@@ -8,7 +8,7 @@ use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope}
 use mimir_core::search::SearchQuery;
 use mimir_core::{db, store, Mimir};
 
-pub fn init() -> Result<()> {
+pub fn init(no_model: bool) -> Result<()> {
     let paths = Paths::resolve()?;
     let config = Config::load(&paths.config_file)?;
     config.save(&paths.config_file)?;
@@ -16,10 +16,16 @@ pub fn init() -> Result<()> {
     let _conn = db::open(&paths.db_file)?;
     println!("config  {}", paths.config_file.display());
     println!("db      {}", paths.db_file.display());
-    match mimir_core::embed::Embedder::load(&paths, &config.embedding.model, true) {
-        Ok(e) => println!("model   {} ready ({}-dim)", e.name, e.dim),
-        Err(err) => {
-            eprintln!("model   download failed ({err}); search is BM25-only until `mimir embed --fetch` succeeds")
+    if no_model {
+        println!(
+            "model   skipped (BM25-only; run `mimir embed --fetch` to enable semantic search)"
+        );
+    } else {
+        match mimir_core::embed::Embedder::load(&paths, &config.embedding.model, true) {
+            Ok(e) => println!("model   {} ready ({}-dim)", e.name, e.dim),
+            Err(err) => {
+                eprintln!("model   download failed ({err}); search is BM25-only until `mimir embed --fetch` succeeds")
+            }
         }
     }
     println!();

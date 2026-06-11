@@ -21,7 +21,11 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create config + database and print setup instructions.
-    Init,
+    Init {
+        /// Skip the embedding-model download (search stays BM25-only).
+        #[arg(long)]
+        no_model: bool,
+    },
     /// Store overview: counts by kind, scope, database size.
     Status,
     /// Health checks: database integrity, FTS availability, model presence.
@@ -170,7 +174,7 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Init => commands::init(),
+        Command::Init { no_model } => commands::init(no_model),
         Command::Status => commands::status(cli.json),
         Command::Doctor => commands::doctor(),
         Command::Remember {
