@@ -124,6 +124,12 @@ enum Command {
         /// Collection name or path; omit to index all.
         name: Option<String>,
     },
+    /// Embed new/changed content for semantic recall.
+    Embed {
+        /// Allow downloading the model if it isn't cached yet.
+        #[arg(long)]
+        fetch: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -214,5 +220,6 @@ fn main() -> anyhow::Result<()> {
             DocsCmd::Note { target, text } => commands::docs_note(&target, text.join(" ")),
         },
         Command::Index { name } => commands::index(name),
+        Command::Embed { fetch } => commands::embed(fetch),
     }
 }

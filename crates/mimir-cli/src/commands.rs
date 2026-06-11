@@ -5,7 +5,7 @@ use mimir_core::config::{Config, Paths};
 use mimir_core::format::{agent_line, full_date};
 use mimir_core::memory::{self, Remember, RememberOutcome};
 use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope};
-use mimir_core::search::{self, SearchQuery};
+use mimir_core::search::SearchQuery;
 use mimir_core::{db, store, Mimir};
 
 pub fn init() -> Result<()> {
@@ -16,9 +16,26 @@ pub fn init() -> Result<()> {
     let _conn = db::open(&paths.db_file)?;
     println!("config  {}", paths.config_file.display());
     println!("db      {}", paths.db_file.display());
+    match mimir_core::embed::Embedder::load(&paths, &config.embedding.model, true) {
+        Ok(e) => println!("model   {} ready ({}-dim)", e.name, e.dim),
+        Err(err) => {
+            eprintln!("model   download failed ({err}); search is BM25-only until `mimir embed --fetch` succeeds")
+        }
+    }
     println!();
     println!("Register the MCP server once, globally:");
     println!("  claude mcp add --scope user mimir -- mimir mcp");
+    Ok(())
+}
+
+/// Embed pending content; --fetch additionally allows the model download.
+pub fn embed(fetch: bool) -> Result<()> {
+    let mut mimir = Mimir::open()?;
+    if mimir.ensure_embedder(fetch).is_none() {
+        bail!("embedding model unavailable; run `mimir embed --fetch` (or `mimir init`) to download it");
+    }
+    let n = mimir.embed_pending()?;
+    println!("embedded {n} node(s)");
     Ok(())
 }
 
@@ -140,7 +157,7 @@ pub fn remember(
     force: bool,
     link_ref: Option<String>,
 ) -> Result<()> {
-    let mimir = Mimir::open()?;
+    let mut mimir = Mimir::open()?;
     let mtype: MemoryType = mtype.parse()?;
     let project = if global {
         None
@@ -171,6 +188,10 @@ pub fn remember(
                 store::link(&mimir.conn, node.id, target.id, Rel::Relates, 1.0)?;
                 println!("linked → {}", line(&target, &projects, 0));
             }
+            // Keep semantic recall fresh; harmless no-op without a model.
+            if let Err(err) = mimir.embed_pending() {
+                tracing::warn!(%err, "embedding new memory failed");
+            }
             Ok(())
         }
         RememberOutcome::Duplicate(existing) => bail!(
@@ -191,7 +212,7 @@ pub fn recall(
     limit: Option<usize>,
     full: bool,
 ) -> Result<()> {
-    let mimir = Mimir::open()?;
+    let mut mimir = Mimir::open()?;
     let query = SearchQuery {
         scope: read_scope(&mimir, global, all)?,
         kinds: parse_kind_filter(kind)?,
@@ -200,7 +221,7 @@ pub fn recall(
         strength_alpha: mimir.config.scoring.strength_alpha,
         text,
     };
-    let hits = search::search(&mimir.conn, &query)?;
+    let hits = mimir.search(&query)?;
 
     let query_hash = blake3::hash(query.text.as_bytes());
     for (rank, hit) in hits.iter().enumerate() {
@@ -511,6 +532,10 @@ pub fn index(name: Option<String>) -> Result<()> {
             "{name}: {} files seen, {} indexed ({} chunks), {} unchanged, {} removed",
             s.seen, s.indexed, s.chunks, s.unchanged, s.removed
         );
+    }
+    let embedded = mimir.embed_pending()?;
+    if embedded > 0 {
+        println!("embedded {embedded} node(s)");
     }
     Ok(())
 }

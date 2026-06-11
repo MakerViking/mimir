@@ -15,6 +15,7 @@ toml.workspace = true
 directories.workspace = true
 ulid.workspace = true
 blake3.workspace = true
+fastembed.workspace = true
 ignore.workspace = true
 pulldown-cmark.workspace = true
 thiserror.workspace = true

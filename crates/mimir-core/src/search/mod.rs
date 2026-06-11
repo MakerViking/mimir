@@ -1,9 +1,10 @@
 //! Hybrid search: ranked legs fused with reciprocal-rank fusion.
 //!
-//! Currently one leg (FTS5 BM25); the vector leg joins in phase 1d.
-//! RRF is scale-free, so adding legs never requires re-tuning.
+//! Legs: FTS5 BM25 (always) + vector dot product (when a query embedding
+//! is supplied). RRF is scale-free, so adding legs never requires re-tuning.
 
 pub mod fts;
+pub mod vector;
 
 use std::collections::HashMap;
 
@@ -49,8 +50,23 @@ pub(crate) fn scope_sql(scope: Scope) -> String {
     }
 }
 
+/// BM25-only search (no model needed).
 pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<Hit>> {
-    let legs: Vec<Vec<i64>> = vec![fts::leg(conn, query, LEG_CAP)?];
+    search_hybrid(conn, query, None, &mut None)
+}
+
+/// Hybrid search. `vector_query` = (model name, L2-normalized query
+/// embedding); pass None to skip the vector leg.
+pub fn search_hybrid(
+    conn: &Connection,
+    query: &SearchQuery,
+    vector_query: Option<(&str, &[f32])>,
+    cache: &mut Option<vector::MatrixCache>,
+) -> Result<Vec<Hit>> {
+    let mut legs: Vec<Vec<i64>> = vec![fts::leg(conn, query, LEG_CAP)?];
+    if let Some((model, qvec)) = vector_query {
+        legs.push(vector::leg(conn, cache, model, qvec, query, LEG_CAP)?);
+    }
 
     let mut rrf: HashMap<i64, f64> = HashMap::new();
     for leg in &legs {
