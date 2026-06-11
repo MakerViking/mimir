@@ -1,0 +1,33 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/thomash/mimir"
+authors = ["Thomas H"]
+
+[workspace.dependencies]
+mimir-core = { path = "crates/mimir-core" }
+
+rusqlite = { version = "0.40", features = ["bundled", "functions"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+directories = "6"
+ulid = "1.2"
+blake3 = "1.8"
+ignore = "0.4"
+pulldown-cmark = "0.13"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.6", features = ["derive"] }
+indicatif = "0.18"
+
+[profile.release]
+lto = "thin"
+strip = true

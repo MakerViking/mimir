@@ -1,0 +1,391 @@
+use rusqlite::{params, Connection, OptionalExtension, Row};
+use ulid::Ulid;
+
+use crate::error::{Error, Result};
+use crate::model::{now_unix, Edge, Kind, NewNode, Node, Rel};
+
+pub fn row_to_node(row: &Row) -> rusqlite::Result<Node> {
+    let kind_text: String = row.get("kind")?;
+    let rel_err = |e: Error| {
+        rusqlite::Error::FromSqlConversionFailure(0, rusqlite::types::Type::Text, Box::new(e))
+    };
+    let meta_text: String = row.get("meta")?;
+    Ok(Node {
+        id: row.get("id")?,
+        uid: row.get("uid")?,
+        kind: kind_text.parse().map_err(rel_err)?,
+        subkind: row.get("subkind")?,
+        project_id: row.get("project_id")?,
+        collection_id: row.get("collection_id")?,
+        parent_id: row.get("parent_id")?,
+        title: row.get("title")?,
+        body: row.get("body")?,
+        path: row.get("path")?,
+        span_start: row.get("span_start")?,
+        span_end: row.get("span_end")?,
+        lang: row.get("lang")?,
+        tags_text: row.get("tags_text")?,
+        content_hash: row.get("content_hash")?,
+        meta: serde_json::from_str(&meta_text).unwrap_or(serde_json::Value::Null),
+        created_at: row.get("created_at")?,
+        updated_at: row.get("updated_at")?,
+        access_count: row.get("access_count")?,
+        last_accessed: row.get("last_accessed")?,
+        strength: row.get("strength")?,
+        pinned: row.get::<_, i64>("pinned")? != 0,
+        superseded_by: row.get("superseded_by")?,
+        deleted_at: row.get("deleted_at")?,
+    })
+}
+
+pub const NODE_COLS: &str = "id, uid, kind, subkind, project_id, collection_id, parent_id, \
+     title, body, path, span_start, span_end, lang, tags_text, content_hash, meta, \
+     created_at, updated_at, access_count, last_accessed, strength, pinned, superseded_by, deleted_at";
+
+pub fn insert_node(conn: &Connection, new: NewNode) -> Result<Node> {
+    let kind = new
+        .kind
+        .ok_or_else(|| Error::Invalid("NewNode.kind is required".into()))?;
+    let uid = Ulid::new().to_string();
+    let now = now_unix();
+    let tags_text = new.tags.join(" ");
+    let meta = new.meta.unwrap_or_else(|| serde_json::json!({}));
+    conn.execute(
+        "INSERT INTO node (uid, kind, subkind, project_id, collection_id, parent_id, title, body, \
+                           path, span_start, span_end, lang, tags_text, content_hash, meta, \
+                           created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)",
+        params![
+            uid,
+            kind.as_str(),
+            new.subkind,
+            new.project_id,
+            new.collection_id,
+            new.parent_id,
+            new.title,
+            new.body,
+            new.path,
+            new.span_start,
+            new.span_end,
+            new.lang,
+            tags_text,
+            new.content_hash,
+            meta.to_string(),
+            now,
+        ],
+    )?;
+    let id = conn.last_insert_rowid();
+    get_node(conn, id)
+}
+
+pub fn get_node(conn: &Connection, id: i64) -> Result<Node> {
+    conn.query_row(
+        &format!("SELECT {NODE_COLS} FROM node WHERE id = ?1"),
+        [id],
+        row_to_node,
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(format!("node #{id}")))
+}
+
+pub fn get_node_by_uid(conn: &Connection, uid: &str) -> Result<Node> {
+    conn.query_row(
+        &format!("SELECT {NODE_COLS} FROM node WHERE uid = ?1"),
+        [uid],
+        row_to_node,
+    )
+    .optional()?
+    .ok_or_else(|| Error::NotFound(format!("node {uid}")))
+}
+
+/// Resolve a user-facing reference: full ULID, `m:ABCDEF` short form,
+/// or a bare uid tail (≥4 chars). Deleted nodes are excluded.
+pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Node> {
+    let raw = reference.trim();
+    // Strip a single-letter sigil prefix like "m:" if present.
+    let tail = match raw.split_once(':') {
+        Some((sigil, rest)) if sigil.len() == 1 => rest,
+        _ => raw,
+    };
+    if tail.len() == 26 {
+        if let Ok(node) = get_node_by_uid(conn, &tail.to_uppercase()) {
+            return Ok(node);
+        }
+    }
+    if tail.len() < 4 {
+        return Err(Error::Invalid(format!(
+            "reference '{raw}' too short; use at least 4 trailing characters of the id"
+        )));
+    }
+    let pattern = format!("%{}", tail.to_uppercase());
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} FROM node WHERE uid LIKE ?1 AND deleted_at IS NULL LIMIT 3"
+    ))?;
+    let nodes: Vec<Node> = stmt
+        .query_map([&pattern], row_to_node)?
+        .collect::<rusqlite::Result<_>>()?;
+    match nodes.len() {
+        0 => Err(Error::NotFound(format!("no node matching '{raw}'"))),
+        1 => Ok(nodes.into_iter().next().unwrap()),
+        n => Err(Error::AmbiguousRef(raw.to_string(), n)),
+    }
+}
+
+pub fn touch_updated(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE node SET updated_at = ?2 WHERE id = ?1",
+        params![id, now_unix()],
+    )?;
+    Ok(())
+}
+
+pub fn soft_delete(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE node SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+        params![id, now_unix()],
+    )?;
+    Ok(())
+}
+
+pub fn hard_delete(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
+    Ok(())
+}
+
+/// Idempotent edge insert (UNIQUE(src,dst,rel) upserts weight).
+pub fn link(conn: &Connection, src: i64, dst: i64, rel: Rel, weight: f64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO edge (src, dst, rel, weight, created_at) VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT(src, dst, rel) DO UPDATE SET weight = excluded.weight",
+        params![src, dst, rel.as_str(), weight, now_unix()],
+    )?;
+    Ok(())
+}
+
+pub fn edges_of(conn: &Connection, node_id: i64) -> Result<Vec<Edge>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, src, dst, rel, weight, meta, created_at FROM edge
+         WHERE src = ?1 OR dst = ?1",
+    )?;
+    let edges = stmt
+        .query_map([node_id], |row| {
+            let rel_text: String = row.get("rel")?;
+            let meta_text: String = row.get("meta")?;
+            Ok(Edge {
+                id: row.get("id")?,
+                src: row.get("src")?,
+                dst: row.get("dst")?,
+                rel: rel_text.parse().map_err(|e: Error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })?,
+                weight: row.get("weight")?,
+                meta: serde_json::from_str(&meta_text).unwrap_or(serde_json::Value::Null),
+                created_at: row.get("created_at")?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(edges)
+}
+
+/// Find or create the project node for a filesystem root.
+/// Project identity is its canonical root path (stored in `path`).
+pub fn ensure_project(conn: &Connection, root: &str, name: &str) -> Result<Node> {
+    let existing = conn
+        .query_row(
+            &format!("SELECT {NODE_COLS} FROM node WHERE kind = 'project' AND path = ?1"),
+            [root],
+            row_to_node,
+        )
+        .optional()?;
+    if let Some(node) = existing {
+        return Ok(node);
+    }
+    let mut new = NewNode::new(Kind::Project);
+    new.title = Some(name.to_string());
+    new.path = Some(root.to_string());
+    insert_node(conn, new)
+}
+
+pub fn count_by_kind(conn: &Connection) -> Result<Vec<(String, i64)>> {
+    let mut stmt = conn.prepare(
+        "SELECT kind, COUNT(*) FROM node WHERE deleted_at IS NULL GROUP BY kind ORDER BY kind",
+    )?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db;
+
+    fn conn() -> Connection {
+        db::open_in_memory().unwrap()
+    }
+
+    fn memory(conn: &Connection, title: &str, body: &str) -> Node {
+        let mut new = NewNode::new(Kind::Memory);
+        new.subkind = Some("note".into());
+        new.title = Some(title.into());
+        new.body = Some(body.into());
+        new.tags = vec!["alpha".into(), "beta".into()];
+        insert_node(conn, new).unwrap()
+    }
+
+    #[test]
+    fn insert_and_get_round_trip() {
+        let conn = conn();
+        let node = memory(&conn, "hello", "world");
+        assert_eq!(node.uid.len(), 26);
+        assert_eq!(node.kind, Kind::Memory);
+        assert_eq!(node.subkind.as_deref(), Some("note"));
+        assert_eq!(node.tags(), vec!["alpha", "beta"]);
+        assert_eq!(node.strength, 1.0);
+        assert!(!node.pinned);
+
+        let by_id = get_node(&conn, node.id).unwrap();
+        assert_eq!(by_id.uid, node.uid);
+        let by_uid = get_node_by_uid(&conn, &node.uid).unwrap();
+        assert_eq!(by_uid.id, node.id);
+    }
+
+    #[test]
+    fn insert_requires_kind() {
+        let conn = conn();
+        let err = insert_node(&conn, NewNode::default()).unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)));
+    }
+
+    #[test]
+    fn resolve_ref_forms() {
+        let conn = conn();
+        let node = memory(&conn, "target", "x");
+
+        // Full ULID.
+        assert_eq!(resolve_ref(&conn, &node.uid).unwrap().id, node.id);
+        // Sigil + 6-char tail (the agent-facing short form).
+        let tail6 = &node.uid[node.uid.len() - 6..];
+        assert_eq!(
+            resolve_ref(&conn, &format!("m:{tail6}")).unwrap().id,
+            node.id
+        );
+        // Bare tail, lowercase.
+        assert_eq!(
+            resolve_ref(&conn, &tail6.to_lowercase()).unwrap().id,
+            node.id
+        );
+        // Too short.
+        assert!(matches!(resolve_ref(&conn, "abc"), Err(Error::Invalid(_))));
+        // No match.
+        assert!(matches!(
+            resolve_ref(&conn, "ZZZZZZ"),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_ref_ambiguity_and_deleted_exclusion() {
+        let conn = conn();
+        let now = now_unix();
+        // Two crafted uids sharing a tail — ULID alphabet, same last 6 chars.
+        for prefix in ["01AAAAAAAAAAAAAAAAAA", "01BBBBBBBBBBBBBBBBBB"] {
+            conn.execute(
+                "INSERT INTO node (uid, kind, created_at, updated_at) VALUES (?1, 'memory', ?2, ?2)",
+                params![format!("{prefix}XYXYXY"), now],
+            )
+            .unwrap();
+        }
+        assert!(matches!(
+            resolve_ref(&conn, "XYXYXY"),
+            Err(Error::AmbiguousRef(_, 2))
+        ));
+        // Soft-deleting one resolves the ambiguity.
+        let id: i64 = conn
+            .query_row("SELECT id FROM node WHERE uid LIKE '01AAA%'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        soft_delete(&conn, id).unwrap();
+        let survivor = resolve_ref(&conn, "XYXYXY").unwrap();
+        assert!(survivor.uid.starts_with("01BBB"));
+    }
+
+    #[test]
+    fn soft_delete_hides_hard_delete_removes() {
+        let conn = conn();
+        let node = memory(&conn, "doomed", "x");
+        soft_delete(&conn, node.id).unwrap();
+        assert!(get_node(&conn, node.id).unwrap().deleted_at.is_some());
+        assert!(count_by_kind(&conn).unwrap().is_empty());
+
+        hard_delete(&conn, node.id).unwrap();
+        assert!(matches!(get_node(&conn, node.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn link_is_idempotent_upsert() {
+        let conn = conn();
+        let a = memory(&conn, "a", "x");
+        let b = memory(&conn, "b", "y");
+        link(&conn, a.id, b.id, Rel::About, 1.0).unwrap();
+        link(&conn, a.id, b.id, Rel::About, 2.5).unwrap();
+        let edges = edges_of(&conn, a.id).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].weight, 2.5);
+        assert_eq!(edges[0].rel, Rel::About);
+    }
+
+    #[test]
+    fn ensure_project_is_idempotent() {
+        let conn = conn();
+        let p1 = ensure_project(&conn, "/tmp/proj", "proj").unwrap();
+        let p2 = ensure_project(&conn, "/tmp/proj", "proj").unwrap();
+        assert_eq!(p1.id, p2.id);
+        let other = ensure_project(&conn, "/tmp/other", "other").unwrap();
+        assert_ne!(p1.id, other.id);
+    }
+
+    #[test]
+    fn fts_triggers_keep_index_in_sync() {
+        let conn = conn();
+        let node = memory(&conn, "searchable title", "unique_body_token here");
+
+        let hits = |q: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM node_fts WHERE node_fts MATCH ?1",
+                [q],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(hits("unique_body_token"), 1);
+
+        // UPDATE of an FTS column re-indexes.
+        conn.execute(
+            "UPDATE node SET body = 'replacement_token now' WHERE id = ?1",
+            [node.id],
+        )
+        .unwrap();
+        assert_eq!(hits("unique_body_token"), 0);
+        assert_eq!(hits("replacement_token"), 1);
+
+        // UPDATE of a non-FTS column must not desync (trigger doesn't fire).
+        conn.execute("UPDATE node SET access_count = 5 WHERE id = ?1", [node.id])
+            .unwrap();
+        assert_eq!(hits("replacement_token"), 1);
+
+        // DELETE removes from the index.
+        hard_delete(&conn, node.id).unwrap();
+        assert_eq!(hits("replacement_token"), 0);
+
+        // Identifier-friendly tokenizer: snake_case stays one token.
+        memory(&conn, "code", "the resolve_ref function");
+        assert_eq!(hits("resolve_ref"), 1);
+    }
+}

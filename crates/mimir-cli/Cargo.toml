@@ -1,0 +1,20 @@
+[package]
+name = "mimir-cli"
+description = "Mimir: unified local-first memory for AI coding agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mimir"
+path = "src/main.rs"
+
+[dependencies]
+mimir-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
