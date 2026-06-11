@@ -210,6 +210,19 @@ pub fn ensure_project(conn: &Connection, root: &str, name: &str) -> Result<Node>
     insert_node(conn, new)
 }
 
+/// Live file nodes whose relative path ends with `suffix` (max 3).
+pub fn files_by_path_suffix(conn: &Connection, suffix: &str) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} FROM node
+         WHERE kind = 'file' AND deleted_at IS NULL AND path LIKE ?1
+         LIMIT 3"
+    ))?;
+    let nodes = stmt
+        .query_map([format!("%{suffix}")], row_to_node)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(nodes)
+}
+
 /// Map of project node id → display name, for rendering `pr:name` scopes.
 pub fn project_titles(conn: &Connection) -> Result<std::collections::HashMap<i64, String>> {
     let mut stmt =

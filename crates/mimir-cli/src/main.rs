@@ -114,6 +114,41 @@ enum Command {
         #[arg(long, default_value = "relates")]
         rel: String,
     },
+    /// Manage docs collections.
+    Docs {
+        #[command(subcommand)]
+        cmd: DocsCmd,
+    },
+    /// (Re)index docs collections incrementally.
+    Index {
+        /// Collection name or path; omit to index all.
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum DocsCmd {
+    /// Register a folder of markdown docs.
+    Add {
+        path: String,
+        /// Display name (default: folder name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Register cross-project (global) even when inside a project.
+        #[arg(short, long)]
+        global: bool,
+    },
+    /// List collections with file/chunk counts.
+    List,
+    /// Soft-delete a collection and everything indexed under it.
+    Remove { name: String },
+    /// Attach a context note to a collection or any node.
+    Note {
+        /// Collection name/path or node reference.
+        target: String,
+        #[arg(required = true)]
+        text: Vec<String>,
+    },
 }
 
 fn main() -> anyhow::Result<()> {
@@ -172,5 +207,12 @@ fn main() -> anyhow::Result<()> {
             tags,
         } => commands::edit(cli.json, &reference, text.join(" "), title, mtype, tags),
         Command::Link { a, b, rel } => commands::link(&a, &b, &rel),
+        Command::Docs { cmd } => match cmd {
+            DocsCmd::Add { path, name, global } => commands::docs_add(&path, name, global),
+            DocsCmd::List => commands::docs_list(cli.json),
+            DocsCmd::Remove { name } => commands::docs_remove(&name),
+            DocsCmd::Note { target, text } => commands::docs_note(&target, text.join(" ")),
+        },
+        Command::Index { name } => commands::index(name),
     }
 }

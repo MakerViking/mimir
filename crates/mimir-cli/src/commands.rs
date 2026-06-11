@@ -239,19 +239,81 @@ pub fn get(json: bool, refs: Vec<String>) -> Result<()> {
     let mimir = Mimir::open()?;
     let projects = store::project_titles(&mimir.conn)?;
     for (i, r) in refs.iter().enumerate() {
+        if i > 0 && !json {
+            println!();
+        }
+        if print_file_slice(&mimir, r)? {
+            continue;
+        }
         let node = store::resolve_ref(&mimir.conn, r)?;
         store::touch_accessed(&mimir.conn, node.id)?;
         store::record_event(&mimir.conn, node.id, "opened", None, None, None)?;
         if json {
             println!("{}", node_json(&node, &projects));
         } else {
-            if i > 0 {
-                println!();
-            }
             print_full(&node, &mimir, &projects)?;
         }
     }
     Ok(())
+}
+
+/// Handle `get docs/file.md:10-40` (or `:10`, or a bare indexed path).
+/// Returns false when the ref doesn't look like an indexed file path.
+fn print_file_slice(mimir: &Mimir, reference: &str) -> Result<bool> {
+    let (path_part, span) = match reference.rsplit_once(':') {
+        Some((p, range)) if !p.is_empty() => {
+            let parse = |s: &str| s.parse::<usize>().ok();
+            let span = match range.split_once('-') {
+                Some((a, b)) => parse(a).zip(parse(b)),
+                None => parse(range).map(|n| (n, n)),
+            };
+            match span {
+                Some(s) => (p, Some(s)),
+                None => (reference, None),
+            }
+        }
+        _ => (reference, None),
+    };
+    // Only paths (with a separator or extension) qualify; ids fall through.
+    if !(path_part.contains('/') || path_part.contains('.')) {
+        return Ok(false);
+    }
+    let matches = store::files_by_path_suffix(&mimir.conn, path_part)?;
+    match matches.len() {
+        0 => Ok(false),
+        1 => {
+            let file = &matches[0];
+            let rel = file.path.as_deref().unwrap_or("");
+            let coll = store::get_node(
+                &mimir.conn,
+                file.collection_id
+                    .ok_or_else(|| anyhow::anyhow!("file without collection"))?,
+            )?;
+            let abs = std::path::Path::new(coll.path.as_deref().unwrap_or("")).join(rel);
+            let content =
+                std::fs::read_to_string(&abs).with_context(|| format!("read {}", abs.display()))?;
+            store::touch_accessed(&mimir.conn, file.id)?;
+            store::record_event(&mimir.conn, file.id, "opened", None, None, None)?;
+            let total = content.lines().count();
+            let (a, b) = span.unwrap_or((1, total));
+            println!("{rel}:{a}-{} ({total} lines)", b.min(total));
+            for (n, line) in content.lines().enumerate() {
+                let n = n + 1;
+                if n >= a && n <= b {
+                    println!("{n:>5}  {line}");
+                }
+            }
+            Ok(true)
+        }
+        _ => bail!(
+            "ambiguous path '{path_part}' matches: {}",
+            matches
+                .iter()
+                .filter_map(|f| f.path.as_deref())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 pub fn list(
@@ -345,6 +407,111 @@ pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
         short_uid(src.kind, &src.uid),
         short_uid(dst.kind, &dst.uid)
     );
+    Ok(())
+}
+
+// ---------- docs & index ----------
+
+pub fn docs_add(path: &str, name: Option<String>, global: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let root = std::path::Path::new(path);
+    let canonical = std::fs::canonicalize(root).with_context(|| format!("no such dir: {path}"))?;
+    let name = name.unwrap_or_else(|| {
+        canonical
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string())
+    });
+    let project = if global {
+        None
+    } else {
+        mimir.project_for_cwd(&canonical)?
+    };
+    let coll = mimir_core::index::add_collection(
+        &mimir.conn,
+        &canonical,
+        &name,
+        project.as_ref().map(|p| p.id),
+    )?;
+    println!(
+        "{} {} {}",
+        short_uid(coll.kind, &coll.uid),
+        name,
+        coll.path.as_deref().unwrap_or("?")
+    );
+    println!("run `mimir index` to scan it");
+    Ok(())
+}
+
+pub fn docs_list(json: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let collections = mimir_core::index::list_collections(&mimir.conn)?;
+    if collections.is_empty() && !json {
+        println!("no collections (add one with `mimir docs add <path>`)");
+        return Ok(());
+    }
+    let projects = store::project_titles(&mimir.conn)?;
+    for coll in collections {
+        let (files, chunks) = mimir_core::index::collection_stats(&mimir.conn, coll.id)?;
+        if json {
+            let mut v = node_json(&coll, &projects);
+            v["files"] = serde_json::json!(files);
+            v["chunks"] = serde_json::json!(chunks);
+            println!("{v}");
+        } else {
+            println!(
+                "{} {} {} ({files} files, {chunks} chunks)",
+                short_uid(coll.kind, &coll.uid),
+                coll.title.as_deref().unwrap_or("?"),
+                coll.path.as_deref().unwrap_or("?"),
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn docs_remove(name: &str) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let coll = mimir_core::index::find_collection(&mimir.conn, name)?;
+    mimir_core::index::remove_collection(&mimir.conn, coll.id)?;
+    println!("removed {}", coll.title.as_deref().unwrap_or(name));
+    Ok(())
+}
+
+pub fn docs_note(target: &str, text: String) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let target_node = mimir_core::index::find_collection(&mimir.conn, target)
+        .or_else(|_| store::resolve_ref(&mimir.conn, target))?;
+    let note = mimir_core::index::annotate(&mimir.conn, &target_node, &text)?;
+    println!(
+        "{} describes {} {}",
+        short_uid(note.kind, &note.uid),
+        short_uid(target_node.kind, &target_node.uid),
+        target_node.title.as_deref().unwrap_or("")
+    );
+    Ok(())
+}
+
+pub fn index(name: Option<String>) -> Result<()> {
+    let mut mimir = Mimir::open()?;
+    let results = match name {
+        Some(n) => {
+            let coll = mimir_core::index::find_collection(&mimir.conn, &n)?;
+            let stats = mimir_core::index::index_collection(&mut mimir.conn, &coll)?;
+            vec![(coll.title.unwrap_or(n), stats)]
+        }
+        None => mimir_core::index::index_all(&mut mimir.conn)?,
+    };
+    if results.is_empty() {
+        println!("no collections (add one with `mimir docs add <path>`)");
+        return Ok(());
+    }
+    for (name, s) in results {
+        println!(
+            "{name}: {} files seen, {} indexed ({} chunks), {} unchanged, {} removed",
+            s.seen, s.indexed, s.chunks, s.unchanged, s.removed
+        );
+    }
     Ok(())
 }
 

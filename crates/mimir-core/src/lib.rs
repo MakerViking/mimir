@@ -8,6 +8,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod format;
+pub mod index;
 pub mod memory;
 pub mod model;
 pub mod scope;
