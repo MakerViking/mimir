@@ -1,7 +1,13 @@
 //! Agent-format output: one token-lean line per hit, shared by the CLI
 //! and the MCP server. Shape: `m:ABCDEF [gotcha pr:mimir 06-11 ↑7] title — snippet`
 
+use std::collections::HashMap;
+
+use rusqlite::Connection;
+
+use crate::error::Result;
 use crate::model::{short_uid, Node};
+use crate::store;
 
 /// `MM-DD` of a unix timestamp (UTC). Compact by design: recall output is
 /// read by agents where every token counts; the year lives in `get`.
@@ -78,11 +84,66 @@ pub fn agent_line(node: &Node, project: Option<&str>, snippet_chars: usize) -> S
     line
 }
 
+/// Multi-line full record: header, title, body, tags, edges.
+pub fn full_record(
+    conn: &Connection,
+    node: &Node,
+    projects: &HashMap<i64, String>,
+) -> Result<String> {
+    let project = node
+        .project_id
+        .and_then(|id| projects.get(&id))
+        .map(String::as_str);
+    let mut out = format!(
+        "{} {}",
+        short_uid(node.kind, &node.uid),
+        node.subkind.as_deref().unwrap_or(node.kind.as_str())
+    );
+    if let Some(p) = project {
+        out.push_str(&format!(" pr:{p}"));
+    }
+    out.push_str(&format!(" created {}", full_date(node.created_at)));
+    if node.updated_at != node.created_at {
+        out.push_str(&format!(" updated {}", full_date(node.updated_at)));
+    }
+    if node.access_count > 0 {
+        out.push_str(&format!(" ↑{}", node.access_count));
+    }
+    if let Some(t) = &node.title {
+        out.push('\n');
+        out.push_str(t);
+    }
+    if let Some(b) = &node.body {
+        if node.title.as_deref() != Some(b.trim()) {
+            out.push('\n');
+            out.push_str(b);
+        }
+    }
+    if !node.tags_text.is_empty() {
+        out.push_str(&format!("\ntags: {}", node.tags_text));
+    }
+    for edge in store::edges_of(conn, node.id)? {
+        let (arrow, other_id) = if edge.src == node.id {
+            ("→", edge.dst)
+        } else {
+            ("←", edge.src)
+        };
+        if let Ok(other) = store::get_node(conn, other_id) {
+            out.push_str(&format!(
+                "\n{arrow} {} {} {}",
+                edge.rel,
+                short_uid(other.kind, &other.uid),
+                other.title.as_deref().unwrap_or("")
+            ));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Kind, NewNode};
-    use crate::store;
 
     #[test]
     fn dates() {

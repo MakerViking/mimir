@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
 use mimir_core::config::{Config, Paths};
-use mimir_core::format::{agent_line, full_date};
+use mimir_core::format::agent_line;
 use mimir_core::memory::{self, Remember, RememberOutcome};
 use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope};
 use mimir_core::search::SearchQuery;
@@ -263,7 +263,8 @@ pub fn get(json: bool, refs: Vec<String>) -> Result<()> {
         if i > 0 && !json {
             println!();
         }
-        if print_file_slice(&mimir, r)? {
+        if let Some(slice) = mimir_core::index::file_slice(&mimir.conn, r)? {
+            println!("{slice}");
             continue;
         }
         let node = store::resolve_ref(&mimir.conn, r)?;
@@ -276,65 +277,6 @@ pub fn get(json: bool, refs: Vec<String>) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Handle `get docs/file.md:10-40` (or `:10`, or a bare indexed path).
-/// Returns false when the ref doesn't look like an indexed file path.
-fn print_file_slice(mimir: &Mimir, reference: &str) -> Result<bool> {
-    let (path_part, span) = match reference.rsplit_once(':') {
-        Some((p, range)) if !p.is_empty() => {
-            let parse = |s: &str| s.parse::<usize>().ok();
-            let span = match range.split_once('-') {
-                Some((a, b)) => parse(a).zip(parse(b)),
-                None => parse(range).map(|n| (n, n)),
-            };
-            match span {
-                Some(s) => (p, Some(s)),
-                None => (reference, None),
-            }
-        }
-        _ => (reference, None),
-    };
-    // Only paths (with a separator or extension) qualify; ids fall through.
-    if !(path_part.contains('/') || path_part.contains('.')) {
-        return Ok(false);
-    }
-    let matches = store::files_by_path_suffix(&mimir.conn, path_part)?;
-    match matches.len() {
-        0 => Ok(false),
-        1 => {
-            let file = &matches[0];
-            let rel = file.path.as_deref().unwrap_or("");
-            let coll = store::get_node(
-                &mimir.conn,
-                file.collection_id
-                    .ok_or_else(|| anyhow::anyhow!("file without collection"))?,
-            )?;
-            let abs = std::path::Path::new(coll.path.as_deref().unwrap_or("")).join(rel);
-            let content =
-                std::fs::read_to_string(&abs).with_context(|| format!("read {}", abs.display()))?;
-            store::touch_accessed(&mimir.conn, file.id)?;
-            store::record_event(&mimir.conn, file.id, "opened", None, None, None)?;
-            let total = content.lines().count();
-            let (a, b) = span.unwrap_or((1, total));
-            println!("{rel}:{a}-{} ({total} lines)", b.min(total));
-            for (n, line) in content.lines().enumerate() {
-                let n = n + 1;
-                if n >= a && n <= b {
-                    println!("{n:>5}  {line}");
-                }
-            }
-            Ok(true)
-        }
-        _ => bail!(
-            "ambiguous path '{path_part}' matches: {}",
-            matches
-                .iter()
-                .filter_map(|f| f.path.as_deref())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-    }
 }
 
 pub fn list(
@@ -593,52 +535,10 @@ fn line(node: &Node, projects: &HashMap<i64, String>, snippet_chars: usize) -> S
 }
 
 fn print_full(node: &Node, mimir: &Mimir, projects: &HashMap<i64, String>) -> Result<()> {
-    let project = node
-        .project_id
-        .and_then(|id| projects.get(&id))
-        .map(String::as_str);
-    let mut header = format!(
-        "{} {}",
-        short_uid(node.kind, &node.uid),
-        node.subkind.as_deref().unwrap_or(node.kind.as_str())
+    println!(
+        "{}",
+        mimir_core::format::full_record(&mimir.conn, node, projects)?
     );
-    if let Some(p) = project {
-        header.push_str(&format!(" pr:{p}"));
-    }
-    header.push_str(&format!(" created {}", full_date(node.created_at)));
-    if node.updated_at != node.created_at {
-        header.push_str(&format!(" updated {}", full_date(node.updated_at)));
-    }
-    if node.access_count > 0 {
-        header.push_str(&format!(" ↑{}", node.access_count));
-    }
-    println!("{header}");
-    if let Some(t) = &node.title {
-        println!("{t}");
-    }
-    if let Some(b) = &node.body {
-        if node.title.as_deref() != Some(b.trim()) {
-            println!("{b}");
-        }
-    }
-    if !node.tags_text.is_empty() {
-        println!("tags: {}", node.tags_text);
-    }
-    for edge in store::edges_of(&mimir.conn, node.id)? {
-        let (arrow, other_id) = if edge.src == node.id {
-            ("→", edge.dst)
-        } else {
-            ("←", edge.src)
-        };
-        if let Ok(other) = store::get_node(&mimir.conn, other_id) {
-            println!(
-                "{arrow} {} {} {}",
-                edge.rel,
-                short_uid(other.kind, &other.uid),
-                other.title.as_deref().unwrap_or("")
-            );
-        }
-    }
     Ok(())
 }
 

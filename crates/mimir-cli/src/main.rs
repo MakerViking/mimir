@@ -1,4 +1,5 @@
 mod commands;
+mod mcp;
 
 use clap::{Parser, Subcommand};
 
@@ -130,6 +131,8 @@ enum Command {
         #[arg(long)]
         fetch: bool,
     },
+    /// Run the MCP stdio server (what Claude Code launches).
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -221,5 +224,6 @@ fn main() -> anyhow::Result<()> {
         },
         Command::Index { name } => commands::index(name),
         Command::Embed { fetch } => commands::embed(fetch),
+        Command::Mcp => mcp::run(),
     }
 }

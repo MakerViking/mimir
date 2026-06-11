@@ -129,6 +129,67 @@ pub fn annotate(conn: &Connection, target: &Node, text: &str) -> Result<Node> {
     Ok(note)
 }
 
+/// Resolve `docs/file.md:10-40` (or `:10`, or a bare indexed path) to the
+/// numbered lines of the file on disk. Returns None when the reference
+/// doesn't look like (or match) an indexed file path. Logs the access.
+pub fn file_slice(conn: &Connection, reference: &str) -> Result<Option<String>> {
+    let (path_part, span) = match reference.rsplit_once(':') {
+        Some((p, range)) if !p.is_empty() => {
+            let parse = |s: &str| s.parse::<usize>().ok();
+            let span = match range.split_once('-') {
+                Some((a, b)) => parse(a).zip(parse(b)),
+                None => parse(range).map(|n| (n, n)),
+            };
+            match span {
+                Some(s) => (p, Some(s)),
+                None => (reference, None),
+            }
+        }
+        _ => (reference, None),
+    };
+    // Only paths (with a separator or extension) qualify; ids fall through.
+    if !(path_part.contains('/') || path_part.contains('.')) {
+        return Ok(None);
+    }
+    let matches = store::files_by_path_suffix(conn, path_part)?;
+    let file = match matches.len() {
+        0 => return Ok(None),
+        1 => &matches[0],
+        n => {
+            return Err(Error::AmbiguousRef(
+                format!(
+                    "{path_part} (matches {})",
+                    matches
+                        .iter()
+                        .filter_map(|f| f.path.as_deref())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                n,
+            ))
+        }
+    };
+    let rel = file.path.as_deref().unwrap_or("");
+    let collection_id = file
+        .collection_id
+        .ok_or_else(|| Error::Invalid(format!("file {rel} has no collection")))?;
+    let coll = store::get_node(conn, collection_id)?;
+    let abs = Path::new(coll.path.as_deref().unwrap_or("")).join(rel);
+    let content = std::fs::read_to_string(&abs).map_err(|e| Error::io(&abs, e))?;
+    store::touch_accessed(conn, file.id)?;
+    store::record_event(conn, file.id, "opened", None, None, None)?;
+    let total = content.lines().count();
+    let (a, b) = span.unwrap_or((1, total));
+    let mut out = format!("{rel}:{a}-{} ({total} lines)", b.min(total));
+    for (n, line) in content.lines().enumerate() {
+        let n = n + 1;
+        if n >= a && n <= b {
+            out.push_str(&format!("\n{n:>5}  {line}"));
+        }
+    }
+    Ok(Some(out))
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct IndexStats {
     pub seen: usize,
