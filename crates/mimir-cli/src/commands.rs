@@ -1,5 +1,11 @@
-use anyhow::Result;
+use std::collections::HashMap;
+
+use anyhow::{bail, Context, Result};
 use mimir_core::config::{Config, Paths};
+use mimir_core::format::{agent_line, full_date};
+use mimir_core::memory::{self, Remember, RememberOutcome};
+use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope};
+use mimir_core::search::{self, SearchQuery};
 use mimir_core::{db, store, Mimir};
 
 pub fn init() -> Result<()> {
@@ -120,4 +126,344 @@ pub fn doctor() -> Result<()> {
         anyhow::bail!("{failures} check(s) failed");
     }
     Ok(())
+}
+
+// ---------- memory verbs ----------
+
+#[allow(clippy::too_many_arguments)]
+pub fn remember(
+    json: bool,
+    text: String,
+    mtype: &str,
+    tags: Vec<String>,
+    global: bool,
+    force: bool,
+    link_ref: Option<String>,
+) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let mtype: MemoryType = mtype.parse()?;
+    let project = if global {
+        None
+    } else {
+        mimir.project_for_cwd(&std::env::current_dir()?)?
+    };
+    let outcome = memory::remember(
+        &mimir.conn,
+        Remember {
+            text,
+            mtype,
+            tags,
+            project_id: project.as_ref().map(|p| p.id),
+            force,
+        },
+    )?;
+    let projects = store::project_titles(&mimir.conn)?;
+    let snippet = mimir.config.output.snippet_chars;
+    match outcome {
+        RememberOutcome::Created(node) => {
+            if json {
+                println!("{}", node_json(&node, &projects));
+            } else {
+                println!("{}", line(&node, &projects, snippet));
+            }
+            if let Some(r) = link_ref {
+                let target = store::resolve_ref(&mimir.conn, &r)?;
+                store::link(&mimir.conn, node.id, target.id, Rel::Relates, 1.0)?;
+                println!("linked → {}", line(&target, &projects, 0));
+            }
+            Ok(())
+        }
+        RememberOutcome::Duplicate(existing) => bail!(
+            "refused: near-duplicate of\n  {}\nuse --force to store anyway",
+            line(&existing, &projects, snippet)
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn recall(
+    json: bool,
+    text: String,
+    kind: &str,
+    global: bool,
+    all: bool,
+    since: Option<String>,
+    limit: Option<usize>,
+    full: bool,
+) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let query = SearchQuery {
+        scope: read_scope(&mimir, global, all)?,
+        kinds: parse_kind_filter(kind)?,
+        since: since.map(|s| parse_since(&s)).transpose()?,
+        limit: limit.unwrap_or(mimir.config.output.default_limit),
+        strength_alpha: mimir.config.scoring.strength_alpha,
+        text,
+    };
+    let hits = search::search(&mimir.conn, &query)?;
+
+    let query_hash = blake3::hash(query.text.as_bytes());
+    for (rank, hit) in hits.iter().enumerate() {
+        store::record_event(
+            &mimir.conn,
+            hit.node.id,
+            "shown",
+            Some(query_hash.as_bytes()),
+            Some(rank as i64),
+            Some(hit.score),
+        )?;
+    }
+
+    let projects = store::project_titles(&mimir.conn)?;
+    if hits.is_empty() && !json {
+        println!("no results");
+        return Ok(());
+    }
+    for hit in &hits {
+        if json {
+            println!("{}", node_json(&hit.node, &projects));
+        } else if full {
+            print_full(&hit.node, &mimir, &projects)?;
+            println!();
+        } else {
+            println!(
+                "{}",
+                line(&hit.node, &projects, mimir.config.output.snippet_chars)
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn get(json: bool, refs: Vec<String>) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let projects = store::project_titles(&mimir.conn)?;
+    for (i, r) in refs.iter().enumerate() {
+        let node = store::resolve_ref(&mimir.conn, r)?;
+        store::touch_accessed(&mimir.conn, node.id)?;
+        store::record_event(&mimir.conn, node.id, "opened", None, None, None)?;
+        if json {
+            println!("{}", node_json(&node, &projects));
+        } else {
+            if i > 0 {
+                println!();
+            }
+            print_full(&node, &mimir, &projects)?;
+        }
+    }
+    Ok(())
+}
+
+pub fn list(
+    json: bool,
+    mtype: Option<String>,
+    tag: Option<String>,
+    global: bool,
+    all: bool,
+    limit: usize,
+) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let scope = read_scope(&mimir, global, all)?;
+    let mtype = mtype.map(|t| t.parse::<MemoryType>()).transpose()?;
+    let nodes = memory::list(&mimir.conn, scope, mtype, tag.as_deref(), limit)?;
+    let projects = store::project_titles(&mimir.conn)?;
+    if nodes.is_empty() && !json {
+        println!("no memories");
+        return Ok(());
+    }
+    for node in &nodes {
+        if json {
+            println!("{}", node_json(node, &projects));
+        } else {
+            println!(
+                "{}",
+                line(node, &projects, mimir.config.output.snippet_chars)
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn forget(reference: &str, hard: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let node = store::resolve_ref(&mimir.conn, reference)?;
+    if hard {
+        store::hard_delete(&mimir.conn, node.id)?;
+    } else {
+        store::soft_delete(&mimir.conn, node.id)?;
+    }
+    println!(
+        "forgot {} {}{}",
+        short_uid(node.kind, &node.uid),
+        node.title.as_deref().unwrap_or(""),
+        if hard { " (permanently)" } else { "" }
+    );
+    Ok(())
+}
+
+pub fn edit(
+    json: bool,
+    reference: &str,
+    text: String,
+    title: Option<String>,
+    mtype: Option<String>,
+    tags: Option<Vec<String>>,
+) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let node = store::resolve_ref(&mimir.conn, reference)?;
+    let mtype = mtype.map(|t| t.parse::<MemoryType>()).transpose()?;
+    let edit = memory::Edit {
+        text: if text.is_empty() { None } else { Some(text) },
+        title,
+        mtype,
+        tags,
+    };
+    if edit.text.is_none() && edit.title.is_none() && edit.mtype.is_none() && edit.tags.is_none() {
+        bail!("nothing to change: pass TEXT, --title, --type, or --tags");
+    }
+    let updated = memory::edit(&mimir.conn, node.id, edit)?;
+    let projects = store::project_titles(&mimir.conn)?;
+    if json {
+        println!("{}", node_json(&updated, &projects));
+    } else {
+        println!(
+            "{}",
+            line(&updated, &projects, mimir.config.output.snippet_chars)
+        );
+    }
+    Ok(())
+}
+
+pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let rel: Rel = rel.parse()?;
+    let src = store::resolve_ref(&mimir.conn, a)?;
+    let dst = store::resolve_ref(&mimir.conn, b)?;
+    store::link(&mimir.conn, src.id, dst.id, rel, 1.0)?;
+    println!(
+        "{} —{rel}→ {}",
+        short_uid(src.kind, &src.uid),
+        short_uid(dst.kind, &dst.uid)
+    );
+    Ok(())
+}
+
+// ---------- helpers ----------
+
+/// Scope for read operations. Inside a project: that project + global.
+/// Outside: everything (reads want breadth; -g narrows to global-only).
+fn read_scope(mimir: &Mimir, global: bool, all: bool) -> Result<Scope> {
+    if all {
+        return Ok(Scope::All);
+    }
+    if global {
+        return Ok(Scope::Global);
+    }
+    Ok(match mimir.project_for_cwd(&std::env::current_dir()?)? {
+        Some(p) => Scope::Project(p.id),
+        None => Scope::All,
+    })
+}
+
+fn parse_kind_filter(kind: &str) -> Result<Vec<Kind>> {
+    Ok(match kind {
+        "all" => vec![],
+        "memory" => vec![Kind::Memory],
+        "doc" => vec![Kind::File, Kind::Chunk, Kind::Annotation],
+        "code" => vec![Kind::Symbol],
+        other => bail!("unknown --kind '{other}' (use all|memory|doc|code)"),
+    })
+}
+
+/// "12h" | "7d" | "2w" | "3m" | "1y" → unix cutoff.
+fn parse_since(s: &str) -> Result<i64> {
+    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    let n: i64 = num
+        .parse()
+        .with_context(|| format!("bad --since '{s}' (use e.g. 12h, 7d, 2w, 3m, 1y)"))?;
+    let secs = match unit {
+        "h" => 3_600,
+        "d" => 86_400,
+        "w" => 604_800,
+        "m" => 2_592_000,
+        "y" => 31_536_000,
+        _ => bail!("bad --since unit '{unit}' (use h, d, w, m, y)"),
+    };
+    Ok(now_unix() - n * secs)
+}
+
+fn line(node: &Node, projects: &HashMap<i64, String>, snippet_chars: usize) -> String {
+    let project = node
+        .project_id
+        .and_then(|id| projects.get(&id))
+        .map(String::as_str);
+    agent_line(node, project, snippet_chars)
+}
+
+fn print_full(node: &Node, mimir: &Mimir, projects: &HashMap<i64, String>) -> Result<()> {
+    let project = node
+        .project_id
+        .and_then(|id| projects.get(&id))
+        .map(String::as_str);
+    let mut header = format!(
+        "{} {}",
+        short_uid(node.kind, &node.uid),
+        node.subkind.as_deref().unwrap_or(node.kind.as_str())
+    );
+    if let Some(p) = project {
+        header.push_str(&format!(" pr:{p}"));
+    }
+    header.push_str(&format!(" created {}", full_date(node.created_at)));
+    if node.updated_at != node.created_at {
+        header.push_str(&format!(" updated {}", full_date(node.updated_at)));
+    }
+    if node.access_count > 0 {
+        header.push_str(&format!(" ↑{}", node.access_count));
+    }
+    println!("{header}");
+    if let Some(t) = &node.title {
+        println!("{t}");
+    }
+    if let Some(b) = &node.body {
+        if node.title.as_deref() != Some(b.trim()) {
+            println!("{b}");
+        }
+    }
+    if !node.tags_text.is_empty() {
+        println!("tags: {}", node.tags_text);
+    }
+    for edge in store::edges_of(&mimir.conn, node.id)? {
+        let (arrow, other_id) = if edge.src == node.id {
+            ("→", edge.dst)
+        } else {
+            ("←", edge.src)
+        };
+        if let Ok(other) = store::get_node(&mimir.conn, other_id) {
+            println!(
+                "{arrow} {} {} {}",
+                edge.rel,
+                short_uid(other.kind, &other.uid),
+                other.title.as_deref().unwrap_or("")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn node_json(node: &Node, projects: &HashMap<i64, String>) -> serde_json::Value {
+    serde_json::json!({
+        "id": short_uid(node.kind, &node.uid),
+        "uid": node.uid,
+        "kind": node.kind.as_str(),
+        "type": node.subkind,
+        "project": node.project_id.and_then(|id| projects.get(&id)),
+        "title": node.title,
+        "body": node.body,
+        "path": node.path,
+        "tags": node.tags(),
+        "created_at": node.created_at,
+        "updated_at": node.updated_at,
+        "access_count": node.access_count,
+        "strength": node.strength,
+    })
 }

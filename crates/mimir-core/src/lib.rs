@@ -7,8 +7,11 @@
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod format;
+pub mod memory;
 pub mod model;
 pub mod scope;
+pub mod search;
 pub mod store;
 
 use std::path::Path;

@@ -210,6 +210,47 @@ pub fn ensure_project(conn: &Connection, root: &str, name: &str) -> Result<Node>
     insert_node(conn, new)
 }
 
+/// Map of project node id → display name, for rendering `pr:name` scopes.
+pub fn project_titles(conn: &Connection) -> Result<std::collections::HashMap<i64, String>> {
+    let mut stmt =
+        conn.prepare("SELECT id, title FROM node WHERE kind = 'project' AND deleted_at IS NULL")?;
+    let map = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(map)
+}
+
+/// Append to the implicit-feedback ledger (shown/opened/useful/not_useful).
+pub fn record_event(
+    conn: &Connection,
+    node_id: i64,
+    event: &str,
+    query_hash: Option<&[u8]>,
+    rank: Option<i64>,
+    score: Option<f64>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO recall_event (node_id, event, query_hash, rank, score, at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![node_id, event, query_hash, rank, score, now_unix()],
+    )?;
+    Ok(())
+}
+
+/// Bump access stats; called when a node's full body is opened.
+pub fn touch_accessed(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE node SET access_count = access_count + 1, last_accessed = ?2 WHERE id = ?1",
+        params![id, now_unix()],
+    )?;
+    Ok(())
+}
+
 pub fn count_by_kind(conn: &Connection) -> Result<Vec<(String, i64)>> {
     let mut stmt = conn.prepare(
         "SELECT kind, COUNT(*) FROM node WHERE deleted_at IS NULL GROUP BY kind ORDER BY kind",
