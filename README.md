@@ -13,9 +13,11 @@ exposed to agents as a single, globally-registered MCP server.
 - **Docs search.** Point it at any folder of markdown; an incremental,
   hash-driven indexer chunks it heading-aware (code fences never split) and
   keeps it fresh in milliseconds.
-- **Hybrid search.** FTS5 BM25 + bge-small embeddings (quantized ONNX,
-  in-process, no daemon, no API key), fused with reciprocal-rank fusion.
-  No model downloaded? Everything still works, BM25-only.
+- **Hybrid search.** FTS5 BM25 (porter-stemmed, stopword-aware) + bge-small
+  embeddings (quantized ONNX, in-process, no daemon, no API key), fused with
+  reciprocal-rank fusion. Optional cross-encoder reranking (`--rerank`) when
+  you want maximum precision over speed. No model downloaded? Everything
+  still works, BM25-only.
 - **Made for agents.** Default output is one ~25-token line per hit.
   The MCP server registers once (`--scope user`) and serves every repo,
   detecting the current project from its working directory.
@@ -42,6 +44,12 @@ mimir get m:ABCDEF         # full body (also: mimir get notes.md:10-40)
 # docs
 mimir docs add ~/notes --name notes
 mimir index                # incremental; re-run any time
+
+# precision dial (all optional)
+mimir embed --fetch --rerank                  # one-time reranker download (~150 MB)
+mimir recall tricky semantic question --rerank  # cross-encoder rescoring (~2 s)
+# config.toml: embedding.model = "bge-base-en-v1.5" — stronger semantic
+# matching at the same query latency (index-time embedding is ~4x slower)
 
 # agents (Claude Code etc.) — register once, works in every repo
 claude mcp add --scope user mimir -- mimir mcp
