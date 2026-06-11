@@ -7,7 +7,9 @@
 
 use std::path::PathBuf;
 
-use fastembed::{EmbeddingModel, TextEmbedding, TextInitOptions};
+use fastembed::{
+    EmbeddingModel, RerankInitOptions, RerankerModel, TextEmbedding, TextInitOptions, TextRerank,
+};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::config::Paths;
@@ -90,6 +92,60 @@ impl Embedder {
             l2_normalize(v);
         }
         Ok(out)
+    }
+}
+
+pub fn reranker_from_name(name: &str) -> Result<RerankerModel> {
+    Ok(match name {
+        // ~150 MB, English, fast on CPU — the default.
+        "jina-reranker-v1-turbo-en" => RerankerModel::JINARerankerV1TurboEn,
+        "bge-reranker-base" => RerankerModel::BGERerankerBase,
+        "bge-reranker-v2-m3" => RerankerModel::BGERerankerV2M3,
+        "jina-reranker-v2-base-multilingual" => RerankerModel::JINARerankerV2BaseMultiligual,
+        other => {
+            return Err(Error::Invalid(format!(
+                "unknown reranker model '{other}' (try jina-reranker-v1-turbo-en)"
+            )))
+        }
+    })
+}
+
+/// Cross-encoder for `recall --rerank`. Same marker-file download gate
+/// as `Embedder`: silent loads never touch the network.
+pub struct Reranker {
+    model: TextRerank,
+    pub name: String,
+}
+
+impl Reranker {
+    pub fn load(paths: &Paths, name: &str, allow_download: bool) -> Result<Reranker> {
+        if !allow_download && !model_ready(paths, name) {
+            return Err(Error::Invalid(format!(
+                "reranker model '{name}' not downloaded; run `mimir embed --fetch --rerank`"
+            )));
+        }
+        let which = reranker_from_name(name)?;
+        std::fs::create_dir_all(&paths.models_dir).map_err(|e| Error::io(&paths.models_dir, e))?;
+        let options = RerankInitOptions::new(which)
+            .with_cache_dir(paths.models_dir.clone())
+            .with_show_download_progress(allow_download);
+        let model = TextRerank::try_new(options).map_err(|e| Error::Embed(e.to_string()))?;
+        std::fs::write(marker_path(paths, name), b"ok")
+            .map_err(|e| Error::io(&paths.models_dir, e))?;
+        Ok(Reranker {
+            model,
+            name: name.to_string(),
+        })
+    }
+
+    /// Score (query, doc) pairs; returns (input index, relevance score),
+    /// best first.
+    pub fn rerank(&mut self, query: &str, docs: Vec<String>) -> Result<Vec<(usize, f32)>> {
+        let results = self
+            .model
+            .rerank(query.to_string(), &docs, false, None)
+            .map_err(|e| Error::Embed(e.to_string()))?;
+        Ok(results.into_iter().map(|r| (r.index, r.score)).collect())
     }
 }
 

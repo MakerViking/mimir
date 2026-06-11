@@ -72,6 +72,10 @@ enum Command {
         /// Print full bodies instead of one-line summaries.
         #[arg(long)]
         full: bool,
+        /// Rescore the top candidates with a cross-encoder (needs the
+        /// reranker model: `mimir embed --fetch --rerank`).
+        #[arg(long)]
+        rerank: bool,
     },
     /// Show full records by reference (logs the access).
     Get {
@@ -134,6 +138,9 @@ enum Command {
         /// Allow downloading the model if it isn't cached yet.
         #[arg(long)]
         fetch: bool,
+        /// With --fetch: also download the reranker model.
+        #[arg(long)]
+        rerank: bool,
     },
     /// Run the MCP stdio server (what Claude Code launches).
     Mcp,
@@ -193,6 +200,7 @@ fn main() -> anyhow::Result<()> {
             since,
             limit,
             full,
+            rerank,
         } => commands::recall(
             cli.json,
             query.join(" "),
@@ -202,6 +210,7 @@ fn main() -> anyhow::Result<()> {
             since,
             limit,
             full,
+            rerank,
         ),
         Command::Get { refs } => commands::get(cli.json, refs),
         Command::List {
@@ -227,7 +236,7 @@ fn main() -> anyhow::Result<()> {
             DocsCmd::Note { target, text } => commands::docs_note(&target, text.join(" ")),
         },
         Command::Index { name } => commands::index(name),
-        Command::Embed { fetch } => commands::embed(fetch),
+        Command::Embed { fetch, rerank } => commands::embed(fetch, rerank),
         Command::Mcp => mcp::run(),
     }
 }

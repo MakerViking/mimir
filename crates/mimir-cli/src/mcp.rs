@@ -52,6 +52,10 @@ pub struct RecallArgs {
     /// true = search every project, not just the current one + global.
     #[serde(default)]
     pub all_projects: bool,
+    /// true = rescore candidates with the cross-encoder reranker
+    /// (slower, better ordering; needs the reranker model downloaded).
+    #[serde(default)]
+    pub rerank: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -137,23 +141,20 @@ impl MimirServer {
                 limit: args.limit.unwrap_or(m.config.output.default_limit),
                 strength_alpha: m.config.scoring.strength_alpha,
             };
-            let hits = m.search(&query).map_err(engine_err)?;
+            let hits = m.search_with(&query, args.rerank).map_err(engine_err)?;
             if hits.is_empty() {
                 return Ok("no results".into());
             }
             let query_hash = blake3::hash(query.text.as_bytes());
+            let shown: Vec<(i64, i64, f64)> = hits
+                .iter()
+                .enumerate()
+                .map(|(rank, hit)| (hit.node.id, rank as i64, hit.score))
+                .collect();
+            store::record_shown(&m.conn, query_hash.as_bytes(), &shown).map_err(engine_err)?;
             let projects = store::project_titles(&m.conn).map_err(engine_err)?;
             let mut out = Vec::new();
-            for (rank, hit) in hits.iter().enumerate() {
-                store::record_event(
-                    &m.conn,
-                    hit.node.id,
-                    "shown",
-                    Some(query_hash.as_bytes()),
-                    Some(rank as i64),
-                    Some(hit.score),
-                )
-                .map_err(engine_err)?;
+            for hit in &hits {
                 let project = hit
                     .node
                     .project_id

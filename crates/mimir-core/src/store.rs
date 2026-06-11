@@ -255,6 +255,28 @@ pub fn record_event(
     Ok(())
 }
 
+/// Log `shown` for a whole result page in one transaction
+/// (per-row autocommits double recall latency for nothing).
+pub fn record_shown(
+    conn: &Connection,
+    query_hash: &[u8],
+    hits: &[(i64, i64, f64)], // (node_id, rank, score)
+) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    {
+        let mut stmt = tx.prepare_cached(
+            "INSERT INTO recall_event (node_id, event, query_hash, rank, score, at)
+             VALUES (?1, 'shown', ?2, ?3, ?4, ?5)",
+        )?;
+        let now = now_unix();
+        for (node_id, rank, score) in hits {
+            stmt.execute(params![node_id, query_hash, rank, score, now])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Bump access stats; called when a node's full body is opened.
 pub fn touch_accessed(conn: &Connection, id: i64) -> Result<()> {
     conn.execute(

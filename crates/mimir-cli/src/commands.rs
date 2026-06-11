@@ -34,11 +34,18 @@ pub fn init(no_model: bool) -> Result<()> {
     Ok(())
 }
 
-/// Embed pending content; --fetch additionally allows the model download.
-pub fn embed(fetch: bool) -> Result<()> {
+/// Embed pending content; --fetch additionally allows the model download,
+/// --rerank (with --fetch) also downloads the reranker.
+pub fn embed(fetch: bool, rerank: bool) -> Result<()> {
     let mut mimir = Mimir::open()?;
     if mimir.ensure_embedder(fetch).is_none() {
         bail!("embedding model unavailable; run `mimir embed --fetch` (or `mimir init`) to download it");
+    }
+    if rerank {
+        if mimir.ensure_reranker(fetch).is_none() {
+            bail!("reranker model unavailable; run `mimir embed --fetch --rerank` to download it");
+        }
+        println!("reranker {} ready", mimir.config.rerank.model);
     }
     let n = mimir.embed_pending()?;
     println!("embedded {n} node(s)");
@@ -217,6 +224,7 @@ pub fn recall(
     since: Option<String>,
     limit: Option<usize>,
     full: bool,
+    rerank: bool,
 ) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let query = SearchQuery {
@@ -227,19 +235,15 @@ pub fn recall(
         strength_alpha: mimir.config.scoring.strength_alpha,
         text,
     };
-    let hits = mimir.search(&query)?;
+    let hits = mimir.search_with(&query, rerank)?;
 
     let query_hash = blake3::hash(query.text.as_bytes());
-    for (rank, hit) in hits.iter().enumerate() {
-        store::record_event(
-            &mimir.conn,
-            hit.node.id,
-            "shown",
-            Some(query_hash.as_bytes()),
-            Some(rank as i64),
-            Some(hit.score),
-        )?;
-    }
+    let shown: Vec<(i64, i64, f64)> = hits
+        .iter()
+        .enumerate()
+        .map(|(rank, hit)| (hit.node.id, rank as i64, hit.score))
+        .collect();
+    store::record_shown(&mimir.conn, query_hash.as_bytes(), &shown)?;
 
     let projects = store::project_titles(&mimir.conn)?;
     if hits.is_empty() && !json {

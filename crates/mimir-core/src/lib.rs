@@ -35,6 +35,8 @@ pub struct Mimir {
     pub paths: Paths,
     embedder: Option<embed::Embedder>,
     embedder_tried: bool,
+    reranker: Option<embed::Reranker>,
+    reranker_tried: bool,
     matrix: Option<MatrixCache>,
 }
 
@@ -53,6 +55,8 @@ impl Mimir {
             paths,
             embedder: None,
             embedder_tried: false,
+            reranker: None,
+            reranker_tried: false,
             matrix: None,
         })
     }
@@ -65,6 +69,8 @@ impl Mimir {
             paths: Paths::under_root(Path::new(".")),
             embedder: None,
             embedder_tried: false,
+            reranker: None,
+            reranker_tried: false,
             matrix: None,
         })
     }
@@ -84,8 +90,34 @@ impl Mimir {
         self.embedder.as_mut()
     }
 
+    /// Lazily load the cross-encoder reranker (marker-gated, like the
+    /// embedder). Missing model degrades to un-reranked results.
+    pub fn ensure_reranker(&mut self, allow_download: bool) -> Option<&mut embed::Reranker> {
+        let downloadable =
+            allow_download || embed::model_ready(&self.paths, &self.config.rerank.model);
+        if self.reranker.is_none() && !self.reranker_tried && downloadable {
+            self.reranker_tried = true;
+            match embed::Reranker::load(&self.paths, &self.config.rerank.model, allow_download) {
+                Ok(r) => self.reranker = Some(r),
+                Err(err) => tracing::warn!(%err, "reranker unavailable; skipping rerank"),
+            }
+        }
+        self.reranker.as_mut()
+    }
+
     /// Hybrid search when the model is available locally, BM25-only otherwise.
     pub fn search(&mut self, query: &SearchQuery) -> Result<Vec<Hit>> {
+        self.search_with(query, false)
+    }
+
+    /// Search with optional cross-encoder reranking: over-fetch the fused
+    /// candidates, rescore them against the query, keep the top `limit`.
+    pub fn search_with(&mut self, query: &SearchQuery, rerank: bool) -> Result<Vec<Hit>> {
+        let mut fetch_query = query.clone();
+        if rerank {
+            fetch_query.limit = query.limit.max(self.config.rerank.candidates);
+        }
+
         let query_vec = self.ensure_embedder(false).and_then(|e| {
             e.embed(vec![query.text.clone()])
                 .map_err(|err| tracing::warn!(%err, "query embedding failed; BM25-only"))
@@ -98,23 +130,73 @@ impl Mimir {
                     }
                 })
         });
-        match query_vec {
+        let mut hits = match query_vec {
             Some(v) => {
                 let model = self.config.embedding.model.clone();
-                search::search_hybrid(&self.conn, query, Some((&model, &v)), &mut self.matrix)
+                search::search_hybrid(
+                    &self.conn,
+                    &fetch_query,
+                    Some((&model, &v)),
+                    &mut self.matrix,
+                )?
             }
-            None => search::search(&self.conn, query),
+            None => search::search(&self.conn, &fetch_query)?,
+        };
+
+        if rerank && hits.len() > 1 {
+            if let Some(rr) = self.ensure_reranker(false) {
+                let docs: Vec<String> = hits
+                    .iter()
+                    .map(|h| {
+                        let title = h.node.title.as_deref().unwrap_or("");
+                        let body = h.node.body.as_deref().unwrap_or("");
+                        // Cross-encoders cap at ~512 tokens; keep pairs cheap.
+                        format!("{title}\n{body}").chars().take(1500).collect()
+                    })
+                    .collect();
+                match rr.rerank(&query.text, docs) {
+                    Ok(ranked) => {
+                        let mut slots: Vec<Option<Hit>> = hits.into_iter().map(Some).collect();
+                        let mut reordered = Vec::with_capacity(slots.len());
+                        for (idx, score) in ranked {
+                            if let Some(mut hit) = slots.get_mut(idx).and_then(Option::take) {
+                                hit.score = score as f64;
+                                reordered.push(hit);
+                            }
+                        }
+                        // Anything the reranker didn't score keeps fused order.
+                        reordered.extend(slots.into_iter().flatten());
+                        hits = reordered;
+                    }
+                    Err(err) => {
+                        tracing::warn!(%err, "rerank failed; keeping fused order");
+                    }
+                }
+            }
         }
+        hits.truncate(query.limit);
+        Ok(hits)
     }
 
     /// Embed all new/changed content. No-op (0) when no model is present.
+    /// Drops the vector matrix cache when anything changed (same-connection
+    /// writes are invisible to data_version).
     pub fn embed_pending(&mut self) -> Result<usize> {
         self.ensure_embedder(false);
-        let Mimir { conn, embedder, .. } = self;
-        match embedder.as_mut() {
-            Some(e) => embed::embed_pending(conn, e),
-            None => Ok(0),
+        let Mimir {
+            conn,
+            embedder,
+            matrix,
+            ..
+        } = self;
+        let n = match embedder.as_mut() {
+            Some(e) => embed::embed_pending(conn, e)?,
+            None => 0,
+        };
+        if n > 0 {
+            *matrix = None;
         }
+        Ok(n)
     }
 
     /// Resolve (and lazily register) the project for a working directory.

@@ -46,6 +46,7 @@ impl Paths {
 #[serde(default)]
 pub struct Config {
     pub embedding: EmbeddingConfig,
+    pub rerank: RerankConfig,
     pub scoring: ScoringConfig,
     pub output: OutputConfig,
 }
@@ -55,6 +56,15 @@ pub struct Config {
 pub struct EmbeddingConfig {
     /// fastembed model name; switching models requires `mimir embed --all`.
     pub model: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RerankConfig {
+    /// fastembed cross-encoder used by `recall --rerank`.
+    pub model: String,
+    /// How many fused candidates the reranker scores.
+    pub candidates: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -75,6 +85,15 @@ impl Default for EmbeddingConfig {
     fn default() -> Self {
         EmbeddingConfig {
             model: "bge-small-en-v1.5".into(),
+        }
+    }
+}
+
+impl Default for RerankConfig {
+    fn default() -> Self {
+        RerankConfig {
+            model: "jina-reranker-v1-turbo-en".into(),
+            candidates: 30,
         }
     }
 }

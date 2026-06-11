@@ -77,11 +77,16 @@ pub fn search_hybrid(
 
     let mut hits: Vec<Hit> = rrf
         .into_iter()
-        .map(|(id, base)| {
-            let node = store::get_node(conn, id)?;
-            // Strength is a tiebreaker multiplier, never a burier.
-            let score = base * (1.0 + query.strength_alpha * (1.0 + node.strength).ln());
-            Ok(Hit { node, score })
+        .filter_map(|(id, base)| match store::get_node(conn, id) {
+            // A stale vector cache may still hold soft-deleted nodes;
+            // they must never surface.
+            Ok(node) if node.deleted_at.is_some() => None,
+            Ok(node) => {
+                // Strength is a tiebreaker multiplier, never a burier.
+                let score = base * (1.0 + query.strength_alpha * (1.0 + node.strength).ln());
+                Some(Ok(Hit { node, score }))
+            }
+            Err(e) => Some(Err(e)),
         })
         .collect::<Result<_>>()?;
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));

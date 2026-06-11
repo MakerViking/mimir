@@ -95,6 +95,35 @@ CREATE TABLE meta (
   value TEXT NOT NULL
 );
 "#,
+    // v2: porter stemming on the FTS index ("authentication" matches
+    // "authenticate"). Tokenizer changes require dropping + rebuilding the
+    // external-content table; 'rebuild' repopulates from node.
+    r#"
+DROP TRIGGER node_ai;
+DROP TRIGGER node_ad;
+DROP TRIGGER node_au;
+DROP TABLE node_fts;
+CREATE VIRTUAL TABLE node_fts USING fts5(
+  title, body, path, tags_text,
+  content='node', content_rowid='id',
+  tokenize="porter unicode61 remove_diacritics 2 tokenchars '_-.'"
+);
+CREATE TRIGGER node_ai AFTER INSERT ON node BEGIN
+  INSERT INTO node_fts(rowid, title, body, path, tags_text)
+  VALUES (new.id, new.title, new.body, new.path, new.tags_text);
+END;
+CREATE TRIGGER node_ad AFTER DELETE ON node BEGIN
+  INSERT INTO node_fts(node_fts, rowid, title, body, path, tags_text)
+  VALUES ('delete', old.id, old.title, old.body, old.path, old.tags_text);
+END;
+CREATE TRIGGER node_au AFTER UPDATE OF title, body, path, tags_text ON node BEGIN
+  INSERT INTO node_fts(node_fts, rowid, title, body, path, tags_text)
+  VALUES ('delete', old.id, old.title, old.body, old.path, old.tags_text);
+  INSERT INTO node_fts(rowid, title, body, path, tags_text)
+  VALUES (new.id, new.title, new.body, new.path, new.tags_text);
+END;
+INSERT INTO node_fts(node_fts) VALUES ('rebuild');
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -130,6 +159,55 @@ mod tests {
         assert_eq!(v, SCHEMA_VERSION);
         // Re-running is a no-op, not an error.
         migrate(&conn).unwrap();
+    }
+
+    #[test]
+    fn v2_porter_stemming_and_up_migration_from_v1() {
+        // Fresh DB at current version: stemming works through the triggers.
+        let conn = crate::db::open_in_memory().unwrap();
+        conn.execute(
+            "INSERT INTO node (uid, kind, body, created_at, updated_at)
+             VALUES ('X', 'memory', 'we authenticate against the broker', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let hits = |q: &str| -> i64 {
+            conn.query_row(
+                "SELECT count(*) FROM node_fts WHERE node_fts MATCH ?1",
+                [q],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(hits("authentication"), 1, "stemmed match");
+        assert_eq!(hits("authenticated"), 1, "stemmed match");
+    }
+
+    #[test]
+    fn migrating_v1_data_rebuilds_fts() {
+        // Simulate a v1 database with existing rows, then migrate to v2:
+        // the rebuilt index must cover pre-existing content.
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "BEGIN;\n{}\nPRAGMA user_version = 1;\nCOMMIT;",
+            MIGRATIONS[0]
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node (uid, kind, body, created_at, updated_at)
+             VALUES ('Y', 'memory', 'configuring the indexer pipeline', 1, 1)",
+            [],
+        )
+        .unwrap();
+        migrate(&conn).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM node_fts WHERE node_fts MATCH 'configure'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "old rows must be searchable (stemmed) after rebuild");
     }
 
     #[test]

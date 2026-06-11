@@ -2,8 +2,12 @@
 //!
 //! No vector extension — embeddings are L2-normalized f32 blobs, so
 //! cosine == dot, and exact scan of ≤200k vectors takes single-digit ms.
-//! The cache reloads when another connection commits (data_version) or
-//! this connection writes (total_changes).
+//!
+//! Invalidation contract: other connections' commits are caught via
+//! `PRAGMA data_version`. Same-connection embedding mutations do NOT
+//! auto-invalidate (deliberately — recall's own event logging must not
+//! force a rebuild every call); the only same-connection mutator is
+//! `embed_pending`, and `Mimir` drops its cache after calling it.
 
 use std::collections::HashSet;
 
@@ -18,17 +22,14 @@ pub struct MatrixCache {
     dim: usize,
     node_ids: Vec<i64>,
     data: Vec<f32>,
-    stamp: (i64, i64),
-}
-
-fn stamp(conn: &Connection) -> Result<(i64, i64)> {
-    Ok((crate::db::data_version(conn)?, conn.total_changes() as i64))
+    stamp: i64,
 }
 
 impl MatrixCache {
-    /// Load (or refresh) the matrix for `model` if anything changed.
+    /// Load (or refresh) the matrix for `model` if another connection
+    /// committed since the last load.
     pub fn ensure(conn: &Connection, model: &str, cache: &mut Option<MatrixCache>) -> Result<()> {
-        let stamp = stamp(conn)?;
+        let stamp = crate::db::data_version(conn)?;
         if let Some(c) = cache {
             if c.model == model && c.stamp == stamp {
                 return Ok(());
@@ -192,13 +193,16 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        // Fresh cache after a delete excludes the deleted node. (With a
+        // stale cache the leg may still return it; fusion filters those.)
         store::soft_delete(&conn, a).unwrap();
+        cache = None;
         let ids = leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &q(), 10).unwrap();
         assert_eq!(ids, vec![b]);
     }
 
     #[test]
-    fn cache_refreshes_after_same_connection_writes() {
+    fn same_connection_writes_need_explicit_invalidation() {
         let conn = db::open_in_memory().unwrap();
         let a = add_with_vec(&conn, "a", &[1.0, 0.0]);
         let mut cache = None;
@@ -206,9 +210,14 @@ mod tests {
             leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &q(), 10).unwrap(),
             vec![a]
         );
+        // Same-connection write: cache deliberately stays stale…
         let b = add_with_vec(&conn, "b", &[1.0, 0.0]);
         let ids = leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &q(), 10).unwrap();
-        assert!(ids.contains(&b), "cache did not pick up new embedding");
+        assert_eq!(ids, vec![a], "no auto-reload on own writes");
+        // …until dropped (what Mimir::embed_pending does).
+        cache = None;
+        let ids = leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &q(), 10).unwrap();
+        assert!(ids.contains(&b));
     }
 
     #[test]
