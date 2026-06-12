@@ -176,8 +176,7 @@ pub fn file_slice(conn: &Connection, reference: &str) -> Result<Option<String>> 
     let coll = store::get_node(conn, collection_id)?;
     let abs = Path::new(coll.path.as_deref().unwrap_or("")).join(rel);
     let content = std::fs::read_to_string(&abs).map_err(|e| Error::io(&abs, e))?;
-    store::touch_accessed(conn, file.id)?;
-    store::record_event(conn, file.id, "opened", None, None, None)?;
+    crate::learn::record_opened(conn, file.id)?;
     let total = content.lines().count();
     let (a, b) = span.unwrap_or((1, total));
     let mut out = format!("{rel}:{a}-{} ({total} lines)", b.min(total));

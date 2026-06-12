@@ -256,6 +256,18 @@ pub fn recall(
         .map(|(rank, hit)| (hit.node.id, rank as i64, hit.score))
         .collect();
     store::record_shown(&mimir.conn, query_hash.as_bytes(), &shown)?;
+    if let Some(report) = mimir_core::consolidate::maybe_auto(
+        &mimir.conn,
+        &mimir.config.embedding.model,
+        &mimir.config.consolidate.auto,
+    ) {
+        if !report.is_empty() {
+            eprintln!(
+                "(consolidated: {} superseded, {} distilled, {} archived)",
+                report.superseded, report.distilled, report.archived
+            );
+        }
+    }
 
     let projects = store::project_titles(&mimir.conn)?;
     if hits.is_empty() && !json {
@@ -307,8 +319,7 @@ pub fn get(json: bool, refs: Vec<String>) -> Result<()> {
             continue;
         }
         let node = store::resolve_ref(&mimir.conn, r)?;
-        store::touch_accessed(&mimir.conn, node.id)?;
-        store::record_event(&mimir.conn, node.id, "opened", None, None, None)?;
+        mimir_core::learn::record_opened(&mimir.conn, node.id)?;
         if json {
             println!("{}", node_json(&node, &projects));
         } else {
@@ -348,6 +359,49 @@ pub fn list(
     Ok(())
 }
 
+pub fn mark(reference: &str, useful: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let node = resolve_any(&mimir, reference)?;
+    let strength = mimir_core::learn::apply_mark(&mimir.conn, node.id, useful)?;
+    println!(
+        "{} {} → strength {strength:.2}",
+        short_uid(node.kind, &node.uid),
+        if useful { "useful" } else { "noise" },
+    );
+    Ok(())
+}
+
+pub fn consolidate(dry_run: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let report =
+        mimir_core::consolidate::consolidate(&mimir.conn, &mimir.config.embedding.model, dry_run)?;
+    print_consolidate_report(&report, dry_run);
+    Ok(())
+}
+
+fn print_consolidate_report(report: &mimir_core::consolidate::Report, dry_run: bool) {
+    let prefix = if dry_run { "would " } else { "" };
+    if report.is_empty() {
+        println!("nothing to consolidate");
+        return;
+    }
+    if report.superseded > 0 {
+        println!("{prefix}supersede {} near-duplicate(s)", report.superseded);
+    }
+    if report.distilled > 0 {
+        println!(
+            "{prefix}distill {} cluster(s) into summaries",
+            report.distilled
+        );
+    }
+    if report.archived > 0 {
+        println!("{prefix}archive {} decayed memorie(s)", report.archived);
+    }
+    for (a, b) in &report.contradictions {
+        println!("possible contradiction (review by hand):\n  {a}\n  {b}");
+    }
+}
+
 pub fn forget(reference: &str, hard: bool) -> Result<()> {
     let mimir = Mimir::open()?;
     let node = store::resolve_ref(&mimir.conn, reference)?;
@@ -365,6 +419,7 @@ pub fn forget(reference: &str, hard: bool) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn edit(
     json: bool,
     reference: &str,
@@ -372,6 +427,7 @@ pub fn edit(
     title: Option<String>,
     mtype: Option<String>,
     tags: Option<Vec<String>>,
+    pin: Option<bool>,
 ) -> Result<()> {
     let mimir = Mimir::open()?;
     let node = store::resolve_ref(&mimir.conn, reference)?;
@@ -382,8 +438,16 @@ pub fn edit(
         mtype,
         tags,
     };
-    if edit.text.is_none() && edit.title.is_none() && edit.mtype.is_none() && edit.tags.is_none() {
-        bail!("nothing to change: pass TEXT, --title, --type, or --tags");
+    if edit.text.is_none()
+        && edit.title.is_none()
+        && edit.mtype.is_none()
+        && edit.tags.is_none()
+        && pin.is_none()
+    {
+        bail!("nothing to change: pass TEXT, --title, --type, --tags, or --pin/--unpin");
+    }
+    if let Some(pin) = pin {
+        store::set_pinned(&mimir.conn, node.id, pin)?;
     }
     let updated = memory::edit(&mimir.conn, node.id, edit)?;
     let projects = store::project_titles(&mimir.conn)?;

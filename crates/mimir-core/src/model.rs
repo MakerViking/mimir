@@ -59,6 +59,7 @@ str_enum!(MemoryType {
     Idea => "idea",
     Note => "note",
     Person => "person",
+    Summary => "summary",
 });
 
 str_enum!(Rel {

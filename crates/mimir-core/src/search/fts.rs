@@ -22,7 +22,7 @@ const STOPWORDS: &[&str] = &[
     "were", "what", "when", "where", "which", "who", "why", "will", "with", "would", "you", "your",
 ];
 
-fn is_stopword(token: &str) -> bool {
+pub fn is_stopword(token: &str) -> bool {
     STOPWORDS.binary_search(&token).is_ok()
 }
 

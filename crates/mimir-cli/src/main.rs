@@ -118,6 +118,11 @@ enum Command {
         mtype: Option<String>,
         #[arg(long, value_delimiter = ',')]
         tags: Option<Vec<String>>,
+        /// Exempt from decay and consolidation merging.
+        #[arg(long, conflicts_with = "unpin")]
+        pin: bool,
+        #[arg(long)]
+        unpin: bool,
     },
     /// Create an edge between two nodes.
     Link {
@@ -145,6 +150,23 @@ enum Command {
         /// With --fetch: also download the reranker model.
         #[arg(long)]
         rerank: bool,
+    },
+    /// Strengthen or weaken a memory's ranking (explicit feedback).
+    Mark {
+        reference: String,
+        /// This was useful (+1 strength).
+        #[arg(long, conflicts_with = "noise")]
+        useful: bool,
+        /// This was noise (-1 strength).
+        #[arg(long)]
+        noise: bool,
+    },
+    /// Run the four consolidation passes (dedup, contradictions,
+    /// distillation, decay archival).
+    Consolidate {
+        /// Report without changing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Run the MCP stdio server (what Claude Code launches).
     Mcp,
@@ -314,7 +336,23 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             title,
             mtype,
             tags,
-        } => commands::edit(cli.json, &reference, text.join(" "), title, mtype, tags),
+            pin,
+            unpin,
+        } => commands::edit(
+            cli.json,
+            &reference,
+            text.join(" "),
+            title,
+            mtype,
+            tags,
+            if pin {
+                Some(true)
+            } else if unpin {
+                Some(false)
+            } else {
+                None
+            },
+        ),
         Command::Link { a, b, rel } => commands::link(&a, &b, &rel),
         Command::Docs { cmd } => match cmd {
             DocsCmd::Add { path, name, global } => commands::docs_add(&path, name, global),
@@ -324,6 +362,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Index { name } => commands::index(name),
         Command::Embed { fetch, rerank } => commands::embed(fetch, rerank),
+        Command::Mark {
+            reference,
+            useful,
+            noise,
+        } => commands::mark(&reference, useful || !noise),
+        Command::Consolidate { dry_run } => commands::consolidate(dry_run),
         Command::Mcp => mcp::run(),
         Command::Graph { cmd } => match cmd {
             GraphCmd::Build | GraphCmd::Update => graph_cmd::build(),

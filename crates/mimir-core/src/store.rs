@@ -277,6 +277,15 @@ pub fn record_shown(
     Ok(())
 }
 
+/// Pin/unpin: pinned nodes never decay and never get superseded.
+pub fn set_pinned(conn: &Connection, id: i64, pinned: bool) -> Result<()> {
+    conn.execute(
+        "UPDATE node SET pinned = ?2 WHERE id = ?1",
+        params![id, pinned],
+    )?;
+    Ok(())
+}
+
 /// Bump access stats; called when a node's full body is opened.
 pub fn touch_accessed(conn: &Connection, id: i64) -> Result<()> {
     conn.execute(

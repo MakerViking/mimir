@@ -113,8 +113,7 @@ pub fn node_info(reference: &str) -> Result<()> {
     if let Some(body) = &sym.body {
         println!("{body}");
     }
-    store::touch_accessed(&mimir.conn, sym.id)?;
-    store::record_event(&mimir.conn, sym.id, "opened", None, None, None)?;
+    mimir_core::learn::record_opened(&mimir.conn, sym.id)?;
     for edge in store::edges_of(&mimir.conn, sym.id)? {
         let (arrow, other_id) = if edge.src == sym.id {
             ("→", edge.dst)

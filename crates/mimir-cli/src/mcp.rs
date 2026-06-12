@@ -80,6 +80,14 @@ pub struct GetArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct MarkArgs {
+    /// Node reference (id from a recall hit).
+    pub r#ref: String,
+    /// true = useful (+1 strength), false = noise (-1 strength).
+    pub useful: bool,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct GraphArgs {
     /// callers | calls | impact | node | path | hubs
     pub op: String,
@@ -251,9 +259,7 @@ impl MimirServer {
                 return Ok(slice);
             }
             let node = store::resolve_ref(&m.conn, &args.r#ref).map_err(engine_err)?;
-            store::touch_accessed(&m.conn, node.id).map_err(engine_err)?;
-            store::record_event(&m.conn, node.id, "opened", None, None, None)
-                .map_err(engine_err)?;
+            mimir_core::learn::record_opened(&m.conn, node.id).map_err(engine_err)?;
             let projects = store::project_titles(&m.conn).map_err(engine_err)?;
             mimir_core::format::full_record(&m.conn, &node, &projects).map_err(engine_err)
         })
@@ -353,9 +359,7 @@ impl MimirServer {
                 }
                 "node" => {
                     let sym = resolve(&args.symbol)?;
-                    store::touch_accessed(&m.conn, sym.id).map_err(engine_err)?;
-                    store::record_event(&m.conn, sym.id, "opened", None, None, None)
-                        .map_err(engine_err)?;
+                    mimir_core::learn::record_opened(&m.conn, sym.id).map_err(engine_err)?;
                     let mut out = vec![mimir_graph::symbol_line(&sym)];
                     if let Some(body) = &sym.body {
                         out.push(body.clone());
@@ -418,6 +422,23 @@ impl MimirServer {
         .await
     }
 
+    #[tool(
+        description = "Explicit feedback on a recalled node: useful strengthens its future ranking, noise weakens it. Use after a memory actually helped (or misled)."
+    )]
+    async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
+        self.blocking(move |m| {
+            let node = store::resolve_ref(&m.conn, &args.r#ref).map_err(engine_err)?;
+            let strength =
+                mimir_core::learn::apply_mark(&m.conn, node.id, args.useful).map_err(engine_err)?;
+            Ok(format!(
+                "{} {} → strength {strength:.2}",
+                short_uid(node.kind, &node.uid),
+                if args.useful { "useful" } else { "noise" }
+            ))
+        })
+        .await
+    }
+
     #[tool(description = "Store overview: detected project, counts by kind, database size.")]
     async fn status(&self) -> String {
         let project_id = self.project_id;
@@ -469,6 +490,27 @@ pub fn run() -> Result<()> {
     let project_id = cwd
         .and_then(|d| engine.project_for_cwd(&d).ok().flatten())
         .map(|p| p.id);
+
+    // Weekly consolidation runs off the request path: separate thread,
+    // separate connection (WAL handles the concurrency).
+    {
+        let cadence = engine.config.consolidate.auto.clone();
+        let model = engine.config.embedding.model.clone();
+        let db_path = engine.paths.db_file.clone();
+        std::thread::spawn(move || {
+            if let Ok(conn) = mimir_core::db::open(&db_path) {
+                if let Some(r) = mimir_core::consolidate::maybe_auto(&conn, &model, &cadence) {
+                    tracing::info!(
+                        superseded = r.superseded,
+                        distilled = r.distilled,
+                        archived = r.archived,
+                        contradictions = r.contradictions.len(),
+                        "auto-consolidation ran"
+                    );
+                }
+            }
+        });
+    }
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {

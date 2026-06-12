@@ -5,11 +5,13 @@
 //! BM25 + vector retrieval with reciprocal-rank fusion.
 
 pub mod config;
+pub mod consolidate;
 pub mod db;
 pub mod embed;
 pub mod error;
 pub mod format;
 pub mod index;
+pub mod learn;
 pub mod memory;
 pub mod model;
 pub mod scope;

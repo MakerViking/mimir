@@ -49,6 +49,7 @@ pub struct Config {
     pub rerank: RerankConfig,
     pub scoring: ScoringConfig,
     pub output: OutputConfig,
+    pub consolidate: ConsolidateConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +61,22 @@ pub struct EmbeddingConfig {
     /// (--features gpu-webgpu / gpu-cuda), falling back to CPU if it
     /// fails to initialize; "cpu" forces CPU even in a GPU build.
     pub device: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ConsolidateConfig {
+    /// "weekly" runs the four consolidation passes automatically
+    /// (debounced, off the request path); "off" disables.
+    pub auto: String,
+}
+
+impl Default for ConsolidateConfig {
+    fn default() -> Self {
+        ConsolidateConfig {
+            auto: "weekly".into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -75,15 +75,17 @@ pub fn search_hybrid(
         }
     }
 
+    let now = crate::model::now_unix();
     let mut hits: Vec<Hit> = rrf
         .into_iter()
         .filter_map(|(id, base)| match store::get_node(conn, id) {
             // A stale vector cache may still hold soft-deleted nodes;
-            // they must never surface.
-            Ok(node) if node.deleted_at.is_some() => None,
+            // they (and superseded memories) must never surface.
+            Ok(node) if node.deleted_at.is_some() || node.superseded_by.is_some() => None,
             Ok(node) => {
-                // Strength is a tiebreaker multiplier, never a burier.
-                let score = base * (1.0 + query.strength_alpha * (1.0 + node.strength).ln());
+                // Decayed strength is a tiebreaker multiplier, never a burier.
+                let effective = crate::learn::effective_strength(&node, now);
+                let score = base * (1.0 + query.strength_alpha * (1.0 + effective).ln());
                 Some(Ok(Hit { node, score }))
             }
             Err(e) => Some(Err(e)),
