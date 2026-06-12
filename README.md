@@ -109,6 +109,7 @@ mimir recall tricky semantic question --rerank  # cross-encoder rescoring (~1 s 
 mimir graph build                 # tree-sitter extraction, incremental
 mimir graph callers resolve_ref   # who calls this?
 mimir graph impact $(git diff --name-only)   # blast radius of a change
+mimir graph viz --open            # interactive graph map (self-contained HTML)
 mimir link m:ABC123 my_function --rel about  # decisions ↔ code
 
 # feedback & hygiene

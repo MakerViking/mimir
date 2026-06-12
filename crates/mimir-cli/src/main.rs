@@ -1,6 +1,7 @@
 mod commands;
 mod dashboard;
 mod graph_cmd;
+mod graph_viz;
 mod mcp;
 
 use clap::{Parser, Subcommand};
@@ -249,6 +250,19 @@ enum GraphCmd {
         #[arg(long, default_value_t = 4)]
         min_size: usize,
     },
+    /// Interactive HTML visualization of the project graph (memories,
+    /// symbols, files, docs and the edges between them).
+    Viz {
+        /// Output path (default: temp dir).
+        #[arg(short, long)]
+        out: Option<String>,
+        /// Open in the default browser.
+        #[arg(long)]
+        open: bool,
+        /// Node budget: all memories + best-connected code up to this many.
+        #[arg(long, default_value_t = 1500)]
+        max_nodes: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -417,6 +431,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             GraphCmd::Communities { persist, min_size } => {
                 graph_cmd::communities(persist, min_size)
             }
+            GraphCmd::Viz {
+                out,
+                open,
+                max_nodes,
+            } => graph_viz::viz(out, open, max_nodes),
         },
     }
 }
