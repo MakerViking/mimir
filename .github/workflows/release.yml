@@ -1,0 +1,70 @@
+name: Release
+
+# Tag a version (`git tag v0.1.0 && git push --tags`) to build and publish
+# prebuilt binaries. CPU-only on purpose: they run on any machine. GPU
+# builds stay source-only (see README) since they dynamically link
+# vendor-specific provider libraries.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { name: linux-aarch64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-gnu }
+          - { name: macos-x86_64, os: macos-13, target: x86_64-apple-darwin }
+          - { name: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
+          - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p mimir-cli
+      - name: Package (unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/mimir dist/
+          cp README.md LICENSE-MIT LICENSE-APACHE dist/
+          tar -czf mimir-${{ matrix.name }}.tar.gz -C dist .
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/mimir.exe dist/
+          Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE dist/
+          Compress-Archive -Path dist/* -DestinationPath mimir-${{ matrix.name }}.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mimir-${{ matrix.name }}
+          path: mimir-${{ matrix.name }}.*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: mimir-*
+          generate_release_notes: true

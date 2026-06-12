@@ -3,3 +3,8 @@
 # binary instead of fiddling with LD_LIBRARY_PATH. Harmless otherwise.
 [target.'cfg(target_os = "linux")']
 rustflags = ["-C", "link-args=-Wl,-rpath,$ORIGIN"]
+
+# rustc's ThinLTO worker segfaults on the default stack when linking the
+# large onnxruntime GPU binaries (--features gpu-*). Harmless otherwise.
+[env]
+RUST_MIN_STACK = "33554432"

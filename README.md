@@ -26,6 +26,18 @@ exposed to agents as a single, globally-registered MCP server.
 
 ## Install
 
+Prebuilt binary (Linux x86_64/aarch64, macOS Intel/Apple Silicon):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/MakerViking/mimir/main/install.sh | sh
+```
+
+Windows: grab `mimir-windows-x86_64.zip` from the
+[latest release](https://github.com/MakerViking/mimir/releases) and put
+`mimir.exe` on your PATH.
+
+From source (any platform with [Rust](https://rustup.rs)):
+
 ```sh
 cargo install --path crates/mimir-cli   # from a checkout (crates.io soon)
 ```
@@ -82,6 +94,22 @@ claude mcp add --scope user mimir -- mimir mcp
 ```
 
 MCP tools: `recall`, `remember`, `get`, `link`, `status`.
+
+### Works with any MCP client
+
+Nothing here is Claude-specific: `mimir mcp` is a standard stdio MCP
+server, so any MCP-capable agent can use it — Cursor, Windsurf, Cline,
+Zed, VS Code (Copilot agent mode), Gemini CLI, Codex CLI, … For clients
+configured via JSON, the entry is simply:
+
+```json
+{ "mcpServers": { "mimir": { "command": "mimir", "args": ["mcp"] } } }
+```
+
+The project is detected from the directory the client launches the server
+in (override with the `MIMIR_PROJECT` env var). And agents without MCP can
+just shell out — the CLI's default output is the same token-lean format
+the server returns.
 
 ## How it works
 
