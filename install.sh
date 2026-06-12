@@ -43,7 +43,7 @@ mkdir -p "$BIN_DIR"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 curl -fsSL "$url" -o "$tmp/mimir.tar.gz"
-tar -xzf "$tmp/mimir.tar.gz" -C "$tmp" mimir
+tar -xzf "$tmp/mimir.tar.gz" -C "$tmp"
 install -m 755 "$tmp/mimir" "$BIN_DIR/mimir"
 
 case ":$PATH:" in
