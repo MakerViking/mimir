@@ -205,3 +205,76 @@ mod tests {
         assert_eq!(search(&conn, &q("weird input")).unwrap().len(), 1);
     }
 }
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+    use crate::embed::to_blob;
+    use crate::model::{Kind, NewNode};
+    use crate::store;
+
+    /// 100k-chunk scale check (plan target: warm hybrid < 100 ms).
+    /// Heavy to seed — run explicitly: cargo test -p mimir-mem-core --release perf_100k -- --ignored
+    #[test]
+    #[ignore]
+    fn perf_100k_chunks_warm_search_under_100ms() {
+        let conn = crate::db::open_in_memory().unwrap();
+        const N: usize = 100_000;
+        const DIM: usize = 384;
+        // Deterministic LCG (no rand dep) for synthetic vectors.
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / 16_777_216.0 - 0.5
+        };
+
+        let tx = conn.unchecked_transaction().unwrap();
+        for i in 0..N {
+            let mut new = NewNode::new(Kind::Chunk);
+            new.title = Some(format!("doc{} › section {}", i / 40, i % 40));
+            // Selective vocabulary: ~100 docs per topic term, ~1.3k per
+            // fragment term — realistic posting-list sizes.
+            new.body = Some(format!(
+                "chunk{i} topic{} fragment{} item{}",
+                i % 997,
+                i % 79,
+                i % 13
+            ));
+            let node = store::insert_node(&tx, new).unwrap();
+            let mut v: Vec<f32> = (0..DIM).map(|_| next()).collect();
+            crate::embed::l2_normalize(&mut v);
+            tx.execute(
+                "INSERT INTO embedding (node_id, model, dim, vec, content_hash)
+                 VALUES (?1, 'perf', ?2, ?3, x'00')",
+                rusqlite::params![node.id, DIM as i64, to_blob(&v)],
+            )
+            .unwrap();
+        }
+        tx.commit().unwrap();
+
+        let mut qv: Vec<f32> = (0..DIM).map(|_| next()).collect();
+        crate::embed::l2_normalize(&mut qv);
+        let query = SearchQuery {
+            text: "topic42 fragment7 item3".into(),
+            scope: Scope::All,
+            kinds: vec![],
+            since: None,
+            limit: 10,
+            strength_alpha: 0.15,
+        };
+        let mut cache = None;
+        // Cold: builds the 100k×384 matrix.
+        search_hybrid(&conn, &query, Some(("perf", &qv)), &mut cache).unwrap();
+        // Warm: the contractual measurement.
+        let started = std::time::Instant::now();
+        let hits = search_hybrid(&conn, &query, Some(("perf", &qv)), &mut cache).unwrap();
+        let elapsed = started.elapsed();
+        assert_eq!(hits.len(), 10);
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "warm hybrid over 100k took {elapsed:?} (budget 100 ms)"
+        );
+    }
+}

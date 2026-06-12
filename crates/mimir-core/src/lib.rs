@@ -10,6 +10,7 @@ pub mod db;
 pub mod embed;
 pub mod error;
 pub mod format;
+pub mod import;
 pub mod index;
 pub mod learn;
 pub mod memory;

@@ -18,6 +18,14 @@ exposed to agents as a single, globally-registered MCP server.
   reciprocal-rank fusion. Optional cross-encoder reranking (`--rerank`) when
   you want maximum precision over speed. No model downloaded? Everything
   still works, BM25-only.
+- **Code graph.** Tree-sitter symbol extraction (Rust, TypeScript/JS,
+  Python, Go) with call/import edges: `graph callers`, `impact` (blast
+  radius of a diff), `path`, `hubs` — and code symbols participate in
+  semantic recall. Link memories to functions and they surface together.
+- **Self-learning.** Recall usage strengthens what helps (`mark` for
+  explicit feedback); typed half-life decay quiets what doesn't; weekly
+  LLM-free consolidation dedups, flags contradictions, distills clusters,
+  and archives the dead — never destructively.
 - **Made for agents.** Default output is one ~25-token line per hit.
   The MCP server registers once (`--scope user`) and serves every repo,
   detecting the current project from its working directory.
@@ -89,11 +97,25 @@ mimir recall tricky semantic question --rerank  # cross-encoder rescoring (~1 s 
 # config.toml: embedding.model = "bge-base-en-v1.5" — stronger semantic
 # matching at the same query latency (index-time embedding is ~4x slower)
 
+# code graph
+mimir graph build                 # tree-sitter extraction, incremental
+mimir graph callers resolve_ref   # who calls this?
+mimir graph impact $(git diff --name-only)   # blast radius of a change
+mimir link m:ABC123 my_function --rel about  # decisions ↔ code
+
+# feedback & hygiene
+mimir mark m:ABC123 --useful      # strengthen future ranking
+mimir consolidate --dry-run       # dedup/contradictions/distill/archive
+
+# escape hatches
+mimir import openbrain export.txt | claude-memory <dir> | qmd
+mimir export > backup.jsonl       # everything, always yours
+
 # agents (Claude Code etc.) — register once, works in every repo
 claude mcp add --scope user mimir -- mimir mcp
 ```
 
-MCP tools: `recall`, `remember`, `get`, `link`, `status`.
+MCP tools: `recall`, `remember`, `get`, `link`, `graph`, `mark`, `status`.
 
 ### Works with any MCP client
 
@@ -126,12 +148,10 @@ set `MIMIR_HOME=<dir>` to put everything under one directory instead.
 
 ## Roadmap
 
-- **v0.2** — code graph: tree-sitter symbol extraction (Rust/TS/Python),
-  call/import edges, impact queries, memory↔code links.
-- **v0.3** — self-learning: recall feedback ledger, strength/decay ranking,
-  LLM-free consolidation (dedup, contradiction flagging, distillation).
-- **v1.0** — importers (OpenBrain, Claude auto-memory, QMD), prebuilt
-  binaries, more languages.
+v0.4 ships the complete original blueprint: memories, docs, code graph,
+hybrid + reranked search, self-learning, importers, prebuilt binaries.
+Next: crates.io release, more languages, and whatever using it daily
+teaches us.
 
 ## License
 

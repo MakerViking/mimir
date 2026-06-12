@@ -3,15 +3,17 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MakerViking/mimir"
 authors = ["Thomas H"]
 
 [workspace.dependencies]
-mimir-core = { path = "crates/mimir-core" }
-mimir-graph = { path = "crates/mimir-graph" }
+# Path deps carry versions so the workspace is publishable as-is.
+# Published names: mimir-mem (bin mimir), mimir-mem-core, mimir-graph.
+mimir-core = { path = "crates/mimir-core", package = "mimir-mem-core", version = "0.4.0" }
+mimir-graph = { path = "crates/mimir-graph", version = "0.4.0" }
 
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }

@@ -170,3 +170,69 @@ fn isolated_home_never_touches_user_dirs() {
     assert!(entries.iter().any(|e| e == "mimir.db"), "{entries:?}");
     assert!(Path::new(env!("CARGO_BIN_EXE_mimir")).exists());
 }
+
+#[test]
+fn concurrent_writers_and_readers_no_sqlite_busy() {
+    // CLI + MCP running at once is the normal, supported case. Simulate:
+    // one thread writes memories while another searches, both as real
+    // separate processes (separate connections, WAL).
+    let h = Harness::new();
+    h.ok(&["init", "--no-model"]);
+    h.ok(&[
+        "remember",
+        "seed memory for concurrent search",
+        "-t",
+        "note",
+    ]);
+
+    let home = h.home.path().to_path_buf();
+    let cwd = h.cwd.path().to_path_buf();
+    let run = move |args: Vec<String>, home: std::path::PathBuf, cwd: std::path::PathBuf| {
+        Command::new(env!("CARGO_BIN_EXE_mimir"))
+            .args(&args)
+            .env("MIMIR_HOME", home)
+            .current_dir(cwd)
+            .output()
+            .expect("spawn")
+    };
+
+    let writer = {
+        let (home, cwd) = (home.clone(), cwd.clone());
+        std::thread::spawn(move || {
+            for i in 0..12 {
+                let out = run(
+                    vec![
+                        "remember".into(),
+                        format!("concurrent fact number {i} about turbines"),
+                        "--force".into(),
+                    ],
+                    home.clone(),
+                    cwd.clone(),
+                );
+                assert!(
+                    out.status.success(),
+                    "writer {i}: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+        })
+    };
+    let reader = std::thread::spawn(move || {
+        for i in 0..12 {
+            let out = run(
+                vec!["recall".into(), "concurrent turbines".into()],
+                home.clone(),
+                cwd.clone(),
+            );
+            assert!(
+                out.status.success(),
+                "reader {i}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(!err.contains("locked"), "SQLITE_BUSY leaked: {err}");
+        }
+    });
+    writer.join().unwrap();
+    reader.join().unwrap();
+}

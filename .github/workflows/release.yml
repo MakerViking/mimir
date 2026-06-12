@@ -36,7 +36,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p mimir-cli
+        run: cargo build --release --target ${{ matrix.target }} -p mimir-mem
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |

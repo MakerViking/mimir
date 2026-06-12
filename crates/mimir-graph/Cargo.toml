@@ -6,6 +6,8 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["tree-sitter", "code-graph", "mcp", "agent"]
+categories = ["development-tools"]
 
 [dependencies]
 mimir-core.workspace = true

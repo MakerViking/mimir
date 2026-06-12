@@ -1,11 +1,17 @@
 [package]
-name = "mimir-core"
+name = "mimir-mem-core"
 description = "Engine for Mimir: unified local-first memory for AI coding agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["memory", "mcp", "agent", "search", "sqlite"]
+categories = ["command-line-utilities", "database"]
+
+# Keep the import path `mimir_core::` despite the published package name.
+[lib]
+name = "mimir_core"
 
 [features]
 # GPU acceleration for embedding/reranking (optional; CPU-only by default).

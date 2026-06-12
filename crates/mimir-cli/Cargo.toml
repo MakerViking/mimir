@@ -1,11 +1,13 @@
 [package]
-name = "mimir-cli"
+name = "mimir-mem"
 description = "Mimir: unified local-first memory for AI coding agents"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 authors.workspace = true
+keywords = ["memory", "mcp", "agent", "claude", "search"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "mimir"
@@ -24,6 +26,7 @@ mimir-graph.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
+directories.workspace = true
 libc = "0.2"
 rmcp.workspace = true
 schemars.workspace = true

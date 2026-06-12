@@ -585,6 +585,80 @@ pub fn index(name: Option<String>) -> Result<()> {
     Ok(())
 }
 
+// ---------- import / export ----------
+
+pub fn import_openbrain(file: &str) -> Result<()> {
+    let mut mimir = Mimir::open()?;
+    let text = if file == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        buf
+    } else {
+        std::fs::read_to_string(file).with_context(|| format!("read {file}"))?
+    };
+    let stats = mimir_core::import::openbrain(&mimir.conn, &text)?;
+    finish_import(&mut mimir, stats)
+}
+
+pub fn import_claude_memory(dir: &str) -> Result<()> {
+    let mut mimir = Mimir::open()?;
+    let stats = mimir_core::import::claude_memory(&mimir.conn, std::path::Path::new(dir))?;
+    finish_import(&mut mimir, stats)
+}
+
+pub fn import_qmd(file: Option<String>) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let path = match file {
+        Some(f) => std::path::PathBuf::from(f),
+        None => directories::BaseDirs::new()
+            .context("cannot resolve home")?
+            .home_dir()
+            .join(".config/qmd/index.yml"),
+    };
+    let yml = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+    let collections = mimir_core::import::qmd_collections(&yml);
+    if collections.is_empty() {
+        bail!("no collections found in {}", path.display());
+    }
+    for (name, root) in &collections {
+        let root_path = std::path::Path::new(root);
+        if !root_path.is_dir() {
+            eprintln!("skipping {name}: {root} is not a directory");
+            continue;
+        }
+        let coll = mimir_core::index::add_collection(&mimir.conn, root_path, name, None)?;
+        println!(
+            "registered {} {} {}",
+            short_uid(coll.kind, &coll.uid),
+            name,
+            root
+        );
+    }
+    println!("run `mimir index` to scan them");
+    Ok(())
+}
+
+fn finish_import(mimir: &mut Mimir, stats: mimir_core::import::ImportStats) -> Result<()> {
+    println!(
+        "imported {} memorie(s), skipped {} duplicate(s)",
+        stats.imported, stats.skipped_duplicates
+    );
+    let embedded = mimir.embed_pending()?;
+    if embedded > 0 {
+        println!("embedded {embedded} node(s)");
+    }
+    Ok(())
+}
+
+pub fn export() -> Result<()> {
+    let mimir = Mimir::open()?;
+    let stdout = std::io::stdout();
+    let mut lock = stdout.lock();
+    let n = mimir_core::import::export_jsonl(&mimir.conn, &mut lock)?;
+    eprintln!("exported {n} line(s)");
+    Ok(())
+}
+
 // ---------- helpers ----------
 
 /// Resolve ids first, then symbol names within the current project — so

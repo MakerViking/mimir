@@ -168,12 +168,32 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Import memories from the tools Mimir replaces.
+    Import {
+        #[command(subcommand)]
+        cmd: ImportCmd,
+    },
+    /// Dump all live nodes and edges as JSONL (backup / migration).
+    Export,
     /// Run the MCP stdio server (what Claude Code launches).
     Mcp,
     /// Build and query the code graph of the current project.
     Graph {
         #[command(subcommand)]
         cmd: GraphCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImportCmd {
+    /// OpenBrain `list_thoughts` text export (file or - for stdin).
+    Openbrain { file: String },
+    /// A Claude Code auto-memory directory (the per-project memory/ dir).
+    ClaudeMemory { dir: String },
+    /// Register the collections from a qmd index.yml, then `mimir index`.
+    Qmd {
+        /// Path to index.yml (default: ~/.config/qmd/index.yml).
+        file: Option<String>,
     },
 }
 
@@ -368,6 +388,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             noise,
         } => commands::mark(&reference, useful || !noise),
         Command::Consolidate { dry_run } => commands::consolidate(dry_run),
+        Command::Import { cmd } => match cmd {
+            ImportCmd::Openbrain { file } => commands::import_openbrain(&file),
+            ImportCmd::ClaudeMemory { dir } => commands::import_claude_memory(&dir),
+            ImportCmd::Qmd { file } => commands::import_qmd(file),
+        },
+        Command::Export => commands::export(),
         Command::Mcp => mcp::run(),
         Command::Graph { cmd } => match cmd {
             GraphCmd::Build | GraphCmd::Update => graph_cmd::build(),

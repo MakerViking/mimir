@@ -1738,15 +1738,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
-name = "mimir-cli"
-version = "0.1.0"
+name = "mimir-graph"
+version = "0.4.0"
+dependencies = [
+ "blake3",
+ "ignore",
+ "mimir-mem-core",
+ "petgraph",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-python",
+ "tree-sitter-rust",
+ "tree-sitter-typescript",
+]
+
+[[package]]
+name = "mimir-mem"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "directories",
  "libc",
- "mimir-core",
  "mimir-graph",
+ "mimir-mem-core",
  "rmcp",
  "schemars",
  "serde",
@@ -1758,8 +1778,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "mimir-core"
-version = "0.1.0"
+name = "mimir-mem-core"
+version = "0.4.0"
 dependencies = [
  "blake3",
  "directories",
@@ -1776,25 +1796,6 @@ dependencies = [
  "toml",
  "tracing",
  "ulid",
-]
-
-[[package]]
-name = "mimir-graph"
-version = "0.1.0"
-dependencies = [
- "blake3",
- "ignore",
- "mimir-core",
- "petgraph",
- "rusqlite",
- "serde_json",
- "tempfile",
- "tracing",
- "tree-sitter",
- "tree-sitter-go",
- "tree-sitter-python",
- "tree-sitter-rust",
- "tree-sitter-typescript",
 ]
 
 [[package]]
