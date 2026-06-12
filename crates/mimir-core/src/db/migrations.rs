@@ -124,6 +124,12 @@ CREATE TRIGGER node_au AFTER UPDATE OF title, body, path, tags_text ON node BEGI
 END;
 INSERT INTO node_fts(node_fts) VALUES ('rebuild');
 "#,
+    // v3: code-graph lookups — symbols are matched across re-extraction by
+    // meta.stable_id, and call resolution buckets by bare name.
+    r#"
+CREATE INDEX node_symbol_stable ON node(json_extract(meta, '$.stable_id')) WHERE kind = 'symbol';
+CREATE INDEX node_symbol_name   ON node(json_extract(meta, '$.name'))      WHERE kind = 'symbol';
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

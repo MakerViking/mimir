@@ -236,6 +236,7 @@ pub fn recall(
     limit: Option<usize>,
     full: bool,
     rerank: bool,
+    linked: bool,
 ) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let query = SearchQuery {
@@ -272,6 +273,23 @@ pub fn recall(
                 "{}",
                 line(&hit.node, &projects, mimir.config.output.snippet_chars)
             );
+        }
+        if linked && !json {
+            for edge in store::edges_of(&mimir.conn, hit.node.id)?.iter().take(4) {
+                let other_id = if edge.src == hit.node.id {
+                    edge.dst
+                } else {
+                    edge.src
+                };
+                let Ok(other) = store::get_node(&mimir.conn, other_id) else {
+                    continue;
+                };
+                let l = match other.kind {
+                    Kind::Symbol => mimir_graph::symbol_line(&other),
+                    _ => line(&other, &projects, 60),
+                };
+                println!("  ~{} {}", edge.rel, l);
+            }
         }
     }
     Ok(())
@@ -383,8 +401,8 @@ pub fn edit(
 pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
     let mimir = Mimir::open()?;
     let rel: Rel = rel.parse()?;
-    let src = store::resolve_ref(&mimir.conn, a)?;
-    let dst = store::resolve_ref(&mimir.conn, b)?;
+    let src = resolve_any(&mimir, a)?;
+    let dst = resolve_any(&mimir, b)?;
     store::link(&mimir.conn, src.id, dst.id, rel, 1.0)?;
     println!(
         "{} —{rel}→ {}",
@@ -504,6 +522,22 @@ pub fn index(name: Option<String>) -> Result<()> {
 }
 
 // ---------- helpers ----------
+
+/// Resolve ids first, then symbol names within the current project — so
+/// `mimir link m:ABC123 resolve_ref --rel about` just works.
+fn resolve_any(mimir: &Mimir, reference: &str) -> Result<Node> {
+    match store::resolve_ref(&mimir.conn, reference) {
+        Ok(node) => Ok(node),
+        Err(id_err) => {
+            if let Some(proj) = mimir.project_for_cwd(&std::env::current_dir()?)? {
+                if let Ok(sym) = mimir_graph::resolve_symbol(&mimir.conn, proj.id, reference) {
+                    return Ok(sym);
+                }
+            }
+            Err(id_err.into())
+        }
+    }
+}
 
 /// Scope for read operations. Inside a project: that project + global.
 /// Outside: everything (reads want breadth; -g narrows to global-only).

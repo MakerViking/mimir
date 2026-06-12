@@ -1,4 +1,5 @@
 mod commands;
+mod graph_cmd;
 mod mcp;
 
 use clap::{Parser, Subcommand};
@@ -76,6 +77,9 @@ enum Command {
         /// reranker model: `mimir embed --fetch --rerank`).
         #[arg(long)]
         rerank: bool,
+        /// Show nodes linked to each hit (memories on code, code on memories).
+        #[arg(long)]
+        linked: bool,
     },
     /// Show full records by reference (logs the access).
     Get {
@@ -144,6 +148,55 @@ enum Command {
     },
     /// Run the MCP stdio server (what Claude Code launches).
     Mcp,
+    /// Build and query the code graph of the current project.
+    Graph {
+        #[command(subcommand)]
+        cmd: GraphCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum GraphCmd {
+    /// Extract/refresh symbols and call edges (incremental).
+    Build,
+    /// Alias of build (always incremental).
+    Update,
+    /// Who calls this symbol (transitively).
+    Callers {
+        symbol: String,
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
+    /// What this symbol calls (transitively).
+    Calls {
+        symbol: String,
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
+    /// Blast radius of changing these files (try `$(git diff --name-only)`).
+    Impact {
+        #[arg(required = true)]
+        files: Vec<String>,
+        #[arg(long, default_value_t = 3)]
+        depth: usize,
+    },
+    /// Full record for a symbol: signature, doc, edges, linked memories.
+    Node { symbol: String },
+    /// Shortest call path between two symbols.
+    Path { from: String, to: String },
+    /// Most-called symbols.
+    Hubs {
+        #[arg(short = 'n', long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Call-graph communities with heuristic names.
+    Communities {
+        /// Store them as community nodes (member_of edges).
+        #[arg(long)]
+        persist: bool,
+        #[arg(long, default_value_t = 4)]
+        min_size: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -233,6 +286,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             limit,
             full,
             rerank,
+            linked,
         } => commands::recall(
             cli.json,
             query.join(" "),
@@ -243,6 +297,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             limit,
             full,
             rerank,
+            linked,
         ),
         Command::Get { refs } => commands::get(cli.json, refs),
         Command::List {
@@ -270,5 +325,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Index { name } => commands::index(name),
         Command::Embed { fetch, rerank } => commands::embed(fetch, rerank),
         Command::Mcp => mcp::run(),
+        Command::Graph { cmd } => match cmd {
+            GraphCmd::Build | GraphCmd::Update => graph_cmd::build(),
+            GraphCmd::Callers { symbol, depth } => graph_cmd::callers(&symbol, depth),
+            GraphCmd::Calls { symbol, depth } => graph_cmd::calls(&symbol, depth),
+            GraphCmd::Impact { files, depth } => graph_cmd::impact(files, depth),
+            GraphCmd::Node { symbol } => graph_cmd::node_info(&symbol),
+            GraphCmd::Path { from, to } => graph_cmd::path(&from, &to),
+            GraphCmd::Hubs { limit } => graph_cmd::hubs(limit),
+            GraphCmd::Communities { persist, min_size } => {
+                graph_cmd::communities(persist, min_size)
+            }
+        },
     }
 }

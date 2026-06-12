@@ -1,0 +1,25 @@
+[package]
+name = "mimir-graph"
+description = "Code graph for Mimir: tree-sitter symbol extraction and graph queries"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[dependencies]
+mimir-core.workspace = true
+blake3.workspace = true
+ignore.workspace = true
+petgraph.workspace = true
+rusqlite.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tree-sitter.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

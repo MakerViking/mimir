@@ -20,6 +20,7 @@ gpu-cuda = ["mimir-core/gpu-cuda"]
 
 [dependencies]
 mimir-core.workspace = true
+mimir-graph.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true

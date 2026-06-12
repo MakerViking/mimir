@@ -80,6 +80,27 @@ pub struct GetArgs {
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
+pub struct GraphArgs {
+    /// callers | calls | impact | node | path | hubs
+    pub op: String,
+    /// Symbol reference (name, qualified name, or id) for callers/calls/node/path.
+    #[serde(default)]
+    pub symbol: Option<String>,
+    /// Second symbol for path.
+    #[serde(default)]
+    pub to: Option<String>,
+    /// Changed file paths for impact.
+    #[serde(default)]
+    pub files: Vec<String>,
+    /// Traversal depth (default 3).
+    #[serde(default)]
+    pub depth: Option<usize>,
+    /// Max results for hubs (default 10).
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
 pub struct LinkArgs {
     /// Source node reference.
     pub a: String,
@@ -258,6 +279,141 @@ impl MimirServer {
                 short_uid(src.kind, &src.uid),
                 short_uid(dst.kind, &dst.uid)
             ))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Code-graph queries for the current project: callers/calls of a symbol, impact (blast radius of changed files — pass git diff --name-only), node (full symbol record), path between symbols, hubs (most-called). Build the graph first with `mimir graph build`."
+    )]
+    async fn graph(&self, Parameters(args): Parameters<GraphArgs>) -> String {
+        let project_id = self.project_id;
+        self.blocking(move |m| {
+            let Some(project_id) = project_id else {
+                return Err("no project detected (the code graph is per-project)".into());
+            };
+            let depth = args.depth.unwrap_or(3);
+            let graph = mimir_graph::CodeGraph::load(&m.conn, project_id).map_err(engine_err)?;
+            let line = |id: i64| -> Result<String, String> {
+                let node = store::get_node(&m.conn, id).map_err(engine_err)?;
+                Ok(mimir_graph::symbol_line(&node))
+            };
+            let resolve = |r: &Option<String>| -> Result<mimir_core::model::Node, String> {
+                let r = r.as_deref().ok_or("missing 'symbol' argument")?;
+                mimir_graph::resolve_symbol(&m.conn, project_id, r).map_err(engine_err)
+            };
+            match args.op.as_str() {
+                "callers" | "calls" => {
+                    let sym = resolve(&args.symbol)?;
+                    let reached = if args.op == "callers" {
+                        graph.callers(sym.id, depth)
+                    } else {
+                        graph.calls(sym.id, depth)
+                    };
+                    if reached.is_empty() {
+                        return Ok(format!("no {} found", args.op));
+                    }
+                    let mut out = vec![mimir_graph::symbol_line(&sym)];
+                    for r in reached {
+                        out.push(format!("{}{}", "  ".repeat(r.distance), line(r.id)?));
+                    }
+                    Ok(out.join("\n"))
+                }
+                "impact" => {
+                    let mut seeds = Vec::new();
+                    for f in &args.files {
+                        for file in store::files_by_path_suffix(&m.conn, f.trim_start_matches("./"))
+                            .map_err(engine_err)?
+                        {
+                            seeds.push(file.id);
+                            if let Some(syms) = graph.file_symbols.get(&file.id) {
+                                seeds.extend(syms);
+                            }
+                        }
+                    }
+                    if seeds.is_empty() {
+                        return Ok("none of those paths are in the code graph".into());
+                    }
+                    let reached = graph.impact(&seeds, depth);
+                    let mut out = Vec::new();
+                    for r in &reached {
+                        let node = store::get_node(&m.conn, r.id).map_err(engine_err)?;
+                        if matches!(node.kind, Kind::Symbol) {
+                            out.push(format!(
+                                "{}{}",
+                                "  ".repeat(r.distance.saturating_sub(1)),
+                                mimir_graph::symbol_line(&node)
+                            ));
+                        }
+                    }
+                    if out.is_empty() {
+                        return Ok("no impact outside the changed files".into());
+                    }
+                    Ok(out.join("\n"))
+                }
+                "node" => {
+                    let sym = resolve(&args.symbol)?;
+                    store::touch_accessed(&m.conn, sym.id).map_err(engine_err)?;
+                    store::record_event(&m.conn, sym.id, "opened", None, None, None)
+                        .map_err(engine_err)?;
+                    let mut out = vec![mimir_graph::symbol_line(&sym)];
+                    if let Some(body) = &sym.body {
+                        out.push(body.clone());
+                    }
+                    for edge in store::edges_of(&m.conn, sym.id).map_err(engine_err)? {
+                        let (arrow, other_id) = if edge.src == sym.id {
+                            ("→", edge.dst)
+                        } else {
+                            ("←", edge.src)
+                        };
+                        if let Ok(other) = store::get_node(&m.conn, other_id) {
+                            let l = match other.kind {
+                                Kind::Symbol => mimir_graph::symbol_line(&other),
+                                _ => format!(
+                                    "{} {}",
+                                    short_uid(other.kind, &other.uid),
+                                    other.title.as_deref().unwrap_or("")
+                                ),
+                            };
+                            out.push(format!("{arrow} {} {l}", edge.rel));
+                        }
+                    }
+                    Ok(out.join("\n"))
+                }
+                "path" => {
+                    let a = resolve(&args.symbol)?;
+                    let b = mimir_graph::resolve_symbol(
+                        &m.conn,
+                        project_id,
+                        args.to.as_deref().ok_or("missing 'to' argument")?,
+                    )
+                    .map_err(engine_err)?;
+                    match graph.path(a.id, b.id) {
+                        Some(ids) => {
+                            let mut out = Vec::new();
+                            for (i, id) in ids.iter().enumerate() {
+                                out.push(format!("{}{}", "  ".repeat(i), line(*id)?));
+                            }
+                            Ok(out.join("\n"))
+                        }
+                        None => Ok("no call path".into()),
+                    }
+                }
+                "hubs" => {
+                    let hubs = graph.hubs(args.limit.unwrap_or(10));
+                    if hubs.is_empty() {
+                        return Ok("no call edges yet (run `mimir graph build`)".into());
+                    }
+                    let mut out = Vec::new();
+                    for (id, indeg) in hubs {
+                        out.push(format!("↑{indeg:<4} {}", line(id)?));
+                    }
+                    Ok(out.join("\n"))
+                }
+                other => Err(format!(
+                    "unknown op '{other}' (callers|calls|impact|node|path|hubs)"
+                )),
+            }
         })
         .await
     }
