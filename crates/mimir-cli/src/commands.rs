@@ -611,6 +611,130 @@ pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
     Ok(())
 }
 
+/// Auto-link memories to the code symbols their text literally mentions
+/// (current project + global memories vs the current project's graph).
+/// Precision-first: only code-shaped names (snake_case, ::path, CamelCase)
+/// or backticked mentions link, on word boundaries; ambiguous names that
+/// resolve to many symbols are skipped. Idempotent: existing edges are kept.
+pub fn link_scan(dry_run: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let proj = mimir
+        .project_for_cwd(&std::env::current_dir()?)?
+        .context("not inside a project (the scan links memories to this project's symbols)")?;
+
+    // name → symbol nodes carrying it (bare name from meta, fallback title)
+    let mut by_name: HashMap<String, Vec<(i64, String, String)>> = HashMap::new();
+    {
+        let mut stmt = mimir.conn.prepare(
+            "SELECT id, uid, COALESCE(json_extract(meta,'$.name'), title) FROM node
+             WHERE kind='symbol' AND project_id=?1 AND deleted_at IS NULL",
+        )?;
+        let mut rows = stmt.query([proj.id])?;
+        while let Some(r) = rows.next()? {
+            let (id, uid): (i64, String) = (r.get(0)?, r.get(1)?);
+            let name: Option<String> = r.get(2)?;
+            if let Some(name) = name {
+                if name.len() >= 4 {
+                    by_name
+                        .entry(name)
+                        .or_default()
+                        .push((id, uid, String::new()));
+                }
+            }
+        }
+    }
+
+    let memories: Vec<(i64, String, String)> = {
+        let mut stmt = mimir.conn.prepare(
+            "SELECT id, uid, COALESCE(title,'') || ' ' || COALESCE(body,'') FROM node
+             WHERE kind='memory' AND deleted_at IS NULL AND superseded_by IS NULL
+               AND (project_id=?1 OR project_id IS NULL)",
+        )?;
+        let rows = stmt.query_map([proj.id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+
+    let mut existing: std::collections::HashSet<(i64, i64)> = Default::default();
+    {
+        let mut stmt = mimir.conn.prepare("SELECT src, dst FROM edge")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let (s, d): (i64, i64) = (r.get(0)?, r.get(1)?);
+            existing.insert((s, d));
+            existing.insert((d, s));
+        }
+    }
+
+    let mut created = 0usize;
+    for (mid, muid, text) in &memories {
+        for (name, syms) in &by_name {
+            if syms.len() > 3 {
+                continue; // same name everywhere = ambiguous, skip
+            }
+            if !mentions_symbol(text, name) {
+                continue;
+            }
+            for (sid, suid, _) in syms {
+                if existing.contains(&(*mid, *sid)) {
+                    continue;
+                }
+                if dry_run {
+                    println!(
+                        "would link m:{} —mentions→ {name} (c:{})",
+                        tail(muid),
+                        tail(suid)
+                    );
+                } else {
+                    store::link(&mimir.conn, *mid, *sid, Rel::Mentions, 1.0)?;
+                    println!("m:{} —mentions→ {name} (c:{})", tail(muid), tail(suid));
+                }
+                existing.insert((*mid, *sid));
+                created += 1;
+            }
+        }
+    }
+    println!(
+        "{} {created} link(s) ({} memories × {} distinct symbol names)",
+        if dry_run { "would create" } else { "created" },
+        memories.len(),
+        by_name.len(),
+    );
+    Ok(())
+}
+
+fn tail(uid: &str) -> &str {
+    &uid[uid.len().saturating_sub(6)..]
+}
+
+/// True when `text` mentions `name` as code: word-boundary matched AND
+/// code-shaped (snake_case, ::path, or mixed-case with an uppercase letter
+/// *after* the first — `MimirServer` yes, sentence-case `Pending` no).
+/// Plain English words never match, even in backticks: `main` is usually
+/// a git branch, not fn main. Precision beats recall here — a wrong link
+/// pollutes recall, a missing one just waits for the next scan.
+fn mentions_symbol(text: &str, name: &str) -> bool {
+    let mixed_case = name.len() >= 6
+        && name.chars().skip(1).any(|c| c.is_uppercase())
+        && name.chars().any(|c| c.is_lowercase());
+    let code_shaped = name.contains('_') || name.contains("::") || mixed_case;
+    if !code_shaped {
+        return false;
+    }
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(name) {
+        let i = start + pos;
+        let j = i + name.len();
+        let is_word = |c: Option<char>| c.map(|c| c.is_alphanumeric() || c == '_').unwrap_or(false);
+        let pre = text[..i].chars().next_back();
+        let post = text[j..].chars().next();
+        if !is_word(pre) && !is_word(post) {
+            return true;
+        }
+        start = j;
+    }
+    false
+}
+
 // ---------- docs & index ----------
 
 pub fn docs_add(path: &str, name: Option<String>, global: bool) -> Result<()> {
@@ -886,4 +1010,39 @@ fn node_json(node: &Node, projects: &HashMap<i64, String>) -> serde_json::Value 
         "access_count": node.access_count,
         "strength": node.strength,
     })
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::mentions_symbol;
+
+    #[test]
+    fn snake_case_matches_on_word_boundaries() {
+        assert!(mentions_symbol(
+            "the record_opened path is the entry",
+            "record_opened"
+        ));
+        assert!(!mentions_symbol("we prerecord_opened it", "record_opened"));
+        assert!(mentions_symbol(
+            "learn::record_opened is the single entry",
+            "record_opened"
+        ));
+    }
+
+    #[test]
+    fn plain_words_never_match_even_backticked() {
+        assert!(!mentions_symbol("we should update the docs", "update"));
+        assert!(!mentions_symbol("we changed `update` semantics", "update"));
+        assert!(!mentions_symbol("force push `main` to origin", "main"));
+    }
+
+    #[test]
+    fn camel_case_matches_but_sentence_case_does_not() {
+        assert!(mentions_symbol(
+            "the MimirServer struct owns the router",
+            "MimirServer"
+        ));
+        assert!(!mentions_symbol("nothing here", "MimirServer"));
+        assert!(!mentions_symbol("Pending tasks for tomorrow", "Pending"));
+    }
 }

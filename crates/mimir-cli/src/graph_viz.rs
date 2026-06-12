@@ -528,7 +528,25 @@ function draw(){
       ctx.fillText(n.t.slice(0,42), n.x+n.r+4/cam.z, n.y+4/cam.z);
     }
   }
-  ctx.globalAlpha=1; ctx.restore();
+  ctx.globalAlpha=1;
+  // domain labels floating above each cloud
+  function cloudLabel(pred, big, small){
+    let sx=0, minY=1e9, c=0;
+    for(const n of N){ if(n.hidden||!pred(n))continue; sx+=n.x; minY=Math.min(minY,n.y-n.r); c++; }
+    if(c<3)return;
+    const x=sx/c;
+    ctx.textAlign='center'; ctx.fillStyle='#3a4358';
+    ctx.font=`650 ${30/cam.z}px system-ui,sans-serif`;
+    ctx.fillText(big, x, minY-58/cam.z);
+    ctx.fillStyle='#2c3445';
+    ctx.font=`${15/cam.z}px system-ui,sans-serif`;
+    ctx.fillText(small, x, minY-34/cam.z);
+    ctx.textAlign='left';
+  }
+  cloudLabel(n=>n.k==='symbol'||n.k==='file', 'CODE', 'symbols · files · calls');
+  cloudLabel(n=>n.k==='memory'||n.k==='tag'||n.k==='collection'||n.k==='chunk',
+    'KNOWLEDGE', 'memories · docs · tags');
+  ctx.restore();
 }
 (function loop(){ if(alpha>0.003)tick(); draw(); requestAnimationFrame(loop); })();
 if(matchMedia('(prefers-reduced-motion: reduce)').matches){ for(let i=0;i<400;i++)tick(); alpha=0.002; }

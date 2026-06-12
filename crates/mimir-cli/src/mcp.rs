@@ -71,6 +71,10 @@ pub struct RememberArgs {
     /// true = cross-project (global) instead of current-project scope.
     #[serde(default)]
     pub global: bool,
+    /// Optional: the code symbol or node this memory is about (name or id).
+    /// Link at capture time so the memory and the code surface together.
+    #[serde(default)]
+    pub link: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -201,7 +205,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Store a typed memory (gotcha/decision/insight/idea/note/person). Search first with recall; near-duplicates are refused with the existing entry."
+        description = "Store a typed memory (gotcha/decision/insight/idea/note/person). Search first with recall; near-duplicates are refused with the existing entry. When the fact is about specific code, pass `link` with the symbol or file so memory and code surface together."
     )]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         let project_id = self.project_id;
@@ -237,7 +241,28 @@ impl MimirServer {
                     if let Err(err) = m.embed_pending() {
                         tracing::warn!(%err, "embedding new memory failed");
                     }
-                    Ok(format!("stored {}", line(&node)))
+                    let mut msg = format!("stored {}", line(&node));
+                    if let Some(target) = args.link.as_deref() {
+                        let resolved = store::resolve_ref(&m.conn, target).ok().or_else(|| {
+                            project_id.and_then(|pid| {
+                                mimir_graph::resolve_symbol(&m.conn, pid, target).ok()
+                            })
+                        });
+                        match resolved {
+                            Some(t) => {
+                                store::link(&m.conn, node.id, t.id, Rel::About, 1.0)
+                                    .map_err(engine_err)?;
+                                msg.push_str(&format!(
+                                    "\nlinked —about→ {}",
+                                    short_uid(t.kind, &t.uid)
+                                ));
+                            }
+                            None => msg.push_str(&format!(
+                                "\n(link target '{target}' not found — memory stored unlinked)"
+                            )),
+                        }
+                    }
+                    Ok(msg)
                 }
                 RememberOutcome::Duplicate(existing) => Ok(format!(
                     "refused: near-duplicate of\n{}\n(edit that entry instead, or rephrase if genuinely different)",

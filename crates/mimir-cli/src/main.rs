@@ -131,11 +131,18 @@ enum Command {
     },
     /// Create an edge between two nodes.
     Link {
-        a: String,
-        b: String,
+        a: Option<String>,
+        b: Option<String>,
         /// links|about|relates|mentions|describes|supersedes…
         #[arg(long, default_value = "relates")]
         rel: String,
+        /// Auto-link memories to code symbols their text mentions
+        /// (current project; precision-first heuristic, idempotent).
+        #[arg(long)]
+        scan: bool,
+        /// With --scan: show what would be linked without writing.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Manage docs collections.
     Docs {
@@ -400,7 +407,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None
             },
         ),
-        Command::Link { a, b, rel } => commands::link(&a, &b, &rel),
+        Command::Link {
+            a,
+            b,
+            rel,
+            scan,
+            dry_run,
+        } => match (scan, a, b) {
+            (true, _, _) => commands::link_scan(dry_run),
+            (false, Some(a), Some(b)) => commands::link(&a, &b, &rel),
+            _ => anyhow::bail!(
+                "usage: mimir link <A> <B> [--rel REL]  |  mimir link --scan [--dry-run]"
+            ),
+        },
         Command::Docs { cmd } => match cmd {
             DocsCmd::Add { path, name, global } => commands::docs_add(&path, name, global),
             DocsCmd::List => commands::docs_list(cli.json),
