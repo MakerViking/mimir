@@ -1,4 +1,9 @@
-# Mimir
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.png">
+    <img src="assets/logo.png" alt="Mimir — unified, local-first memory for AI coding agents" width="360">
+  </picture>
+</div>
 
 **Unified, local-first memory for AI coding agents.** One SQLite store where
 typed memories, indexed docs, and code symbols are all nodes in one graph —
