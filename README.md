@@ -143,6 +143,12 @@ in (override with the `MIMIR_PROJECT` env var). And agents without MCP can
 just shell out — the CLI's default output is the same token-lean format
 the server returns.
 
+`mimir init` also installs `/graph` and `/stats` slash commands for the
+agent CLIs it finds on the machine — Claude Code, Codex, OpenCode,
+Gemini CLI and Cursor. Only apps already present get them, and existing
+command files are never overwritten, so your edits survive upgrades
+(re-run `mimir init` any time; it's idempotent).
+
 ## How it works
 
 Everything is a node — memories, files, chunks, projects, collections, tags,

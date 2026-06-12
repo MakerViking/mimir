@@ -33,10 +33,114 @@ pub fn init(no_model: bool) -> Result<()> {
             }
         }
     }
+    install_agent_commands();
     println!();
     println!("Register the MCP server once, globally:");
     println!("  claude mcp add --scope user mimir -- mimir mcp");
     Ok(())
+}
+
+/// `/graph` and `/stats` slash commands for the agent CLIs that support
+/// user-level custom commands. Installed only for apps already present on
+/// the machine; existing files are never overwritten (user edits win).
+/// Re-running `mimir init` after an upgrade refreshes missing files.
+fn install_agent_commands() {
+    const GRAPH_DESC: &str = "Open the interactive Mimir graph visualization (current project)";
+    const STATS_DESC: &str = "Open the Mimir stats dashboard (memories, docs, code, learning)";
+    const GRAPH_BODY: &str = "Run `mimir graph viz --open {args}` with your shell tool from the \
+        current project root, then report the output path it prints. If it fails with \
+        \"not inside a project\", tell the user to run it from inside a git repository.";
+    const STATS_BODY: &str = "Run `mimir dashboard --open {args}` with your shell tool, then \
+        report the output path it prints.";
+
+    let md = |desc: &str, body: &str, allowed: Option<&str>| {
+        let allowed = allowed
+            .map(|a| format!("allowed-tools: {a}\n"))
+            .unwrap_or_default();
+        format!(
+            "---\ndescription: {desc}\n{allowed}---\n\n{}\n",
+            body.replace("{args}", "$ARGUMENTS")
+        )
+    };
+    let toml = |desc: &str, body: &str| {
+        format!(
+            "description = \"{desc}\"\nprompt = \"\"\"\n{}\n\"\"\"\n",
+            body.replace("{args}", "{{args}}")
+        )
+    };
+
+    let Some(base) = directories::BaseDirs::new() else {
+        return;
+    };
+    let home = base.home_dir();
+
+    // (app, detect dir, target dir, file ext, graph content, stats content)
+    let apps: Vec<(&str, &str, &str, &str, String, String)> = vec![
+        (
+            "claude",
+            ".claude",
+            ".claude/commands",
+            "md",
+            md(GRAPH_DESC, GRAPH_BODY, Some("Bash(mimir graph viz:*)")),
+            md(STATS_DESC, STATS_BODY, Some("Bash(mimir dashboard:*)")),
+        ),
+        (
+            "codex",
+            ".codex",
+            ".codex/prompts",
+            "md",
+            md(GRAPH_DESC, GRAPH_BODY, None),
+            md(STATS_DESC, STATS_BODY, None),
+        ),
+        (
+            "opencode",
+            ".config/opencode",
+            ".config/opencode/command",
+            "md",
+            md(GRAPH_DESC, GRAPH_BODY, None),
+            md(STATS_DESC, STATS_BODY, None),
+        ),
+        (
+            "gemini",
+            ".gemini",
+            ".gemini/commands",
+            "toml",
+            toml(GRAPH_DESC, GRAPH_BODY),
+            toml(STATS_DESC, STATS_BODY),
+        ),
+        (
+            "cursor",
+            ".cursor",
+            ".cursor/commands",
+            "md",
+            md(GRAPH_DESC, GRAPH_BODY, None),
+            md(STATS_DESC, STATS_BODY, None),
+        ),
+    ];
+
+    let mut installed: Vec<String> = Vec::new();
+    for (app, detect, target, ext, graph, stats) in apps {
+        if !home.join(detect).is_dir() {
+            continue;
+        }
+        let dir = home.join(target);
+        if std::fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let mut wrote = Vec::new();
+        for (name, content) in [("graph", graph), ("stats", stats)] {
+            let path = dir.join(format!("{name}.{ext}"));
+            if !path.exists() && std::fs::write(&path, content).is_ok() {
+                wrote.push(format!("/{name}"));
+            }
+        }
+        if !wrote.is_empty() {
+            installed.push(format!("{app} ({})", wrote.join(" ")));
+        }
+    }
+    if !installed.is_empty() {
+        println!("agents  slash commands installed: {}", installed.join(", "));
+    }
 }
 
 /// Embed pending content; --fetch additionally allows the model download,
