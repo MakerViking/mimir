@@ -16,7 +16,12 @@ pub fn viz(out: Option<String>, open: bool, max_nodes: usize) -> Result<()> {
     let proj = mimir
         .project_for_cwd(&std::env::current_dir()?)?
         .context("not inside a project (run from a repo, or pass --help)")?;
-    let html = render(&mimir, proj.id, proj.title.as_deref().unwrap_or("project"), max_nodes)?;
+    let html = render(
+        &mimir,
+        proj.id,
+        proj.title.as_deref().unwrap_or("project"),
+        max_nodes,
+    )?;
     let path = out.unwrap_or_else(|| {
         std::env::temp_dir()
             .join("mimir-graph.html")
@@ -184,8 +189,10 @@ fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Re
                 "SELECT DISTINCT parent_id FROM node
                  WHERE id IN ({placeholders}) AND parent_id IS NOT NULL"
             ))?;
-            let params: Vec<&dyn rusqlite::ToSql> =
-                included.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+            let params: Vec<&dyn rusqlite::ToSql> = included
+                .iter()
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
             let mut rows = stmt.query(&params[..])?;
             let mut out = Vec::new();
             while let Some(r) = rows.next()? {
@@ -197,8 +204,10 @@ fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Re
     if !parent_ids.is_empty() {
         let placeholders = vec!["?"; parent_ids.len()].join(",");
         let sql = format!("SELECT {COLS} FROM node WHERE {live} AND id IN ({placeholders})");
-        let params: Vec<&dyn rusqlite::ToSql> =
-            parent_ids.iter().map(|id| id as &dyn rusqlite::ToSql).collect();
+        let params: Vec<&dyn rusqlite::ToSql> = parent_ids
+            .iter()
+            .map(|id| id as &dyn rusqlite::ToSql)
+            .collect();
         push_all(fetch(&sql, &params)?, &mut nodes);
     }
 
@@ -300,10 +309,8 @@ fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Re
             })
         })
         .collect();
-    let jedges: Vec<serde_json::Value> = edges
-        .iter()
-        .map(|(s, d, rel)| json!([s, d, rel]))
-        .collect();
+    let jedges: Vec<serde_json::Value> =
+        edges.iter().map(|(s, d, rel)| json!([s, d, rel])).collect();
     let data = json!({ "nodes": jnodes, "edges": jedges })
         .to_string()
         .replace("</", "<\\/");
@@ -320,7 +327,9 @@ fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Re
 }
 
 fn esc(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 const TEMPLATE: &str = r#"<!doctype html>

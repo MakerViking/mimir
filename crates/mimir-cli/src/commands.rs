@@ -84,7 +84,13 @@ fn install_agent_commands() {
     let home = base.home_dir();
 
     // (app, detect dir, target dir, file ext, graph/stats/report content)
-    type App = (&'static str, &'static str, &'static str, &'static str, [String; 3]);
+    type App = (
+        &'static str,
+        &'static str,
+        &'static str,
+        &'static str,
+        [String; 3],
+    );
     let apps: Vec<App> = vec![
         (
             "claude",

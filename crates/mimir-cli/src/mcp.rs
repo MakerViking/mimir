@@ -504,7 +504,9 @@ pub fn run() -> Result<()> {
                 let Ok(proj) = mimir_core::store::get_node(&m.conn, pid) else {
                     return;
                 };
-                let Some(root) = proj.path.clone() else { return };
+                let Some(root) = proj.path.clone() else {
+                    return;
+                };
                 let root = std::path::PathBuf::from(root);
                 if auto.graph {
                     match mimir_graph::update(&mut m.conn, &proj, &root) {
@@ -518,19 +520,13 @@ pub fn run() -> Result<()> {
                 }
                 if auto.docs {
                     let name = proj.title.clone().unwrap_or_else(|| "project".into());
-                    let indexed = mimir_core::index::add_collection(
-                        &m.conn,
-                        &root,
-                        &name,
-                        Some(pid),
-                    )
-                    .and_then(|c| mimir_core::index::index_collection(&mut m.conn, &c));
+                    let indexed =
+                        mimir_core::index::add_collection(&m.conn, &root, &name, Some(pid))
+                            .and_then(|c| mimir_core::index::index_collection(&mut m.conn, &c));
                     match indexed {
-                        Ok(s) => tracing::info!(
-                            files = s.seen,
-                            chunks = s.chunks,
-                            "auto docs sync"
-                        ),
+                        Ok(s) => {
+                            tracing::info!(files = s.seen, chunks = s.chunks, "auto docs sync")
+                        }
                         Err(e) => tracing::warn!("auto docs sync failed: {e}"),
                     }
                 }

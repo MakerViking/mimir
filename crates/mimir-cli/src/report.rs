@@ -100,9 +100,11 @@ pub fn report(json: bool) -> Result<()> {
         out
     };
     let last_consolidate: Option<i64> = conn
-        .query_row("SELECT value FROM meta WHERE key='last_consolidate'", [], |r| {
-            r.get::<_, String>(0)
-        })
+        .query_row(
+            "SELECT value FROM meta WHERE key='last_consolidate'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
         .ok()
         .and_then(|v| v.parse().ok());
 
@@ -149,7 +151,11 @@ pub fn report(json: bool) -> Result<()> {
         let line = top
             .iter()
             .map(|(uid, title, c)| {
-                format!("{} \"{}\" {c}×", short_uid(Kind::Memory, uid), clip(title, 40))
+                format!(
+                    "{} \"{}\" {c}×",
+                    short_uid(Kind::Memory, uid),
+                    clip(title, 40)
+                )
             })
             .collect::<Vec<_>>()
             .join(" · ");
