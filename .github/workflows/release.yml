@@ -37,6 +37,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} -p mimir-mem
+      # The artifact must contain what main contains — a 0.4.0 release once
+      # shipped without the slash-command installer because the tag predated
+      # the feature. Assert the built binary actually installs them.
+      - name: Smoke test (slash-command installer)
+        if: runner.os != 'Windows'
+        run: |
+          SMOKE=$(mktemp -d)
+          mkdir -p "$SMOKE/.claude"
+          HOME="$SMOKE" target/${{ matrix.target }}/release/mimir init --no-model | tee init.out
+          grep -q "slash commands installed" init.out
+          test -f "$SMOKE/.claude/commands/m-recall.md"
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |

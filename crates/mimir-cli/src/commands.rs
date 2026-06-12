@@ -168,10 +168,12 @@ fn install_agent_commands() {
     ];
 
     let mut installed: Vec<String> = Vec::new();
+    let mut detected = 0usize;
     for (app, detect, target, ext, with_allowed) in APPS {
         if !home.join(detect).is_dir() {
             continue;
         }
+        detected += 1;
         let dir = home.join(target);
         if std::fs::create_dir_all(&dir).is_err() {
             continue;
@@ -192,8 +194,17 @@ fn install_agent_commands() {
             installed.push(format!("{app} ({})", wrote.join(" ")));
         }
     }
+    // Always say what happened — a silent installer is undiagnosable
+    // (a stale release binary once looked identical to "no agents found").
     if !installed.is_empty() {
         println!("agents  slash commands installed: {}", installed.join(", "));
+    } else if detected == 0 {
+        println!(
+            "agents  no agent CLI config dirs found (~/.claude, ~/.codex, \
+             ~/.config/opencode, ~/.gemini, ~/.cursor) — slash commands not installed"
+        );
+    } else {
+        println!("agents  slash commands already present (nothing new to install)");
     }
 }
 
