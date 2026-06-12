@@ -40,18 +40,27 @@ pub fn init(no_model: bool) -> Result<()> {
     Ok(())
 }
 
-/// `/graph` and `/stats` slash commands for the agent CLIs that support
-/// user-level custom commands. Installed only for apps already present on
+/// `/m-graph`, `/m-stats` and `/m-report` slash commands for the agent CLIs
+/// that support user-level custom commands (the `m-` prefix avoids colliding
+/// with users' own commands). Installed only for apps already present on
 /// the machine; existing files are never overwritten (user edits win).
 /// Re-running `mimir init` after an upgrade refreshes missing files.
 fn install_agent_commands() {
+    // An isolated instance (tests, scratch homes) must not touch the user's
+    // agent configs — MIMIR_HOME means "everything under one directory".
+    if std::env::var_os("MIMIR_HOME").is_some() {
+        return;
+    }
     const GRAPH_DESC: &str = "Open the interactive Mimir graph visualization (current project)";
     const STATS_DESC: &str = "Open the Mimir stats dashboard (memories, docs, code, learning)";
+    const REPORT_DESC: &str = "Mimir activity report: day / week / month / year / all-time";
     const GRAPH_BODY: &str = "Run `mimir graph viz --open {args}` with your shell tool from the \
         current project root, then report the output path it prints. If it fails with \
         \"not inside a project\", tell the user to run it from inside a git repository.";
     const STATS_BODY: &str = "Run `mimir dashboard --open {args}` with your shell tool, then \
         report the output path it prints.";
+    const REPORT_BODY: &str = "Run `mimir report` with your shell tool and show its complete \
+        output verbatim in a code block. Do not summarize or reformat the table.";
 
     let md = |desc: &str, body: &str, allowed: Option<&str>| {
         let allowed = allowed
@@ -74,52 +83,68 @@ fn install_agent_commands() {
     };
     let home = base.home_dir();
 
-    // (app, detect dir, target dir, file ext, graph content, stats content)
-    let apps: Vec<(&str, &str, &str, &str, String, String)> = vec![
+    // (app, detect dir, target dir, file ext, graph/stats/report content)
+    type App = (&'static str, &'static str, &'static str, &'static str, [String; 3]);
+    let apps: Vec<App> = vec![
         (
             "claude",
             ".claude",
             ".claude/commands",
             "md",
-            md(GRAPH_DESC, GRAPH_BODY, Some("Bash(mimir graph viz:*)")),
-            md(STATS_DESC, STATS_BODY, Some("Bash(mimir dashboard:*)")),
+            [
+                md(GRAPH_DESC, GRAPH_BODY, Some("Bash(mimir graph viz:*)")),
+                md(STATS_DESC, STATS_BODY, Some("Bash(mimir dashboard:*)")),
+                md(REPORT_DESC, REPORT_BODY, Some("Bash(mimir report:*)")),
+            ],
         ),
         (
             "codex",
             ".codex",
             ".codex/prompts",
             "md",
-            md(GRAPH_DESC, GRAPH_BODY, None),
-            md(STATS_DESC, STATS_BODY, None),
+            [
+                md(GRAPH_DESC, GRAPH_BODY, None),
+                md(STATS_DESC, STATS_BODY, None),
+                md(REPORT_DESC, REPORT_BODY, None),
+            ],
         ),
         (
             "opencode",
             ".config/opencode",
             ".config/opencode/command",
             "md",
-            md(GRAPH_DESC, GRAPH_BODY, None),
-            md(STATS_DESC, STATS_BODY, None),
+            [
+                md(GRAPH_DESC, GRAPH_BODY, None),
+                md(STATS_DESC, STATS_BODY, None),
+                md(REPORT_DESC, REPORT_BODY, None),
+            ],
         ),
         (
             "gemini",
             ".gemini",
             ".gemini/commands",
             "toml",
-            toml(GRAPH_DESC, GRAPH_BODY),
-            toml(STATS_DESC, STATS_BODY),
+            [
+                toml(GRAPH_DESC, GRAPH_BODY),
+                toml(STATS_DESC, STATS_BODY),
+                toml(REPORT_DESC, REPORT_BODY),
+            ],
         ),
         (
             "cursor",
             ".cursor",
             ".cursor/commands",
             "md",
-            md(GRAPH_DESC, GRAPH_BODY, None),
-            md(STATS_DESC, STATS_BODY, None),
+            [
+                md(GRAPH_DESC, GRAPH_BODY, None),
+                md(STATS_DESC, STATS_BODY, None),
+                md(REPORT_DESC, REPORT_BODY, None),
+            ],
         ),
     ];
 
     let mut installed: Vec<String> = Vec::new();
-    for (app, detect, target, ext, graph, stats) in apps {
+    for (app, detect, target, ext, contents) in apps {
         if !home.join(detect).is_dir() {
             continue;
         }
@@ -128,7 +153,7 @@ fn install_agent_commands() {
             continue;
         }
         let mut wrote = Vec::new();
-        for (name, content) in [("graph", graph), ("stats", stats)] {
+        for (name, content) in ["m-graph", "m-stats", "m-report"].iter().zip(contents) {
             let path = dir.join(format!("{name}.{ext}"));
             if !path.exists() && std::fs::write(&path, content).is_ok() {
                 wrote.push(format!("/{name}"));

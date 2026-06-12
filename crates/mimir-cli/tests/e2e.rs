@@ -22,6 +22,9 @@ impl Harness {
         Command::new(env!("CARGO_BIN_EXE_mimir"))
             .args(args)
             .env("MIMIR_HOME", self.home.path())
+            // Never let a test reach the real user's agent configs.
+            .env("HOME", self.home.path())
+            .env("USERPROFILE", self.home.path())
             .current_dir(self.cwd.path())
             .output()
             .expect("binary runs")

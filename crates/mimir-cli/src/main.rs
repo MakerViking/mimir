@@ -3,6 +3,7 @@ mod dashboard;
 mod graph_cmd;
 mod graph_viz;
 mod mcp;
+mod report;
 
 use clap::{Parser, Subcommand};
 
@@ -31,6 +32,8 @@ enum Command {
     },
     /// Store overview: counts by kind, scope, database size.
     Status,
+    /// Activity table: day / week / month / year / all-time.
+    Report,
     /// Health checks: database integrity, FTS availability, model presence.
     Doctor,
     /// Capture a memory (refuses near-duplicates unless --force).
@@ -419,6 +422,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Export => commands::export(),
         Command::Dashboard { out, open } => dashboard::dashboard(out, open),
+        Command::Report => report::report(cli.json),
         Command::Mcp => mcp::run(),
         Command::Graph { cmd } => match cmd {
             GraphCmd::Build | GraphCmd::Update => graph_cmd::build(),

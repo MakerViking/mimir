@@ -116,6 +116,7 @@ mimir link m:ABC123 my_function --rel about  # decisions ↔ code
 mimir mark m:ABC123 --useful      # strengthen future ranking
 mimir consolidate --dry-run       # dedup/contradictions/distill/archive
 mimir dashboard --open            # self-contained HTML telemetry panel
+mimir report                      # activity table: day/week/month/year/all-time
 
 # escape hatches
 mimir import openbrain export.txt | claude-memory <dir> | qmd
@@ -143,11 +144,12 @@ in (override with the `MIMIR_PROJECT` env var). And agents without MCP can
 just shell out — the CLI's default output is the same token-lean format
 the server returns.
 
-`mimir init` also installs `/graph` and `/stats` slash commands for the
-agent CLIs it finds on the machine — Claude Code, Codex, OpenCode,
-Gemini CLI and Cursor. Only apps already present get them, and existing
-command files are never overwritten, so your edits survive upgrades
-(re-run `mimir init` any time; it's idempotent).
+`mimir init` also installs `/m-graph`, `/m-stats` and `/m-report` slash
+commands for the agent CLIs it finds on the machine — Claude Code, Codex,
+OpenCode, Gemini CLI and Cursor (the `m-` prefix keeps them clear of your
+own commands). Only apps already present get them, and existing command
+files are never overwritten, so your edits survive upgrades (re-run
+`mimir init` any time; it's idempotent).
 
 ## How it works
 
