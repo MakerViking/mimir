@@ -1,4 +1,5 @@
 mod commands;
+mod dashboard;
 mod graph_cmd;
 mod mcp;
 
@@ -175,6 +176,15 @@ enum Command {
     },
     /// Dump all live nodes and edges as JSONL (backup / migration).
     Export,
+    /// Generate a self-contained HTML stats dashboard.
+    Dashboard {
+        /// Output path (default: temp dir).
+        #[arg(short, long)]
+        out: Option<String>,
+        /// Open in the default browser.
+        #[arg(long)]
+        open: bool,
+    },
     /// Run the MCP stdio server (what Claude Code launches).
     Mcp,
     /// Build and query the code graph of the current project.
@@ -394,6 +404,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             ImportCmd::Qmd { file } => commands::import_qmd(file),
         },
         Command::Export => commands::export(),
+        Command::Dashboard { out, open } => dashboard::dashboard(out, open),
         Command::Mcp => mcp::run(),
         Command::Graph { cmd } => match cmd {
             GraphCmd::Build | GraphCmd::Update => graph_cmd::build(),

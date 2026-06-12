@@ -113,6 +113,7 @@ mimir link m:ABC123 my_function --rel about  # decisions ↔ code
 # feedback & hygiene
 mimir mark m:ABC123 --useful      # strengthen future ranking
 mimir consolidate --dry-run       # dedup/contradictions/distill/archive
+mimir dashboard --open            # self-contained HTML telemetry panel
 
 # escape hatches
 mimir import openbrain export.txt | claude-memory <dir> | qmd

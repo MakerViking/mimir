@@ -29,6 +29,7 @@ clap.workspace = true
 directories.workspace = true
 libc = "0.2"
 rmcp.workspace = true
+rusqlite.workspace = true
 schemars.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
