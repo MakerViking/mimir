@@ -26,7 +26,7 @@ exposed to agents as a single, globally-registered MCP server.
 
 ## Install
 
-Prebuilt binary (Linux x86_64/aarch64, macOS Intel/Apple Silicon):
+Prebuilt binary (Linux x86_64/aarch64, macOS Apple Silicon):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/MakerViking/mimir/main/install.sh | sh

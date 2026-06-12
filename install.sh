@@ -27,6 +27,10 @@ case "$(uname -m)" in
   aarch64 | arm64) arch=aarch64 ;;
   *) echo "Unsupported architecture: $(uname -m)" >&2; exit 1 ;;
 esac
+if [ "$os" = "macos" ] && [ "$arch" = "x86_64" ]; then
+  echo "Intel Macs are not supported: onnxruntime no longer ships x86_64 macOS binaries." >&2
+  exit 1
+fi
 
 if [ "$VERSION" = "latest" ]; then
   url="https://github.com/$REPO/releases/latest/download/mimir-$os-$arch.tar.gz"
