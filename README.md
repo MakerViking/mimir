@@ -10,6 +10,14 @@ typed memories, indexed docs, and code symbols are all nodes in one graph —
 searched together by hybrid BM25 + local-ONNX semantic retrieval, and exposed
 to agents as a single, globally-registered MCP server.
 
+<div align="center">
+  <a href="https://youtu.be/VOU68g1I1-I">
+    <img src="https://img.youtube.com/vi/VOU68g1I1-I/maxresdefault.jpg" alt="Mimir in 90 seconds — watch the launch video" width="640">
+  </a>
+  <br>
+  <em>▶ Mimir in 90 seconds</em>
+</div>
+
 ![Mimir benchmark: 7–360× faster than the tools it replaces](assets/benchmark.svg)
 
 ## Why
