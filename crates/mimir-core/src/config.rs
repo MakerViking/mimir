@@ -50,6 +50,27 @@ pub struct Config {
     pub scoring: ScoringConfig,
     pub output: OutputConfig,
     pub consolidate: ConsolidateConfig,
+    pub auto: AutoConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoConfig {
+    /// Build/refresh the project's code graph when the MCP server starts
+    /// in it (incremental: first contact extracts, afterwards no-ops in ms).
+    pub graph: bool,
+    /// Register + index the project's own markdown as a docs collection
+    /// when the MCP server starts in it (gitignore-aware, incremental).
+    pub docs: bool,
+}
+
+impl Default for AutoConfig {
+    fn default() -> Self {
+        AutoConfig {
+            graph: true,
+            docs: true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -35,7 +35,10 @@ to agents as a single, globally-registered MCP server.
   and archives the dead — never destructively.
 - **Made for agents.** Default output is one ~25-token line per hit.
   The MCP server registers once (`--scope user`) and serves every repo,
-  detecting the current project from its working directory.
+  detecting the current project from its working directory. On session
+  start it auto-builds the project's code graph and indexes its markdown
+  (background thread, incremental, milliseconds after first contact) —
+  zero setup per project. Opt out in `config.toml`: `[auto] graph/docs = false`.
 - **Local and private.** A memory tool holding your decisions and notes must
   be beyond suspicion: everything stays on disk, **zero telemetry**, ever.
 
@@ -105,7 +108,8 @@ mimir recall tricky semantic question --rerank  # cross-encoder rescoring (~1 s 
 # config.toml: embedding.model = "bge-base-en-v1.5" — stronger semantic
 # matching at the same query latency (index-time embedding is ~4x slower)
 
-# code graph
+# code graph (the MCP server runs build + docs indexing automatically
+# on session start — these are for manual/CLI use)
 mimir graph build                 # tree-sitter extraction, incremental
 mimir graph callers resolve_ref   # who calls this?
 mimir graph impact $(git diff --name-only)   # blast radius of a change

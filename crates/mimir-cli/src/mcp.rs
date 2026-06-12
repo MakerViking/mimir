@@ -491,6 +491,58 @@ pub fn run() -> Result<()> {
         .and_then(|d| engine.project_for_cwd(&d).ok().flatten())
         .map(|p| p.id);
 
+    // Auto-sync the project on session start: first contact builds the code
+    // graph and indexes the repo's markdown; every later start is an
+    // incremental no-op in milliseconds. Separate thread + connection like
+    // consolidation below — never on the request path, never fatal, and
+    // local-only (embed_pending silently skips when no model is on disk).
+    if let Some(pid) = project_id {
+        let auto = engine.config.auto.clone();
+        if auto.graph || auto.docs {
+            std::thread::spawn(move || {
+                let Ok(mut m) = Mimir::open() else { return };
+                let Ok(proj) = mimir_core::store::get_node(&m.conn, pid) else {
+                    return;
+                };
+                let Some(root) = proj.path.clone() else { return };
+                let root = std::path::PathBuf::from(root);
+                if auto.graph {
+                    match mimir_graph::update(&mut m.conn, &proj, &root) {
+                        Ok(s) => tracing::info!(
+                            symbols = s.symbols,
+                            files_indexed = s.files_indexed,
+                            "auto graph sync"
+                        ),
+                        Err(e) => tracing::warn!("auto graph sync failed: {e}"),
+                    }
+                }
+                if auto.docs {
+                    let name = proj.title.clone().unwrap_or_else(|| "project".into());
+                    let indexed = mimir_core::index::add_collection(
+                        &m.conn,
+                        &root,
+                        &name,
+                        Some(pid),
+                    )
+                    .and_then(|c| mimir_core::index::index_collection(&mut m.conn, &c));
+                    match indexed {
+                        Ok(s) => tracing::info!(
+                            files = s.seen,
+                            chunks = s.chunks,
+                            "auto docs sync"
+                        ),
+                        Err(e) => tracing::warn!("auto docs sync failed: {e}"),
+                    }
+                }
+                if let Ok(n) = m.embed_pending() {
+                    if n > 0 {
+                        tracing::info!(embedded = n, "auto embed");
+                    }
+                }
+            });
+        }
+    }
+
     // Weekly consolidation runs off the request path: separate thread,
     // separate connection (WAL handles the concurrency).
     {
