@@ -54,7 +54,8 @@ Windows: grab `mimir-windows-x86_64.zip` from the
 From source (any platform with [Rust](https://rustup.rs)):
 
 ```sh
-cargo install --path crates/mimir-cli   # from a checkout (crates.io soon)
+cargo install mimir-mem                 # the binary is named `mimir`
+cargo install --path crates/mimir-cli   # …or from a checkout
 ```
 
 ### Optional GPU acceleration
@@ -64,10 +65,10 @@ CPU-only by default — GPU is an opt-in build feature (pick **one**):
 ```sh
 # Cross-vendor: Vulkan (Linux), D3D12 (Windows), Metal (macOS) via Dawn.
 # The right choice for AMD/Intel GPUs.
-RUST_MIN_STACK=33554432 cargo install --path crates/mimir-cli --features gpu-webgpu
+RUST_MIN_STACK=33554432 cargo install mimir-mem --features gpu-webgpu
 
 # NVIDIA CUDA 12/13:
-RUST_MIN_STACK=33554432 cargo install --path crates/mimir-cli --features gpu-cuda
+RUST_MIN_STACK=33554432 cargo install mimir-mem --features gpu-cuda
 ```
 
 Notes:
@@ -157,9 +158,9 @@ set `MIMIR_HOME=<dir>` to put everything under one directory instead.
 ## Roadmap
 
 v0.4 ships the complete original blueprint: memories, docs, code graph,
-hybrid + reranked search, self-learning, importers, prebuilt binaries.
-Next: crates.io release, more languages, and whatever using it daily
-teaches us.
+hybrid + reranked search, self-learning, importers, prebuilt binaries,
+and the crates.io release ([mimir-mem](https://crates.io/crates/mimir-mem)).
+Next: more languages, and whatever using it daily teaches us.
 
 ## License
 
