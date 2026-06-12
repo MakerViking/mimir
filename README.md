@@ -12,6 +12,19 @@ to agents as a single, globally-registered MCP server.
 
 ![Mimir benchmark: 7–360× faster than the tools it replaces](assets/benchmark.svg)
 
+## Why
+
+Mimir replaced three tools that each did their job fine: OpenBrain
+(semantic memory service), QMD (markdown search), and Graphify (code
+knowledge graph). The problem was never that they didn't work — it was
+that they were three daemons, three stores, three query surfaces, and
+none of them knew about each other. A memory couldn't point at the
+function it was about; doc search couldn't surface the decision that
+explained the doc. Running three systems where one could do the job —
+and do it better, *because* everything lives in one graph — was too
+enticing not to build. The speedups in the chart above are real, but
+they're a side effect; the point is the links.
+
 - **One store, every project.** A single database with project scoping —
   cross-project knowledge surfaces wherever it's relevant, project noise
   doesn't.
