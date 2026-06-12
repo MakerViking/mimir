@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="940" height="676" viewBox="0 0 940 676" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+<rect width="940" height="676" rx="12" fill="#0d1117"/>
+<text x="36" y="46" fill="#e6edf3" font-size="24" font-weight="700">Mimir vs the tools it replaces</text>
+<text x="36" y="72" fill="#8b949e" font-size="14">Same machine, same real data — lower is better</text>
+<text x="36" y="108" fill="#e6edf3" font-size="16" font-weight="700">Memory recall</text>
+<text x="904" y="108" fill="#3fb950" font-size="20" font-weight="800" text-anchor="end">17× faster</text>
+<text x="178" y="135" fill="#8b949e" font-size="13" text-anchor="end">OpenBrain</text>
+<rect x="190" y="122" width="560.0" height="16" rx="4" fill="#6e7681"/>
+<text x="760" y="135" fill="#8b949e" font-size="12.5" font-weight="600">372 ms</text>
+<text x="178" y="159" fill="#3fb950" font-size="13" font-weight="700" text-anchor="end">Mimir</text>
+<rect x="190" y="146" width="33.1" height="16" rx="4" fill="#3fb950"/>
+<text x="233.11827956989248" y="159" fill="#e6edf3" font-size="12.5" font-weight="600">22 ms</text>
+<text x="36" y="212" fill="#e6edf3" font-size="16" font-weight="700">Semantic doc search</text>
+<text x="904" y="212" fill="#3fb950" font-size="20" font-weight="800" text-anchor="end">7× faster</text>
+<text x="178" y="239" fill="#8b949e" font-size="13" text-anchor="end">QMD vsearch</text>
+<rect x="190" y="226" width="560.0" height="16" rx="4" fill="#6e7681"/>
+<text x="760" y="239" fill="#8b949e" font-size="12.5" font-weight="600">2.3 s</text>
+<text x="178" y="263" fill="#3fb950" font-size="13" font-weight="700" text-anchor="end">Mimir</text>
+<rect x="190" y="250" width="74.7" height="16" rx="4" fill="#3fb950"/>
+<text x="274.6666666666667" y="263" fill="#e6edf3" font-size="12.5" font-weight="600">0.31 s</text>
+<text x="36" y="316" fill="#e6edf3" font-size="16" font-weight="700">Precision search</text>
+<text x="904" y="316" fill="#3fb950" font-size="20" font-weight="800" text-anchor="end">12× faster</text>
+<text x="178" y="343" fill="#8b949e" font-size="13" text-anchor="end">QMD query</text>
+<rect x="190" y="330" width="560.0" height="16" rx="4" fill="#6e7681"/>
+<text x="760" y="343" fill="#8b949e" font-size="12.5" font-weight="600">12.1 s</text>
+<text x="178" y="367" fill="#3fb950" font-size="13" font-weight="700" text-anchor="end">Mimir</text>
+<rect x="190" y="354" width="46.2" height="16" rx="4" fill="#3fb950"/>
+<text x="246.16652926628194" y="367" fill="#e6edf3" font-size="12.5" font-weight="600">1.0 s</text>
+<text x="36" y="420" fill="#e6edf3" font-size="16" font-weight="700">Code-graph refresh</text>
+<text x="904" y="420" fill="#3fb950" font-size="20" font-weight="800" text-anchor="end">360× faster</text>
+<text x="178" y="447" fill="#8b949e" font-size="13" text-anchor="end">Graphify update</text>
+<rect x="190" y="434" width="560.0" height="16" rx="4" fill="#6e7681"/>
+<text x="760" y="447" fill="#8b949e" font-size="12.5" font-weight="600">3m 18s</text>
+<text x="178" y="471" fill="#3fb950" font-size="13" font-weight="700" text-anchor="end">Mimir</text>
+<rect x="190" y="458" width="7.0" height="16" rx="4" fill="#3fb950"/>
+<text x="207" y="471" fill="#e6edf3" font-size="12.5" font-weight="600">0.55 s</text>
+<text x="36" y="524" fill="#e6edf3" font-size="16" font-weight="700">Code-graph query</text>
+<text x="904" y="524" fill="#3fb950" font-size="20" font-weight="800" text-anchor="end">22× faster</text>
+<text x="178" y="551" fill="#8b949e" font-size="13" text-anchor="end">Graphify explain</text>
+<rect x="190" y="538" width="560.0" height="16" rx="4" fill="#6e7681"/>
+<text x="760" y="551" fill="#8b949e" font-size="12.5" font-weight="600">1.1 s</text>
+<text x="178" y="575" fill="#3fb950" font-size="13" font-weight="700" text-anchor="end">Mimir</text>
+<rect x="190" y="562" width="25.5" height="16" rx="4" fill="#3fb950"/>
+<text x="225.45454545454544" y="575" fill="#e6edf3" font-size="12.5" font-weight="600">0.05 s</text>
+<text x="36" y="624" fill="#8b949e" font-size="12.5">CPU numbers — the GPU build (Vulkan / CUDA) does recall in 7 ms and precision search in 0.14 s. Responses are also ~4× fewer tokens.</text>
+<text x="36" y="644" fill="#8b949e" font-size="12.5">Measured 2026-06 on real corpora: 104 memories, 642 doc chunks, and a 2,495-file TypeScript repo (11,735 symbols).</text>
+</svg>

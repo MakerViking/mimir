@@ -1,9 +1,11 @@
 # Mimir
 
 **Unified, local-first memory for AI coding agents.** One SQLite store where
-typed memories, indexed docs, and (soon) code symbols are all nodes in one
-graph — searched together by hybrid BM25 + local-ONNX semantic retrieval, and
-exposed to agents as a single, globally-registered MCP server.
+typed memories, indexed docs, and code symbols are all nodes in one graph —
+searched together by hybrid BM25 + local-ONNX semantic retrieval, and exposed
+to agents as a single, globally-registered MCP server.
+
+![Mimir benchmark: 7–360× faster than the tools it replaces](assets/benchmark.svg)
 
 - **One store, every project.** A single database with project scoping —
   cross-project knowledge surfaces wherever it's relevant, project noise
