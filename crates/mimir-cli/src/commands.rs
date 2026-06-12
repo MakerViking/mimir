@@ -40,9 +40,85 @@ pub fn init(no_model: bool) -> Result<()> {
     Ok(())
 }
 
-/// `/m-graph`, `/m-stats` and `/m-report` slash commands for the agent CLIs
-/// that support user-level custom commands (the `m-` prefix avoids colliding
-/// with users' own commands). Installed only for apps already present on
+/// One Mimir slash command: name carries the `m-` prefix (collision safety
+/// with users' own commands), `allowed` is Claude-Code-only tool pre-approval.
+struct SlashCmd {
+    name: &'static str,
+    desc: &'static str,
+    body: &'static str,
+    allowed: Option<&'static str>,
+}
+
+/// Every `/m-*` slash command Mimir ships. `{args}` becomes the app's own
+/// argument placeholder at render time.
+const SLASH_COMMANDS: &[SlashCmd] = &[
+    SlashCmd {
+        name: "m-graph",
+        desc: "Open the interactive Mimir graph visualization (current project)",
+        body: "Run `mimir graph viz --open {args}` with your shell tool from the current \
+            project root, then report the output path it prints. If it fails with \
+            \"not inside a project\", tell the user to run it from inside a git repository.",
+        allowed: Some("Bash(mimir graph viz:*)"),
+    },
+    SlashCmd {
+        name: "m-stats",
+        desc: "Open the Mimir stats dashboard (memories, docs, code, learning)",
+        body: "Run `mimir dashboard --open {args}` with your shell tool, then report the \
+            output path it prints.",
+        allowed: Some("Bash(mimir dashboard:*)"),
+    },
+    SlashCmd {
+        name: "m-report",
+        desc: "Mimir activity report: day / week / month / year / all-time",
+        body: "Run `mimir report` with your shell tool and show its complete output \
+            verbatim in a code block. Do not summarize or reformat the table.",
+        allowed: Some("Bash(mimir report:*)"),
+    },
+    SlashCmd {
+        name: "m-scan",
+        desc: "Auto-link Mimir memories to the code symbols they mention",
+        body: "Run `mimir link --scan` with your shell tool from the current project \
+            root and show its output. If links were created, suggest /m-graph to see \
+            the new memory-to-code connections.",
+        allowed: Some("Bash(mimir link:*)"),
+    },
+    SlashCmd {
+        name: "m-recall",
+        desc: "Search Mimir memory (memories, docs, code)",
+        body: "Run `mimir recall {args}` with your shell tool and show the results. \
+            If a hit looks like exactly what the user needs, also run \
+            `mimir get <id>` on it and show the full body.",
+        allowed: Some("Bash(mimir recall:*), Bash(mimir get:*)"),
+    },
+    SlashCmd {
+        name: "m-remember",
+        desc: "Save a memory to Mimir",
+        body: "Store this in Mimir: {args}\n\nUse the mimir remember MCP tool (or \
+            `mimir remember` via shell). Pick the fitting type (gotcha / decision / \
+            insight / idea / note / person) and concise tags. If it is about specific \
+            code, pass `link` with the symbol name. Confirm what was stored.",
+        allowed: Some("mcp__mimir__remember, mcp__mimir__recall, Bash(mimir remember:*)"),
+    },
+    SlashCmd {
+        name: "m-impact",
+        desc: "Blast radius of the current uncommitted changes (Mimir code graph)",
+        body: "Run `mimir graph impact $(git diff --name-only)` with your shell tool \
+            from the current project root and show the affected symbols. If the diff \
+            is empty, say there are no uncommitted changes to analyze.",
+        allowed: Some("Bash(mimir graph impact:*)"),
+    },
+    SlashCmd {
+        name: "m-doctor",
+        desc: "Mimir health check (database, search index, models)",
+        body: "Run `mimir doctor` and `mimir status` with your shell tool and show \
+            both outputs verbatim. If any check is not ok, explain what it means and \
+            how to fix it.",
+        allowed: Some("Bash(mimir doctor:*), Bash(mimir status:*)"),
+    },
+];
+
+/// Install the `/m-*` slash commands for the agent CLIs that support
+/// user-level custom commands. Installed only for apps already present on
 /// the machine; existing files are never overwritten (user edits win).
 /// Re-running `mimir init` after an upgrade refreshes missing files.
 fn install_agent_commands() {
@@ -51,30 +127,23 @@ fn install_agent_commands() {
     if std::env::var_os("MIMIR_HOME").is_some() {
         return;
     }
-    const GRAPH_DESC: &str = "Open the interactive Mimir graph visualization (current project)";
-    const STATS_DESC: &str = "Open the Mimir stats dashboard (memories, docs, code, learning)";
-    const REPORT_DESC: &str = "Mimir activity report: day / week / month / year / all-time";
-    const GRAPH_BODY: &str = "Run `mimir graph viz --open {args}` with your shell tool from the \
-        current project root, then report the output path it prints. If it fails with \
-        \"not inside a project\", tell the user to run it from inside a git repository.";
-    const STATS_BODY: &str = "Run `mimir dashboard --open {args}` with your shell tool, then \
-        report the output path it prints.";
-    const REPORT_BODY: &str = "Run `mimir report` with your shell tool and show its complete \
-        output verbatim in a code block. Do not summarize or reformat the table.";
 
-    let md = |desc: &str, body: &str, allowed: Option<&str>| {
-        let allowed = allowed
-            .map(|a| format!("allowed-tools: {a}\n"))
-            .unwrap_or_default();
+    let md = |cmd: &SlashCmd, with_allowed: bool| {
+        let allowed = match (with_allowed, cmd.allowed) {
+            (true, Some(a)) => format!("allowed-tools: {a}\n"),
+            _ => String::new(),
+        };
         format!(
-            "---\ndescription: {desc}\n{allowed}---\n\n{}\n",
-            body.replace("{args}", "$ARGUMENTS")
+            "---\ndescription: {}\n{allowed}---\n\n{}\n",
+            cmd.desc,
+            cmd.body.replace("{args}", "$ARGUMENTS")
         )
     };
-    let toml = |desc: &str, body: &str| {
+    let toml = |cmd: &SlashCmd| {
         format!(
-            "description = \"{desc}\"\nprompt = \"\"\"\n{}\n\"\"\"\n",
-            body.replace("{args}", "{{args}}")
+            "description = \"{}\"\nprompt = \"\"\"\n{}\n\"\"\"\n",
+            cmd.desc,
+            cmd.body.replace("{args}", "{{args}}")
         )
     };
 
@@ -83,74 +152,23 @@ fn install_agent_commands() {
     };
     let home = base.home_dir();
 
-    // (app, detect dir, target dir, file ext, graph/stats/report content)
-    type App = (
-        &'static str,
-        &'static str,
-        &'static str,
-        &'static str,
-        [String; 3],
-    );
-    let apps: Vec<App> = vec![
-        (
-            "claude",
-            ".claude",
-            ".claude/commands",
-            "md",
-            [
-                md(GRAPH_DESC, GRAPH_BODY, Some("Bash(mimir graph viz:*)")),
-                md(STATS_DESC, STATS_BODY, Some("Bash(mimir dashboard:*)")),
-                md(REPORT_DESC, REPORT_BODY, Some("Bash(mimir report:*)")),
-            ],
-        ),
-        (
-            "codex",
-            ".codex",
-            ".codex/prompts",
-            "md",
-            [
-                md(GRAPH_DESC, GRAPH_BODY, None),
-                md(STATS_DESC, STATS_BODY, None),
-                md(REPORT_DESC, REPORT_BODY, None),
-            ],
-        ),
+    // (app, detect dir, target dir, file ext, claude-style allowed-tools?)
+    const APPS: &[(&str, &str, &str, &str, bool)] = &[
+        ("claude", ".claude", ".claude/commands", "md", true),
+        ("codex", ".codex", ".codex/prompts", "md", false),
         (
             "opencode",
             ".config/opencode",
             ".config/opencode/command",
             "md",
-            [
-                md(GRAPH_DESC, GRAPH_BODY, None),
-                md(STATS_DESC, STATS_BODY, None),
-                md(REPORT_DESC, REPORT_BODY, None),
-            ],
+            false,
         ),
-        (
-            "gemini",
-            ".gemini",
-            ".gemini/commands",
-            "toml",
-            [
-                toml(GRAPH_DESC, GRAPH_BODY),
-                toml(STATS_DESC, STATS_BODY),
-                toml(REPORT_DESC, REPORT_BODY),
-            ],
-        ),
-        (
-            "cursor",
-            ".cursor",
-            ".cursor/commands",
-            "md",
-            [
-                md(GRAPH_DESC, GRAPH_BODY, None),
-                md(STATS_DESC, STATS_BODY, None),
-                md(REPORT_DESC, REPORT_BODY, None),
-            ],
-        ),
+        ("gemini", ".gemini", ".gemini/commands", "toml", false),
+        ("cursor", ".cursor", ".cursor/commands", "md", false),
     ];
 
     let mut installed: Vec<String> = Vec::new();
-    for (app, detect, target, ext, contents) in apps {
+    for (app, detect, target, ext, with_allowed) in APPS {
         if !home.join(detect).is_dir() {
             continue;
         }
@@ -159,10 +177,15 @@ fn install_agent_commands() {
             continue;
         }
         let mut wrote = Vec::new();
-        for (name, content) in ["m-graph", "m-stats", "m-report"].iter().zip(contents) {
-            let path = dir.join(format!("{name}.{ext}"));
+        for cmd in SLASH_COMMANDS {
+            let content = if *ext == "toml" {
+                toml(cmd)
+            } else {
+                md(cmd, *with_allowed)
+            };
+            let path = dir.join(format!("{}.{ext}", cmd.name));
             if !path.exists() && std::fs::write(&path, content).is_ok() {
-                wrote.push(format!("/{name}"));
+                wrote.push(format!("/{}", cmd.name));
             }
         }
         if !wrote.is_empty() {

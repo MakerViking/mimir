@@ -188,12 +188,24 @@ in (override with the `MIMIR_PROJECT` env var). And agents without MCP can
 just shell out — the CLI's default output is the same token-lean format
 the server returns.
 
-`mimir init` also installs `/m-graph`, `/m-stats` and `/m-report` slash
-commands for the agent CLIs it finds on the machine — Claude Code, Codex,
-OpenCode, Gemini CLI and Cursor (the `m-` prefix keeps them clear of your
-own commands). Only apps already present get them, and existing command
-files are never overwritten, so your edits survive upgrades (re-run
-`mimir init` any time; it's idempotent).
+`mimir init` also installs a set of `/m-*` slash commands for the agent
+CLIs it finds on the machine — Claude Code, Codex, OpenCode, Gemini CLI
+and Cursor (the `m-` prefix keeps them clear of your own commands):
+
+| command | does |
+|---|---|
+| `/m-recall <query>` | search memories, docs and code |
+| `/m-remember <fact>` | capture a memory (typed, tagged, linked) |
+| `/m-graph` | open the interactive graph visualization |
+| `/m-impact` | blast radius of your uncommitted changes |
+| `/m-scan` | auto-link memories to the code they mention |
+| `/m-report` | activity table: day/week/month/year/all-time |
+| `/m-stats` | open the stats dashboard |
+| `/m-doctor` | health check |
+
+Only apps already present get them, and existing command files are never
+overwritten, so your edits survive upgrades (re-run `mimir init` any
+time; it's idempotent).
 
 ## How it works
 
