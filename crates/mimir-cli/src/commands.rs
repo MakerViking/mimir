@@ -21,7 +21,12 @@ pub fn init(no_model: bool) -> Result<()> {
             "model   skipped (BM25-only; run `mimir embed --fetch` to enable semantic search)"
         );
     } else {
-        match mimir_core::embed::Embedder::load(&paths, &config.embedding.model, true) {
+        match mimir_core::embed::Embedder::load(
+            &paths,
+            &config.embedding.model,
+            &config.embedding.device,
+            true,
+        ) {
             Ok(e) => println!("model   {} ready ({}-dim)", e.name, e.dim),
             Err(err) => {
                 eprintln!("model   download failed ({err}); search is BM25-only until `mimir embed --fetch` succeeds")
@@ -136,6 +141,12 @@ pub fn doctor() -> Result<()> {
         }
         Err(e) => check("db", false, e.to_string(), &mut failures),
     }
+
+    println!(
+        "ok   gpu: {}",
+        mimir_core::embed::gpu_backend()
+            .unwrap_or("not compiled in (CPU; rebuild with --features gpu-webgpu or gpu-cuda)")
+    );
 
     let model_present = paths.models_dir.exists()
         && std::fs::read_dir(&paths.models_dir)

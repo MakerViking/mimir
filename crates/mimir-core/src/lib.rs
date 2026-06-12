@@ -26,6 +26,10 @@ use crate::model::Node;
 use crate::search::vector::MatrixCache;
 use crate::search::{Hit, SearchQuery};
 
+/// Bound for the query-embedding memo: agents repeat queries (retries,
+/// follow-ups) and the ~5–10 ms ONNX call is pure waste the second time.
+const QUERY_CACHE_CAP: usize = 256;
+
 /// Engine facade. Owns one writer connection; cheap to open.
 /// The embedding model loads lazily on first semantic use and is cached
 /// for the process lifetime (long-lived in the MCP server).
@@ -38,6 +42,7 @@ pub struct Mimir {
     reranker: Option<embed::Reranker>,
     reranker_tried: bool,
     matrix: Option<MatrixCache>,
+    query_cache: std::collections::HashMap<String, Vec<f32>>,
 }
 
 impl Mimir {
@@ -58,6 +63,7 @@ impl Mimir {
             reranker: None,
             reranker_tried: false,
             matrix: None,
+            query_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -72,6 +78,7 @@ impl Mimir {
             reranker: None,
             reranker_tried: false,
             matrix: None,
+            query_cache: std::collections::HashMap::new(),
         })
     }
 
@@ -82,7 +89,12 @@ impl Mimir {
             allow_download || embed::model_ready(&self.paths, &self.config.embedding.model);
         if self.embedder.is_none() && !self.embedder_tried && downloadable {
             self.embedder_tried = true;
-            match embed::Embedder::load(&self.paths, &self.config.embedding.model, allow_download) {
+            match embed::Embedder::load(
+                &self.paths,
+                &self.config.embedding.model,
+                &self.config.embedding.device,
+                allow_download,
+            ) {
                 Ok(e) => self.embedder = Some(e),
                 Err(err) => tracing::warn!(%err, "embeddings unavailable; BM25-only"),
             }
@@ -97,7 +109,12 @@ impl Mimir {
             allow_download || embed::model_ready(&self.paths, &self.config.rerank.model);
         if self.reranker.is_none() && !self.reranker_tried && downloadable {
             self.reranker_tried = true;
-            match embed::Reranker::load(&self.paths, &self.config.rerank.model, allow_download) {
+            match embed::Reranker::load(
+                &self.paths,
+                &self.config.rerank.model,
+                &self.config.embedding.device,
+                allow_download,
+            ) {
                 Ok(r) => self.reranker = Some(r),
                 Err(err) => tracing::warn!(%err, "reranker unavailable; skipping rerank"),
             }
@@ -110,16 +127,14 @@ impl Mimir {
         self.search_with(query, false)
     }
 
-    /// Search with optional cross-encoder reranking: over-fetch the fused
-    /// candidates, rescore them against the query, keep the top `limit`.
-    pub fn search_with(&mut self, query: &SearchQuery, rerank: bool) -> Result<Vec<Hit>> {
-        let mut fetch_query = query.clone();
-        if rerank {
-            fetch_query.limit = query.limit.max(self.config.rerank.candidates);
+    /// Embed a query, memoized per process. None = no model / embed failed
+    /// (search degrades to BM25-only).
+    fn query_embedding(&mut self, text: &str) -> Option<Vec<f32>> {
+        if let Some(v) = self.query_cache.get(text) {
+            return Some(v.clone());
         }
-
-        let query_vec = self.ensure_embedder(false).and_then(|e| {
-            e.embed(vec![query.text.clone()])
+        let vec = self.ensure_embedder(false).and_then(|e| {
+            e.embed(vec![text.to_string()])
                 .map_err(|err| tracing::warn!(%err, "query embedding failed; BM25-only"))
                 .ok()
                 .and_then(|mut v| {
@@ -129,7 +144,23 @@ impl Mimir {
                         Some(v.remove(0))
                     }
                 })
-        });
+        })?;
+        if self.query_cache.len() >= QUERY_CACHE_CAP {
+            self.query_cache.clear();
+        }
+        self.query_cache.insert(text.to_string(), vec.clone());
+        Some(vec)
+    }
+
+    /// Search with optional cross-encoder reranking: over-fetch the fused
+    /// candidates, rescore them against the query, keep the top `limit`.
+    pub fn search_with(&mut self, query: &SearchQuery, rerank: bool) -> Result<Vec<Hit>> {
+        let mut fetch_query = query.clone();
+        if rerank {
+            fetch_query.limit = query.limit.max(self.config.rerank.candidates);
+        }
+
+        let query_vec = self.query_embedding(&query.text);
         let mut hits = match query_vec {
             Some(v) => {
                 let model = self.config.embedding.model.clone();

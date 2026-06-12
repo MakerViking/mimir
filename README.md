@@ -30,6 +30,32 @@ exposed to agents as a single, globally-registered MCP server.
 cargo install --path crates/mimir-cli   # from a checkout (crates.io soon)
 ```
 
+### Optional GPU acceleration
+
+CPU-only by default — GPU is an opt-in build feature (pick **one**):
+
+```sh
+# Cross-vendor: Vulkan (Linux), D3D12 (Windows), Metal (macOS) via Dawn.
+# The right choice for AMD/Intel GPUs.
+RUST_MIN_STACK=33554432 cargo install --path crates/mimir-cli --features gpu-webgpu
+
+# NVIDIA CUDA 12/13:
+RUST_MIN_STACK=33554432 cargo install --path crates/mimir-cli --features gpu-cuda
+```
+
+Notes:
+- `RUST_MIN_STACK` works around a rustc/LLVM ThinLTO crash when linking the
+  large onnxruntime GPU binary.
+- The webgpu build dynamically links `libwebgpu_dawn.so` — copy it from the
+  build cache next to the binary (the binary's `$ORIGIN` rpath finds it
+  there), or set `LD_LIBRARY_PATH`:
+  `cp $(find ~/.cache/ort.pyke.io -name 'libwebgpu_dawn.so' | head -1) ~/.cargo/bin/`
+- `config.toml: embedding.device = "cpu"` forces CPU in a GPU build;
+  the default `"auto"` falls back to CPU if GPU init fails.
+
+Measured on an RX 6900 XT (Vulkan): bulk embedding 2.3× faster, recall
+22 ms → 7 ms, `--rerank` 1.9 s → 0.14 s.
+
 ## Quickstart
 
 ```sh
@@ -47,7 +73,7 @@ mimir index                # incremental; re-run any time
 
 # precision dial (all optional)
 mimir embed --fetch --rerank                  # one-time reranker download (~150 MB)
-mimir recall tricky semantic question --rerank  # cross-encoder rescoring (~2 s)
+mimir recall tricky semantic question --rerank  # cross-encoder rescoring (~1 s CPU, ~0.15 s GPU)
 # config.toml: embedding.model = "bge-base-en-v1.5" — stronger semantic
 # matching at the same query latency (index-time embedding is ~4x slower)
 

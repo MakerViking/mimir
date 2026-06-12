@@ -17,6 +17,9 @@ use crate::error::Result;
 use crate::model::Scope;
 use crate::search::{scope_sql, SearchQuery};
 
+/// Row count above which the dot-product scan fans out across cores.
+const PARALLEL_SCAN_THRESHOLD: usize = 8_192;
+
 pub struct MatrixCache {
     model: String,
     dim: usize,
@@ -88,17 +91,32 @@ pub fn leg(
         return Ok(vec![]);
     }
     let allowed = candidate_set(conn, query)?;
-    let mut scored: Vec<(i64, f32)> = Vec::with_capacity(c.node_ids.len());
-    for (i, id) in c.node_ids.iter().enumerate() {
+    let score_row = |(i, id): (usize, &i64)| -> Option<(i64, f32)> {
         if let Some(set) = &allowed {
             if !set.contains(id) {
-                continue;
+                return None;
             }
         }
         let row = &c.data[i * c.dim..(i + 1) * c.dim];
         let dot: f32 = row.iter().zip(query_vec).map(|(a, b)| a * b).sum();
-        scored.push((*id, dot));
-    }
+        Some((*id, dot))
+    };
+    // Parallel scan pays for itself only on big matrices; below the
+    // threshold rayon's fork/join overhead exceeds the work.
+    let mut scored: Vec<(i64, f32)> = if c.node_ids.len() >= PARALLEL_SCAN_THRESHOLD {
+        use rayon::prelude::*;
+        c.node_ids
+            .par_iter()
+            .enumerate()
+            .filter_map(score_row)
+            .collect()
+    } else {
+        c.node_ids
+            .iter()
+            .enumerate()
+            .filter_map(score_row)
+            .collect()
+    };
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     scored.truncate(cap);
     Ok(scored.into_iter().map(|(id, _)| id).collect())

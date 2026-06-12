@@ -15,6 +15,51 @@ use rusqlite::{params, Connection, OptionalExtension};
 use crate::config::Paths;
 use crate::error::{Error, Result};
 
+#[cfg(all(feature = "gpu-webgpu", feature = "gpu-cuda"))]
+compile_error!(
+    "gpu-webgpu and gpu-cuda are mutually exclusive: each selects a different \
+     prebuilt onnxruntime binary and no binary ships with both. Pick one."
+);
+
+/// Name of the GPU backend compiled into this binary, if any.
+pub fn gpu_backend() -> Option<&'static str> {
+    #[cfg(feature = "gpu-webgpu")]
+    {
+        Some("webgpu (Vulkan/D3D12/Metal via Dawn)")
+    }
+    #[cfg(feature = "gpu-cuda")]
+    {
+        Some("cuda")
+    }
+    #[cfg(not(any(feature = "gpu-webgpu", feature = "gpu-cuda")))]
+    {
+        None
+    }
+}
+
+/// Execution providers for a device setting. Empty = onnxruntime's CPU
+/// default. EPs that fail to initialize at session build fall back to
+/// CPU with a logged warning — "auto" never hard-fails.
+fn execution_providers(device: &str) -> Vec<ort::ep::ExecutionProviderDispatch> {
+    if device == "cpu" {
+        return Vec::new();
+    }
+    let eps: Vec<ort::ep::ExecutionProviderDispatch> = vec![
+        #[cfg(feature = "gpu-webgpu")]
+        ort::ep::WebGPU::default().build(),
+        #[cfg(feature = "gpu-cuda")]
+        ort::ep::CUDA::default().build(),
+    ];
+    if !eps.is_empty() {
+        tracing::info!(
+            device,
+            backend = gpu_backend(),
+            "registering GPU execution provider"
+        );
+    }
+    eps
+}
+
 pub const EMBED_BATCH: usize = 64;
 
 /// Kinds whose body participates in semantic recall.
@@ -53,8 +98,8 @@ pub struct Embedder {
 impl Embedder {
     /// Load the model. With `allow_download = false` this refuses unless a
     /// previous load completed (marker present), so it never touches the
-    /// network on an agent's hot path.
-    pub fn load(paths: &Paths, name: &str, allow_download: bool) -> Result<Embedder> {
+    /// network on an agent's hot path. `device`: see EmbeddingConfig.
+    pub fn load(paths: &Paths, name: &str, device: &str, allow_download: bool) -> Result<Embedder> {
         if !allow_download && !model_ready(paths, name) {
             return Err(Error::Invalid(format!(
                 "embedding model '{name}' not downloaded; run `mimir init` or `mimir embed --fetch`"
@@ -64,6 +109,7 @@ impl Embedder {
         std::fs::create_dir_all(&paths.models_dir).map_err(|e| Error::io(&paths.models_dir, e))?;
         let options = TextInitOptions::new(which)
             .with_cache_dir(paths.models_dir.clone())
+            .with_execution_providers(execution_providers(device))
             .with_show_download_progress(allow_download);
         let mut model = TextEmbedding::try_new(options).map_err(|e| Error::Embed(e.to_string()))?;
         let probe = model
@@ -118,7 +164,7 @@ pub struct Reranker {
 }
 
 impl Reranker {
-    pub fn load(paths: &Paths, name: &str, allow_download: bool) -> Result<Reranker> {
+    pub fn load(paths: &Paths, name: &str, device: &str, allow_download: bool) -> Result<Reranker> {
         if !allow_download && !model_ready(paths, name) {
             return Err(Error::Invalid(format!(
                 "reranker model '{name}' not downloaded; run `mimir embed --fetch --rerank`"
@@ -128,6 +174,7 @@ impl Reranker {
         std::fs::create_dir_all(&paths.models_dir).map_err(|e| Error::io(&paths.models_dir, e))?;
         let options = RerankInitOptions::new(which)
             .with_cache_dir(paths.models_dir.clone())
+            .with_execution_providers(execution_providers(device))
             .with_show_download_progress(allow_download);
         let model = TextRerank::try_new(options).map_err(|e| Error::Embed(e.to_string()))?;
         std::fs::write(marker_path(paths, name), b"ok")

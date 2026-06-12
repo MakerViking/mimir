@@ -11,11 +11,19 @@ authors.workspace = true
 name = "mimir"
 path = "src/main.rs"
 
+[features]
+# GPU acceleration (see mimir-core; pick at most one):
+#   cargo install --features gpu-webgpu   # Vulkan/D3D12/Metal via Dawn
+#   cargo install --features gpu-cuda     # NVIDIA CUDA
+gpu-webgpu = ["mimir-core/gpu-webgpu"]
+gpu-cuda = ["mimir-core/gpu-cuda"]
+
 [dependencies]
 mimir-core.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
+libc = "0.2"
 rmcp.workspace = true
 schemars.workspace = true
 serde = { workspace = true }

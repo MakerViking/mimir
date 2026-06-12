@@ -171,7 +171,14 @@ enum DocsCmd {
     },
 }
 
-fn main() -> anyhow::Result<()> {
+fn main() {
+    // Behave like a normal Unix tool when piped into head/grep: die on
+    // SIGPIPE instead of panicking on a failed stdout write.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
@@ -180,6 +187,31 @@ fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+    let code = match run(cli) {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            1
+        }
+    };
+
+    // GPU builds: Dawn/onnxruntime process-teardown destructors are known
+    // to segfault (ort 2.0-rc). All work is flushed and SQLite-committed
+    // by now, so skip libc teardown entirely instead of crashing on exit.
+    #[cfg(any(feature = "gpu-webgpu", feature = "gpu-cuda"))]
+    {
+        use std::io::Write as _;
+        let _ = std::io::stdout().flush();
+        let _ = std::io::stderr().flush();
+        // SAFETY: bypasses atexit/dso destructors on purpose; no state
+        // depends on them.
+        unsafe { libc::_exit(code) }
+    }
+    #[cfg(not(any(feature = "gpu-webgpu", feature = "gpu-cuda")))]
+    std::process::exit(code)
+}
+
+fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::Init { no_model } => commands::init(no_model),
         Command::Status => commands::status(cli.json),

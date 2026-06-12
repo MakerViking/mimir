@@ -56,6 +56,10 @@ pub struct Config {
 pub struct EmbeddingConfig {
     /// fastembed model name; switching models requires `mimir embed --all`.
     pub model: String,
+    /// "auto" uses a GPU execution provider when one was compiled in
+    /// (--features gpu-webgpu / gpu-cuda), falling back to CPU if it
+    /// fails to initialize; "cpu" forces CPU even in a GPU build.
+    pub device: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,6 +89,7 @@ impl Default for EmbeddingConfig {
     fn default() -> Self {
         EmbeddingConfig {
             model: "bge-small-en-v1.5".into(),
+            device: "auto".into(),
         }
     }
 }
@@ -93,7 +98,10 @@ impl Default for RerankConfig {
     fn default() -> Self {
         RerankConfig {
             model: "jina-reranker-v1-turbo-en".into(),
-            candidates: 30,
+            // Cost is linear in candidates (~65 ms each on CPU); 15 keeps
+            // --rerank around a second while still covering the realistic
+            // winners. Raise for deeper reshuffles.
+            candidates: 15,
         }
     }
 }

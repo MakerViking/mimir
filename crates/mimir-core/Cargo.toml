@@ -7,6 +7,16 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+# GPU acceleration for embedding/reranking (optional; CPU-only by default).
+# The two are mutually exclusive: each selects a different prebuilt
+# onnxruntime binary, and no binary ships with both.
+# - gpu-webgpu: cross-vendor via Dawn — Vulkan (Linux), D3D12 (Windows),
+#   Metal (macOS). The right choice for AMD/Intel GPUs.
+# - gpu-cuda: NVIDIA via CUDA 12/13.
+gpu-webgpu = ["ort/webgpu"]
+gpu-cuda = ["ort/cuda"]
+
 [dependencies]
 rusqlite.workspace = true
 serde.workspace = true
@@ -17,6 +27,8 @@ ulid.workspace = true
 blake3.workspace = true
 fastembed.workspace = true
 ignore.workspace = true
+ort.workspace = true
+rayon.workspace = true
 pulldown-cmark.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

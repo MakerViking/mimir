@@ -1,0 +1,5 @@
+# GPU builds dynamically link provider libraries (libwebgpu_dawn.so /
+# CUDA EPs). $ORIGIN rpath lets users drop those next to the mimir
+# binary instead of fiddling with LD_LIBRARY_PATH. Harmless otherwise.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-args=-Wl,-rpath,$ORIGIN"]
