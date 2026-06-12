@@ -143,6 +143,25 @@ mimir export > backup.jsonl       # everything, always yours
 claude mcp add --scope user mimir -- mimir mcp
 ```
 
+### Already have a memory system?
+
+Don't start from zero — migrate, verify, then retire the old one.
+Claude Code auto-memory directories import directly
+(`mimir import claude-memory ~/.claude/projects/<project>/memory`). For
+anything else, your agent is the importer — tell it:
+
+> Read every entry in [my old memory system] and store each one in Mimir
+> with the `remember` tool — pick a fitting type (gotcha/decision/insight/
+> idea/note/person), keep the original wording, add tags. When done,
+> compare counts with `mimir status` and spot-check a few searches with
+> `recall`.
+
+Re-running is safe: `remember` refuses near-duplicates, so a second pass
+only fills gaps. **Verify before you delete** — compare entry counts,
+recall a handful of things you actually remember storing — and only then
+unplug the old system's MCP server. (And `mimir export` keeps the exit
+door open in the other direction: everything, always yours.)
+
 MCP tools: `recall`, `remember`, `get`, `link`, `graph`, `mark`, `status`.
 
 ### Works with any MCP client
