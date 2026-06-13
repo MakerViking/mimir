@@ -49,7 +49,8 @@ pub fn viz(out: Option<String>, open: bool, max_nodes: usize) -> Result<()> {
             .to_string_lossy()
             .into_owned()
     });
-    std::fs::write(&path, html).with_context(|| format!("write {path}"))?;
+    crate::fsutil::write_private(std::path::Path::new(&path), &html)
+        .with_context(|| format!("write {path}"))?;
     println!("graph viz → {path}");
     if open {
         let _ = std::process::Command::new(if cfg!(target_os = "macos") {
@@ -616,20 +617,20 @@ function tip(e){
   tipEl.style.display='block';
   tipEl.style.left=Math.min(W-440,e.clientX+16)+'px';
   tipEl.style.top=(e.clientY+16)+'px';
-  tipEl.innerHTML=`<div class="k">${hovered.k}${hovered.sk?' · '+hovered.sk:''} · deg ${hovered.deg}</div>
+  tipEl.innerHTML=`<div class="k">${escapeHtml(hovered.k)}${hovered.sk?' · '+escapeHtml(hovered.sk):''} · deg ${hovered.deg}</div>
     <div>${escapeHtml(hovered.t)}</div>${hovered.p?`<div class="p">${escapeHtml(hovered.p)}</div>`:''}`;
 }
-function escapeHtml(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+function escapeHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
 const side=document.getElementById('side'), sidebody=document.getElementById('sidebody');
 function select(n){
   selected=n;
   const nbs=[...(adj.get(n.id)||[])].map(id=>byId.get(id)).filter(Boolean)
     .sort((a,b)=>b.deg-a.deg).slice(0,40);
-  sidebody.innerHTML=`<div class="k">${n.k}${n.sk?' · '+n.sk:''} · ${n.uid}</div>
+  sidebody.innerHTML=`<div class="k">${escapeHtml(n.k)}${n.sk?' · '+escapeHtml(n.sk):''} · ${escapeHtml(n.uid)}</div>
     <h2>${escapeHtml(n.t)}</h2>${n.p?`<div class="p">${escapeHtml(n.p)}</div>`:''}
     <h3>connected (${(adj.get(n.id)||new Set()).size})</h3>` +
     nbs.map(m=>`<button class="nb" data-id="${m.id}">
-      <i style="background:${COLOR[m.k]||'#8a93a6'}"></i><em>${m.k}</em>${escapeHtml(m.t)}</button>`).join('');
+      <i style="background:${COLOR[m.k]||'#8a93a6'}"></i><em>${escapeHtml(m.k)}</em>${escapeHtml(m.t)}</button>`).join('');
   side.style.display='block';
   sidebody.querySelectorAll('.nb').forEach(b=>b.onclick=()=>{
     const m=byId.get(+b.dataset.id); if(m){select(m); cam.x=m.x; cam.y=m.y;}});

@@ -41,10 +41,27 @@ pub fn remember(conn: &Connection, args: Remember) -> Result<RememberOutcome> {
     new.subkind = Some(args.mtype.to_string());
     new.title = Some(derive_title(&args.text));
     new.body = Some(args.text);
-    new.tags = args.tags;
+    new.tags = sanitize_tags(args.tags);
     new.project_id = args.project_id;
     new.content_hash = Some(hash);
     Ok(RememberOutcome::Created(store::insert_node(conn, new)?))
+}
+
+/// Tags surface as nodes in the graph visualization (HTML). Strip the
+/// HTML-significant characters at ingest so a tag can never carry markup —
+/// the viz also escapes at render time, this is defense in depth. Tags that
+/// reduce to nothing are dropped.
+pub fn sanitize_tags(tags: Vec<String>) -> Vec<String> {
+    tags.into_iter()
+        .map(|t| {
+            t.chars()
+                .filter(|c| !matches!(c, '<' | '>' | '&' | '"' | '\''))
+                .collect::<String>()
+                .trim()
+                .to_string()
+        })
+        .filter(|t| !t.is_empty())
+        .collect()
 }
 
 fn find_duplicate(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<Node>> {
@@ -143,7 +160,10 @@ pub fn edit(conn: &Connection, id: i64, edit: Edit) -> Result<Node> {
         None => body.as_deref().map(derive_title),
     };
     let subkind = edit.mtype.map(|t| t.to_string()).or(node.subkind);
-    let tags_text = edit.tags.map(|t| t.join(" ")).unwrap_or(node.tags_text);
+    let tags_text = edit
+        .tags
+        .map(|t| sanitize_tags(t).join(" "))
+        .unwrap_or(node.tags_text);
     let hash = body.as_deref().map(content_hash);
     conn.execute(
         "UPDATE node SET title = ?2, body = ?3, subkind = ?4, tags_text = ?5,
@@ -201,6 +221,19 @@ pub fn list(
 mod tests {
     use super::*;
     use crate::db;
+
+    #[test]
+    fn sanitize_tags_strips_markup_and_drops_empties() {
+        let got = sanitize_tags(vec![
+            "<img/src=x/onerror=alert(1)>".into(),
+            "auth".into(),
+            "<>&\"'".into(),
+            "  postgres  ".into(),
+        ]);
+        // markup chars gone, empties dropped, whitespace trimmed
+        assert_eq!(got, vec!["img/src=x/onerror=alert(1)", "auth", "postgres"]);
+        assert!(got.iter().all(|t| !t.contains('<') && !t.contains('>')));
+    }
 
     fn remember_text(conn: &Connection, text: &str) -> RememberOutcome {
         remember(

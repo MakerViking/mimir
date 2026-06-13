@@ -1,5 +1,6 @@
 mod commands;
 mod dashboard;
+mod fsutil;
 mod graph_cmd;
 mod graph_viz;
 mod mcp;

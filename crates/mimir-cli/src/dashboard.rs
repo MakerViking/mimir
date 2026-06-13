@@ -16,7 +16,8 @@ pub fn dashboard(out: Option<String>, open: bool) -> Result<()> {
             .to_string_lossy()
             .into_owned()
     });
-    std::fs::write(&path, html).with_context(|| format!("write {path}"))?;
+    crate::fsutil::write_private(std::path::Path::new(&path), &html)
+        .with_context(|| format!("write {path}"))?;
     println!("dashboard → {path}");
     if open {
         let _ = std::process::Command::new(if cfg!(target_os = "macos") {
