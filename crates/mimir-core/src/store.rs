@@ -122,12 +122,31 @@ pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Node> {
             "reference '{raw}' too short; use at least 4 trailing characters of the id"
         )));
     }
-    let pattern = format!("%{}", tail.to_uppercase());
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {NODE_COLS} FROM node WHERE uid LIKE ?1 AND deleted_at IS NULL LIMIT 3"
-    ))?;
+    // The short-id form (`m:ABCDEF`) is exactly 6 trailing chars, which the
+    // `node_uid_tail` index on substr(uid,-6) serves via equality — an O(log
+    // N) seek. A `LIKE '%tail'` leading wildcard can't use any index and
+    // full-scans (≈66 ms at 500k nodes), so only fall back to it for the
+    // uncommon non-6-char tail.
+    let up = tail.to_uppercase();
+    let (sql, param) = if tail.len() == 6 {
+        (
+            format!(
+                "SELECT {NODE_COLS} FROM node
+                 WHERE substr(uid, -6) = ?1 AND deleted_at IS NULL LIMIT 3"
+            ),
+            up,
+        )
+    } else {
+        (
+            format!(
+                "SELECT {NODE_COLS} FROM node WHERE uid LIKE ?1 AND deleted_at IS NULL LIMIT 3"
+            ),
+            format!("%{up}"),
+        )
+    };
+    let mut stmt = conn.prepare(&sql)?;
     let nodes: Vec<Node> = stmt
-        .query_map([&pattern], row_to_node)?
+        .query_map([&param], row_to_node)?
         .collect::<rusqlite::Result<_>>()?;
     match nodes.len() {
         0 => Err(Error::NotFound(format!("no node matching '{raw}'"))),

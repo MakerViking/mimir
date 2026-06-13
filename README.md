@@ -247,6 +247,27 @@ State lives in the platform-standard directories
 (`~/.local/share/mimir`, `~/.config/mimir`, `~/.cache/mimir` on Linux);
 set `MIMIR_HOME=<dir>` to put everything under one directory instead.
 
+### Scaling
+
+The exact brute-force vector scan is O(n) in both time and RAM, so recall
+latency and memory grow linearly with the embedded-node count. Measured
+(CPU, synthetic corpus; `cargo test --release scaling_profile -- --ignored
+--nocapture`):
+
+| embedded nodes | warm hybrid recall | matrix RAM |
+|---|---|---|
+| 50k | ~16 ms | ~75 MB |
+| 200k | ~55 ms | ~290 MB |
+| 500k | ~130 ms | ~730 MB |
+
+Everyday operations (`get`/`mark`/`edit`, by id) stay flat — microseconds —
+at every size. The sweet spot is up to a couple hundred thousand embedded
+nodes, where recall is comfortably interactive; beyond that it degrades
+gracefully rather than falling over. If a store ever genuinely outgrows
+this, the planned path is training-free vector quantization (8–16× less RAM,
+exact-ish scan preserved) rather than an approximate index — keeping recall
+exact is the point.
+
 ## Roadmap
 
 v0.4 ships the complete original blueprint: memories, docs, code graph,

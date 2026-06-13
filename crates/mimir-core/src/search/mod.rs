@@ -277,4 +277,113 @@ mod perf_tests {
             "warm hybrid over 100k took {elapsed:?} (budget 100 ms)"
         );
     }
+
+    /// Scaling profile: prints recall/resolve/RAM at increasing store sizes
+    /// to locate the real cliffs (the brute-force vector scan is O(N) time
+    /// and RAM). Explicit + verbose:
+    ///   cargo test -p mimir-mem-core --release scaling_profile -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn scaling_profile() {
+        const DIM: usize = 384;
+        let mut state = 0x2545F4914F6CDD1Du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 40) as f32 / 16_777_216.0 - 0.5
+        };
+        let median = |mut v: Vec<u128>| {
+            v.sort_unstable();
+            v[v.len() / 2]
+        };
+
+        println!(
+            "\n{:>9}  {:>10}  {:>11}  {:>10}  {:>11}  {:>9}",
+            "nodes", "seed", "cold(build)", "warm hyb", "bm25-only", "resolve"
+        );
+        for &n in &[50_000usize, 200_000, 500_000] {
+            let conn = crate::db::open_in_memory().unwrap();
+            let t = std::time::Instant::now();
+            let tx = conn.unchecked_transaction().unwrap();
+            for i in 0..n {
+                let mut node = NewNode::new(Kind::Chunk);
+                node.title = Some(format!("doc{} section {}", i / 40, i % 40));
+                node.body = Some(format!(
+                    "chunk{i} topic{} fragment{} item{}",
+                    i % 997,
+                    i % 79,
+                    i % 13
+                ));
+                let inserted = store::insert_node(&tx, node).unwrap();
+                let mut v: Vec<f32> = (0..DIM).map(|_| next()).collect();
+                crate::embed::l2_normalize(&mut v);
+                tx.execute(
+                    "INSERT INTO embedding (node_id, model, dim, vec, content_hash)
+                     VALUES (?1, 'perf', ?2, ?3, x'00')",
+                    rusqlite::params![inserted.id, DIM as i64, to_blob(&v)],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+            let seed = t.elapsed();
+
+            let mut qv: Vec<f32> = (0..DIM).map(|_| next()).collect();
+            crate::embed::l2_normalize(&mut qv);
+            let query = SearchQuery {
+                text: "topic42 fragment7 item3".into(),
+                scope: Scope::All,
+                kinds: vec![],
+                since: None,
+                limit: 10,
+                strength_alpha: 0.15,
+            };
+            let mut cache = None;
+            let t = std::time::Instant::now();
+            search_hybrid(&conn, &query, Some(("perf", &qv)), &mut cache).unwrap();
+            let cold = t.elapsed();
+            let warm = median(
+                (0..7)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        search_hybrid(&conn, &query, Some(("perf", &qv)), &mut cache).unwrap();
+                        t.elapsed().as_micros()
+                    })
+                    .collect(),
+            );
+            let bm25 = median(
+                (0..7)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        search(&conn, &query).unwrap();
+                        t.elapsed().as_micros()
+                    })
+                    .collect(),
+            );
+            // resolve_ref: short-tail LIKE '%xxxxxx' — leading wildcard, full scan.
+            let some_uid: String = conn
+                .query_row(
+                    "SELECT uid FROM node LIMIT 1 OFFSET ?1",
+                    [(n / 2) as i64],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let tail = &some_uid[some_uid.len() - 6..];
+            let resolve = median(
+                (0..7)
+                    .map(|_| {
+                        let t = std::time::Instant::now();
+                        store::resolve_ref(&conn, tail).unwrap();
+                        t.elapsed().as_micros()
+                    })
+                    .collect(),
+            );
+            let ram_mb = (n * DIM * 4) as f64 / 1_048_576.0;
+            println!(
+                "{n:>9}  {:>9.1?}  {:>11.1?}  {:>8} µs  {:>9} µs  {:>7} µs   matrix ~{ram_mb:.0} MB",
+                seed, cold, warm, bm25, resolve
+            );
+        }
+        println!();
+    }
 }
