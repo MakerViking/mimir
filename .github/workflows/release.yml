@@ -30,7 +30,7 @@ jobs:
           - { name: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -63,7 +63,7 @@ jobs:
           Copy-Item target/${{ matrix.target }}/release/mimir.exe dist/
           Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE dist/
           Compress-Archive -Path dist/* -DestinationPath mimir-${{ matrix.name }}.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: mimir-${{ matrix.name }}
           path: mimir-${{ matrix.name }}.*
@@ -73,7 +73,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
       - uses: softprops/action-gh-release@v2
