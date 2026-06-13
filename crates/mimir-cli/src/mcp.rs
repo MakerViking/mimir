@@ -600,3 +600,126 @@ pub fn run() -> Result<()> {
         Ok(())
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimir_core::config::Paths;
+
+    /// A server backed by a real temp-dir DB (status reads the db file), in
+    /// global scope (project_id = None), so the tool handlers exercise the
+    /// same paths an agent hits.
+    fn server() -> (tempfile::TempDir, MimirServer) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Mimir::open_at(Paths::under_root(dir.path())).unwrap();
+        (dir, MimirServer::new(engine, None))
+    }
+
+    fn remember_args(text: &str, ty: &str) -> RememberArgs {
+        RememberArgs {
+            text: text.into(),
+            r#type: Some(ty.into()),
+            tags: vec!["auth".into()],
+            global: true,
+            link: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remember_recall_get_roundtrip() {
+        let (_dir, s) = server();
+        let stored = s
+            .remember(Parameters(remember_args(
+                "SCRAM auth rejects non-ASCII passwords",
+                "gotcha",
+            )))
+            .await;
+        assert!(stored.starts_with("stored"), "remember: {stored}");
+        let id = stored.split_whitespace().nth(1).unwrap().to_string();
+
+        let hits = s
+            .recall(Parameters(RecallArgs {
+                query: "postgres password trouble".into(),
+                kind: None,
+                limit: None,
+                all_projects: true,
+                rerank: false,
+            }))
+            .await;
+        assert!(hits.contains("SCRAM"), "recall: {hits}");
+
+        let body = s.get(Parameters(GetArgs { r#ref: id })).await;
+        assert!(body.contains("SCRAM"), "get: {body}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn near_duplicate_is_refused() {
+        let (_dir, s) = server();
+        let first = s
+            .remember(Parameters(remember_args(
+                "we picked SQLite for one file",
+                "decision",
+            )))
+            .await;
+        assert!(first.starts_with("stored"), "{first}");
+        let dup = s
+            .remember(Parameters(remember_args(
+                "we picked SQLite for one file",
+                "decision",
+            )))
+            .await;
+        assert!(dup.contains("refused"), "duplicate not refused: {dup}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mark_link_and_status() {
+        let (_dir, s) = server();
+        let a = s
+            .remember(Parameters(remember_args(
+                "alpha decision about caching",
+                "decision",
+            )))
+            .await;
+        let b = s
+            .remember(Parameters(remember_args(
+                "beta gotcha about caching",
+                "gotcha",
+            )))
+            .await;
+        let id_a = a.split_whitespace().nth(1).unwrap().to_string();
+        let id_b = b.split_whitespace().nth(1).unwrap().to_string();
+
+        let marked = s
+            .mark(Parameters(MarkArgs {
+                r#ref: id_a.clone(),
+                useful: true,
+            }))
+            .await;
+        assert!(marked.contains("useful"), "mark: {marked}");
+
+        let linked = s
+            .link(Parameters(LinkArgs {
+                a: id_a,
+                b: id_b,
+                rel: Some("relates".into()),
+            }))
+            .await;
+        assert!(!linked.starts_with("error"), "link: {linked}");
+
+        let status = s.status().await;
+        assert!(status.contains("memory"), "status: {status}");
+        assert!(status.contains("KB"), "status: {status}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn bad_reference_errors_cleanly() {
+        let (_dir, s) = server();
+        // A missing id must return an error string, not panic or wedge.
+        let got = s
+            .get(Parameters(GetArgs {
+                r#ref: "m:ZZZZZZ".into(),
+            }))
+            .await;
+        assert!(got.starts_with("error"), "expected error: {got}");
+    }
+}
