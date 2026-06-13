@@ -1,0 +1,94 @@
+<!doctype html>
+<html><head><meta charset="utf-8">
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html,body { width:1000px; height:600px; overflow:hidden; background:#0b0e14;
+  font-family:"JetBrains Mono","DejaVu Sans Mono","Fira Code",monospace; }
+#win { position:absolute; inset:0; background:#10141c; }
+#bar { height:40px; border-bottom:1px solid #232a38; display:flex; align-items:center; padding:0 16px; gap:9px; }
+.dot { width:12px; height:12px; border-radius:50%; background:#2c3445; }
+.dot.r{background:#d96c6c}.dot.y{background:#e8a33d}.dot.g{background:#7ec699}
+#title { color:#5a6577; font-size:13.5px; margin-left:14px; }
+#body { padding:22px 26px; font-size:19px; line-height:1.75; color:#e6e9ef; }
+.line { white-space:pre; }
+.prompt { color:#7ec699; }
+.cmd { color:#e6e9ef; }
+.flag { color:#5aa9e6; }
+.str { color:#e8a33d; }
+.id { color:#e8a33d; }
+.tag { color:#7ec699; }
+.dim { color:#8a93a6; }
+.hl { background:#1a2230; border-radius:4px; }
+.cursor { display:inline-block; width:10px; height:21px; background:#7ec699;
+  vertical-align:-3px; }
+.hidden { visibility:hidden; }
+</style></head>
+<body>
+<div id="win">
+  <div id="bar"><i class="dot r"></i><i class="dot y"></i><i class="dot g"></i>
+    <span id="title">mimir — give your agent a memory that lasts</span></div>
+  <div id="body" id="b"></div>
+</div>
+<script>
+// Each step: typed command, then revealed output lines. seek(t) scrubs.
+const STEPS = [
+  { type: '<span class="prompt">$</span> <span class="cmd">mimir remember</span> <span class="str">"We picked SQLite over Postgres: zero-dep, one file"</span> <span class="flag">-t decision</span>',
+    out: ['<span class="id">m:678CWK</span> <span class="dim">[decision pr:Mimir]</span> We picked SQLite over Postgres: zero-dep, one file'] },
+  { type: '<span class="prompt">$</span> <span class="cmd">mimir remember</span> <span class="str">"SCRAM auth rejects non-ASCII passwords"</span> <span class="flag">-t gotcha</span>',
+    out: ['<span class="id">m:DMFYWX</span> <span class="dim">[gotcha pr:Mimir]</span> SCRAM auth rejects non-ASCII passwords'] },
+  { type: '<span class="prompt">$</span> <span class="cmd">mimir recall</span> why did we choose sqlite',
+    out: ['<span class="hl"><span class="id">m:678CWK</span> <span class="dim">[decision pr:Mimir]</span> We picked SQLite over Postgres: zero-dep, one file</span>',
+          '<span class="dim">1 hit · 4 ms</span>'] },
+];
+// rough char-typing speed and pauses (seconds)
+const TYPE_CPS = 28, AFTER_TYPE = 0.35, AFTER_OUT = 1.1;
+
+// Build a timeline of (tStart, render-state) by simulating.
+const body = document.getElementById('body');
+function plainLen(html){ const d=document.createElement('div'); d.innerHTML=html; return d.textContent.length; }
+const timeline = [];
+let t = 0.4;
+const printed = []; // committed html lines
+for (const step of STEPS) {
+  const n = plainLen(step.type);
+  const dur = n / TYPE_CPS;
+  // typing frames: progressively reveal characters of step.type
+  timeline.push({ t, kind:'type', html: step.type, dur, printed: printed.slice() });
+  t += dur + 0.12;
+  printed.push(step.type);
+  for (const o of step.out) printed.push(o);
+  timeline.push({ t, kind:'show', printed: printed.slice() });
+  t += AFTER_TYPE + AFTER_OUT;
+}
+const TOTAL = t + 0.6;
+
+// reveal the first `chars` characters of an html string (tag-aware)
+function clip(html, chars){
+  let out='', count=0, i=0;
+  while(i<html.length && count<chars){
+    if(html[i]==='<'){ const j=html.indexOf('>',i); out+=html.slice(i,j+1); i=j+1; }
+    else { out+=html[i]; i++; count++; }
+  }
+  return out;
+}
+function render(state, typed){
+  let html = state.printed.map(l=>`<div class="line">${l}</div>`).join('');
+  if (typed!=null) html += `<div class="line">${typed}<span class="cursor"></span></div>`;
+  else html += `<div class="line"><span class="prompt">$</span> <span class="cursor"></span></div>`;
+  body.innerHTML = html;
+}
+function seek(time){
+  let cur = timeline[0];
+  for (const e of timeline) if (e.t <= time) cur = e; else break;
+  if (cur.kind === 'type'){
+    const prog = Math.min(1, (time - cur.t) / cur.dur);
+    const chars = Math.floor(plainLen(cur.html) * prog);
+    render({printed: cur.printed}, clip(cur.html, chars));
+  } else {
+    render(cur, null);
+  }
+}
+window.__total = TOTAL;
+window.addEventListener('load', ()=>{ seek(0); window.__ready = true; });
+</script>
+</body></html>
