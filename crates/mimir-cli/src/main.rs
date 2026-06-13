@@ -76,6 +76,10 @@ enum Command {
         since: Option<String>,
         #[arg(short = 'n', long)]
         limit: Option<usize>,
+        /// Drop hits scoring below this fused relevance score (the value shown
+        /// in `--json`). The score is scale-free (RRF), so tune it empirically.
+        #[arg(long)]
+        min_score: Option<f64>,
         /// Print full bodies instead of one-line summaries.
         #[arg(long)]
         full: bool,
@@ -361,6 +365,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             all,
             since,
             limit,
+            min_score,
             full,
             rerank,
             linked,
@@ -375,6 +380,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             full,
             rerank,
             linked,
+            min_score,
         ),
         Command::Get { refs } => commands::get(cli.json, refs),
         Command::List {
