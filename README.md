@@ -275,6 +275,13 @@ hybrid + reranked search, self-learning, importers, prebuilt binaries,
 and the crates.io release ([mimir-mem](https://crates.io/crates/mimir-mem)).
 Next: more languages, and whatever using it daily teaches us.
 
+## Contributing & security
+
+Bug reports, language adapters, and docs are welcome — see
+[CONTRIBUTING.md](CONTRIBUTING.md). Release history is in
+[CHANGELOG.md](CHANGELOG.md). For security issues, please follow
+[SECURITY.md](SECURITY.md) (private disclosure) rather than a public issue.
+
 ## License
 
 MIT or Apache-2.0, at your option.
