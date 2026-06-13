@@ -3,19 +3,20 @@
 //! No vector extension — embeddings are L2-normalized f32 blobs, so
 //! cosine == dot, and exact scan of ≤200k vectors takes single-digit ms.
 //!
+//! Scope/kind/since filters are evaluated against per-row metadata cached
+//! with the matrix — no per-query candidate-set table scan.
+//!
 //! Invalidation contract: other connections' commits are caught via
 //! `PRAGMA data_version`. Same-connection embedding mutations do NOT
 //! auto-invalidate (deliberately — recall's own event logging must not
 //! force a rebuild every call); the only same-connection mutator is
 //! `embed_pending`, and `Mimir` drops its cache after calling it.
 
-use std::collections::HashSet;
-
 use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::model::Scope;
-use crate::search::{scope_sql, SearchQuery};
+use crate::search::SearchQuery;
 
 /// Row count above which the dot-product scan fans out across cores.
 const PARALLEL_SCAN_THRESHOLD: usize = 8_192;
@@ -25,6 +26,12 @@ pub struct MatrixCache {
     dim: usize,
     node_ids: Vec<i64>,
     data: Vec<f32>,
+    // Per-row filter metadata, parallel to node_ids. Kinds are interned:
+    // kind_of[i] indexes into kind_names (a handful of distinct strings).
+    project_ids: Vec<Option<i64>>,
+    kind_of: Vec<u8>,
+    kind_names: Vec<String>,
+    created_at: Vec<i64>,
     stamp: i64,
 }
 
@@ -39,12 +46,17 @@ impl MatrixCache {
             }
         }
         let mut stmt = conn.prepare(
-            "SELECT e.node_id, e.dim, e.vec FROM embedding e
+            "SELECT e.node_id, e.dim, e.vec, n.project_id, n.kind, n.created_at
+             FROM embedding e
              JOIN node n ON n.id = e.node_id
              WHERE e.model = ?1 AND n.deleted_at IS NULL",
         )?;
         let mut node_ids = Vec::new();
         let mut data: Vec<f32> = Vec::new();
+        let mut project_ids = Vec::new();
+        let mut kind_of = Vec::new();
+        let mut kind_names: Vec<String> = Vec::new();
+        let mut created_at = Vec::new();
         let mut dim = 0usize;
         let mut rows = stmt.query([model])?;
         while let Some(row) = rows.next()? {
@@ -59,14 +71,29 @@ impl MatrixCache {
                 tracing::warn!(node = id, "embedding dim mismatch; skipping");
                 continue;
             }
+            let kind: String = row.get(4)?;
+            let kind_idx = match kind_names.iter().position(|k| *k == kind) {
+                Some(i) => i,
+                None => {
+                    kind_names.push(kind);
+                    kind_names.len() - 1
+                }
+            };
             node_ids.push(id);
             data.extend_from_slice(&vec);
+            project_ids.push(row.get(3)?);
+            kind_of.push(kind_idx as u8);
+            created_at.push(row.get(5)?);
         }
         *cache = Some(MatrixCache {
             model: model.to_string(),
             dim,
             node_ids,
             data,
+            project_ids,
+            kind_of,
+            kind_names,
+            created_at,
             stamp,
         });
         Ok(())
@@ -90,10 +117,41 @@ pub fn leg(
     if c.node_ids.is_empty() || c.dim != query_vec.len() {
         return Ok(vec![]);
     }
-    let allowed = candidate_set(conn, query)?;
+    // Requested kinds → interned indices in this cache. A requested kind
+    // absent from kind_names matches nothing, which is correct.
+    let kind_filter: Option<Vec<u8>> = if query.kinds.is_empty() {
+        None
+    } else {
+        Some(
+            query
+                .kinds
+                .iter()
+                .filter_map(|k| {
+                    let name = k.to_string();
+                    c.kind_names
+                        .iter()
+                        .position(|n| *n == name)
+                        .map(|i| i as u8)
+                })
+                .collect(),
+        )
+    };
     let score_row = |(i, id): (usize, &i64)| -> Option<(i64, f32)> {
-        if let Some(set) = &allowed {
-            if !set.contains(id) {
+        let scope_ok = match query.scope {
+            Scope::All => true,
+            Scope::Global => c.project_ids[i].is_none(),
+            Scope::Project(pid) => c.project_ids[i].is_none() || c.project_ids[i] == Some(pid),
+        };
+        if !scope_ok {
+            return None;
+        }
+        if let Some(kinds) = &kind_filter {
+            if !kinds.contains(&c.kind_of[i]) {
+                return None;
+            }
+        }
+        if let Some(since) = query.since {
+            if c.created_at[i] < since {
                 return None;
             }
         }
@@ -120,35 +178,6 @@ pub fn leg(
     scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     scored.truncate(cap);
     Ok(scored.into_iter().map(|(id, _)| id).collect())
-}
-
-/// Node ids passing the query filters, or None when nothing filters
-/// (avoids materializing the whole store).
-fn candidate_set(conn: &Connection, query: &SearchQuery) -> Result<Option<HashSet<i64>>> {
-    if matches!(query.scope, Scope::All) && query.kinds.is_empty() && query.since.is_none() {
-        return Ok(None);
-    }
-    let mut sql = format!(
-        "SELECT n.id FROM node n WHERE n.deleted_at IS NULL AND {}",
-        scope_sql(query.scope)
-    );
-    if !query.kinds.is_empty() {
-        let kinds = query
-            .kinds
-            .iter()
-            .map(|k| format!("'{k}'"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        sql.push_str(&format!(" AND n.kind IN ({kinds})"));
-    }
-    if let Some(since) = query.since {
-        sql.push_str(&format!(" AND n.created_at >= {since}"));
-    }
-    let mut stmt = conn.prepare(&sql)?;
-    let set = stmt
-        .query_map([], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(Some(set))
 }
 
 #[cfg(test)]
@@ -217,6 +246,44 @@ mod tests {
         cache = None;
         let ids = leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &q(), 10).unwrap();
         assert_eq!(ids, vec![b]);
+    }
+
+    #[test]
+    fn scope_and_since_filter_from_cached_metadata() {
+        let conn = db::open_in_memory().unwrap();
+        let proj = store::insert_node(&conn, NewNode::new(Kind::Project)).unwrap();
+        let other = store::insert_node(&conn, NewNode::new(Kind::Project)).unwrap();
+        let global = add_with_vec(&conn, "global", &[1.0, 0.0]);
+        let scoped = add_with_vec(&conn, "scoped", &[0.9, 0.1]);
+        conn.execute(
+            "UPDATE node SET project_id = ?2 WHERE id = ?1",
+            [scoped, proj.id],
+        )
+        .unwrap();
+
+        let mut cache = None;
+        let mut query = q();
+        query.scope = Scope::Global;
+        let ids = leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &query, 10).unwrap();
+        assert_eq!(ids, vec![global], "global scope excludes project rows");
+
+        query.scope = Scope::Project(proj.id);
+        let ids = leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &query, 10).unwrap();
+        assert_eq!(
+            ids,
+            vec![global, scoped],
+            "project scope = project + global"
+        );
+
+        query.scope = Scope::Project(other.id);
+        let ids = leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &query, 10).unwrap();
+        assert_eq!(ids, vec![global], "other project sees only global");
+
+        let mut query = q();
+        query.since = Some(i64::MAX);
+        assert!(leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &query, 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

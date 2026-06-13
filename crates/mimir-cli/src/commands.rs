@@ -230,8 +230,8 @@ pub fn status(json: bool) -> Result<()> {
     let mimir = Mimir::open()?;
     let counts = store::count_by_kind(&mimir.conn)?;
     let db_size = std::fs::metadata(&mimir.paths.db_file)
-        .map(|m| m.len())
-        .unwrap_or(0);
+        .with_context(|| format!("stat {}", mimir.paths.db_file.display()))?
+        .len();
     let project = mimir.project_for_cwd(&std::env::current_dir()?)?;
 
     if json {

@@ -432,7 +432,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             reference,
             useful,
             noise,
-        } => commands::mark(&reference, useful || !noise),
+        } => {
+            // Marking mutates ranking state — refuse to guess the intent.
+            if !useful && !noise {
+                anyhow::bail!("pass --useful or --noise");
+            }
+            commands::mark(&reference, useful)
+        }
         Command::Consolidate { dry_run } => commands::consolidate(dry_run),
         Command::Import { cmd } => match cmd {
             ImportCmd::Openbrain { file } => commands::import_openbrain(&file),

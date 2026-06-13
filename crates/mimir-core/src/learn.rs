@@ -49,7 +49,8 @@ pub fn effective_strength(node: &Node, now: i64) -> f64 {
 
 /// Has this node already received an event of this type today?
 fn capped_today(conn: &Connection, node_id: i64, event: &str) -> Result<bool> {
-    let midnight = now_unix() - (now_unix() % 86_400);
+    let now = now_unix();
+    let midnight = now - (now % 86_400);
     let n: i64 = conn.query_row(
         "SELECT count(*) FROM recall_event
          WHERE node_id = ?1 AND event = ?2 AND at >= ?3",

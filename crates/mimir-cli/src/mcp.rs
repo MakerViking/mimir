@@ -478,7 +478,7 @@ impl MimirServer {
             };
             let db_size = std::fs::metadata(&m.paths.db_file)
                 .map(|md| md.len())
-                .unwrap_or(0);
+                .map_err(engine_err)?;
             let summary = if counts.is_empty() {
                 "empty".to_string()
             } else {
@@ -512,9 +512,15 @@ pub fn run() -> Result<()> {
     let cwd = std::env::var_os("MIMIR_PROJECT")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::current_dir().ok());
-    let project_id = cwd
-        .and_then(|d| engine.project_for_cwd(&d).ok().flatten())
-        .map(|p| p.id);
+    let project_id = cwd.and_then(|d| match engine.project_for_cwd(&d) {
+        Ok(proj) => proj.map(|p| p.id),
+        Err(err) => {
+            // Without this the whole session silently degrades to global
+            // scope — wrong-scoped memories are corruption nobody notices.
+            tracing::warn!(%err, "project detection failed; serving GLOBAL scope only");
+            None
+        }
+    });
 
     // Auto-sync the project on session start: first contact builds the code
     // graph and indexes the repo's markdown; every later start is an

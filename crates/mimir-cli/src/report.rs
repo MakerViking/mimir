@@ -127,9 +127,7 @@ pub fn report(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    let db_size = std::fs::metadata(&mimir.paths.db_file)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let db_size = std::fs::metadata(&mimir.paths.db_file)?.len();
     println!(
         "mimir report · {} · db {:.1} MB",
         date(now),

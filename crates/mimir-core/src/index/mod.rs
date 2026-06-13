@@ -253,12 +253,14 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
         let meta = entry
             .metadata()
             .map_err(|e| Error::Invalid(format!("stat {}: {e}", path.display())))?;
+        // -1 = mtime unavailable; must never satisfy the fast path
+        // (0==0 would skip changed files forever on such filesystems).
         let mtime = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            .unwrap_or(-1);
         let size = meta.len() as i64;
 
         let existing = conn
@@ -274,7 +276,8 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
 
         // Fast path: stat unchanged and node alive.
         if let Some(f) = &existing {
-            if f.deleted_at.is_none()
+            if mtime >= 0
+                && f.deleted_at.is_none()
                 && f.meta.get("mtime").and_then(|v| v.as_i64()) == Some(mtime)
                 && f.meta.get("size").and_then(|v| v.as_i64()) == Some(size)
             {

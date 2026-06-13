@@ -62,15 +62,17 @@ struct VizNode {
 fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Result<String> {
     let conn = &mimir.conn;
 
-    // Degree per node, computed once (the edge table is small).
+    // One pass over the edge table serves both the degree map here and the
+    // included-set filtering at the end (it was two full scans before).
+    let all_edges: Vec<(i64, i64, String)> = {
+        let mut stmt = conn.prepare("SELECT src, dst, rel FROM edge")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
     let mut degree: HashMap<i64, i64> = HashMap::new();
-    {
-        let mut stmt = conn.prepare("SELECT src, dst FROM edge")?;
-        let mut rows = stmt.query([])?;
-        while let Some(row) = rows.next()? {
-            *degree.entry(row.get(0)?).or_default() += 1;
-            *degree.entry(row.get(1)?).or_default() += 1;
-        }
+    for (s, d, _) in &all_edges {
+        *degree.entry(*s).or_default() += 1;
+        *degree.entry(*d).or_default() += 1;
     }
 
     let fetch = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> Result<Vec<VizNode>> {
@@ -145,18 +147,22 @@ fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Re
         .map(|n| n.id)
         .collect();
     if !mem_ids.is_empty() {
-        let placeholders = vec!["?"; mem_ids.len()].join(",");
-        let sql = format!(
-            "SELECT {COLS} FROM node WHERE {live} AND id IN (
-               SELECT dst FROM edge WHERE src IN ({placeholders})
-               UNION SELECT src FROM edge WHERE dst IN ({placeholders}))"
-        );
-        let params: Vec<&dyn rusqlite::ToSql> = mem_ids
-            .iter()
-            .chain(mem_ids.iter())
-            .map(|id| id as &dyn rusqlite::ToSql)
-            .collect();
-        push_all(fetch(&sql, &params)?, &mut nodes);
+        // Chunked: the id list appears twice in the query, and SQLite caps
+        // bound parameters at 32766 — a big store would abort otherwise.
+        for chunk in mem_ids.chunks(8_000) {
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT {COLS} FROM node WHERE {live} AND id IN (
+                   SELECT dst FROM edge WHERE src IN ({placeholders})
+                   UNION SELECT src FROM edge WHERE dst IN ({placeholders}))"
+            );
+            let params: Vec<&dyn rusqlite::ToSql> = chunk
+                .iter()
+                .chain(chunk.iter())
+                .map(|id| id as &dyn rusqlite::ToSql)
+                .collect();
+            push_all(fetch(&sql, &params)?, &mut nodes);
+        }
     }
 
     // 3. Fill the remaining budget with the project's best-connected symbols.
@@ -260,19 +266,12 @@ fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Re
         }
     }
 
-    // ---- edges among the included set ----
+    // ---- edges among the included set (reuses the single edge scan) ----
     let included: HashSet<i64> = nodes.iter().map(|n| n.id).collect();
-    let mut edges: Vec<(i64, i64, String)> = Vec::new();
-    {
-        let mut stmt = conn.prepare("SELECT src, dst, rel FROM edge")?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            let (s, d): (i64, i64) = (r.get(0)?, r.get(1)?);
-            if included.contains(&s) && included.contains(&d) {
-                edges.push((s, d, r.get(2)?));
-            }
-        }
-    }
+    let mut edges: Vec<(i64, i64, String)> = all_edges
+        .into_iter()
+        .filter(|(s, d, _)| included.contains(s) && included.contains(d))
+        .collect();
     // symbol → parent file containment (implicit in parent_id, not in edge).
     {
         let mut stmt = conn.prepare(

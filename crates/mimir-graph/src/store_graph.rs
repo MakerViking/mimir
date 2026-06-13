@@ -36,11 +36,18 @@ pub fn stable_id(project_id: i64, rel_path: &str, qualified: &str, kind: &str) -
 
 /// Build or incrementally update the code graph for a project rooted at
 /// `root`. mtime+size short-circuit, blake3 change detection, one
-/// transaction per file; calls re-resolved only for changed files.
+/// transaction for the whole update; calls re-resolved only for changed
+/// files.
 pub fn update(conn: &mut Connection, project: &Node, root: &Path) -> Result<GraphStats> {
     let mut stats = GraphStats::default();
     let mut seen: HashSet<String> = HashSet::new();
     let mut changed_files: Vec<(i64, String, FileExtract)> = Vec::new();
+
+    // One transaction for the whole update: file/symbol upserts and the
+    // call-edge rebuild commit together. A crash mid-update used to leave
+    // committed file hashes with missing call edges — and the hash
+    // short-circuit then skipped those files forever.
+    let tx = conn.transaction()?;
 
     for entry in ignore::WalkBuilder::new(root).build() {
         let entry = match entry {
@@ -68,17 +75,21 @@ pub fn update(conn: &mut Connection, project: &Node, root: &Path) -> Result<Grap
         let meta = entry
             .metadata()
             .map_err(|e| Error::Invalid(format!("stat {rel}: {e}")))?;
+        // -1 = mtime unavailable (some network/virtual filesystems). It
+        // must never satisfy the fast path: 0==0 would skip changed files
+        // forever; -1 falls through to the content-hash check instead.
         let mtime = meta
             .modified()
             .ok()
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
             .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
+            .unwrap_or(-1);
         let size = meta.len() as i64;
 
-        let existing = code_file(conn, project.id, &rel)?;
+        let existing = code_file(&tx, project.id, &rel)?;
         if let Some(f) = &existing {
-            if f.deleted_at.is_none()
+            if mtime >= 0
+                && f.deleted_at.is_none()
                 && f.meta.get("mtime").and_then(|v| v.as_i64()) == Some(mtime)
                 && f.meta.get("size").and_then(|v| v.as_i64()) == Some(size)
             {
@@ -92,7 +103,7 @@ pub fn update(conn: &mut Connection, project: &Node, root: &Path) -> Result<Grap
         let hash = blake3::hash(content.as_bytes()).as_bytes().to_vec();
         if let Some(f) = &existing {
             if f.deleted_at.is_none() && f.content_hash.as_deref() == Some(&hash[..]) {
-                conn.execute(
+                tx.execute(
                     "UPDATE node SET meta = json_set(meta, '$.mtime', ?2, '$.size', ?3),
                                      updated_at = ?4 WHERE id = ?1",
                     params![f.id, mtime, size, now_unix()],
@@ -104,7 +115,7 @@ pub fn update(conn: &mut Connection, project: &Node, root: &Path) -> Result<Grap
 
         let fx = extract::extract(lang, &content);
         let file_id = persist_file(
-            conn,
+            &tx,
             project.id,
             existing.as_ref(),
             &rel,
@@ -120,7 +131,7 @@ pub fn update(conn: &mut Connection, project: &Node, root: &Path) -> Result<Grap
     }
 
     // Files gone from disk: soft-delete file + its symbols.
-    let mut stmt = conn.prepare(
+    let mut stmt = tx.prepare(
         "SELECT id, path FROM node
          WHERE kind = 'file' AND project_id = ?1 AND collection_id IS NULL
            AND deleted_at IS NULL",
@@ -131,7 +142,7 @@ pub fn update(conn: &mut Connection, project: &Node, root: &Path) -> Result<Grap
     drop(stmt);
     for (id, path) in live {
         if !seen.contains(&path) {
-            conn.execute(
+            tx.execute(
                 "UPDATE node SET deleted_at = ?2
                  WHERE deleted_at IS NULL AND (id = ?1 OR parent_id = ?1)",
                 params![id, now_unix()],
@@ -140,7 +151,8 @@ pub fn update(conn: &mut Connection, project: &Node, root: &Path) -> Result<Grap
         }
     }
 
-    resolve_calls(conn, project.id, &changed_files, &mut stats)?;
+    resolve_calls(&tx, project.id, &changed_files, &mut stats)?;
+    tx.commit()?;
     Ok(stats)
 }
 
@@ -160,7 +172,7 @@ fn code_file(conn: &Connection, project_id: i64, rel: &str) -> Result<Option<Nod
 
 #[allow(clippy::too_many_arguments)]
 fn persist_file(
-    conn: &mut Connection,
+    conn: &Connection,
     project_id: i64,
     existing: Option<&Node>,
     rel: &str,
@@ -187,10 +199,9 @@ fn persist_file(
         "imports": imports_json, "calls": calls_json,
     });
 
-    let tx = conn.transaction()?;
     let file_id = match existing {
         Some(f) => {
-            tx.execute(
+            conn.execute(
                 "UPDATE node SET content_hash = ?2, meta = ?3, lang = ?4,
                                  updated_at = ?5, deleted_at = NULL WHERE id = ?1",
                 params![f.id, hash, file_meta.to_string(), lang.name(), now_unix()],
@@ -210,7 +221,7 @@ fn persist_file(
             new.project_id = Some(project_id);
             new.content_hash = Some(hash.to_vec());
             new.meta = Some(file_meta);
-            store::insert_node(&tx, new)?.id
+            store::insert_node(conn, new)?.id
         }
     };
 
@@ -223,7 +234,7 @@ fn persist_file(
             None => sym.signature.clone(),
         };
         let meta = serde_json::json!({"stable_id": sid, "name": sym.name});
-        let existing_id: Option<i64> = tx
+        let existing_id: Option<i64> = conn
             .query_row(
                 "SELECT id FROM node
                  WHERE kind = 'symbol' AND json_extract(meta, '$.stable_id') = ?1",
@@ -233,7 +244,7 @@ fn persist_file(
             .optional()?;
         let id = match existing_id {
             Some(id) => {
-                tx.execute(
+                conn.execute(
                     "UPDATE node SET title = ?2, body = ?3, subkind = ?4, path = ?5,
                             span_start = ?6, span_end = ?7, content_hash = ?8, meta = ?9,
                             lang = ?10, parent_id = ?11, updated_at = ?12, deleted_at = NULL
@@ -268,7 +279,7 @@ fn persist_file(
                 new.span_end = Some(sym.end_line as i64);
                 new.content_hash = Some(blake3::hash(body.as_bytes()).as_bytes().to_vec());
                 new.meta = Some(meta);
-                store::insert_node(&tx, new)?.id
+                store::insert_node(conn, new)?.id
             }
         };
         kept.insert(id);
@@ -278,18 +289,17 @@ fn persist_file(
     // edges cascade, embeddings cascade).
     {
         let mut stmt =
-            tx.prepare("SELECT id FROM node WHERE kind = 'symbol' AND parent_id = ?1")?;
+            conn.prepare("SELECT id FROM node WHERE kind = 'symbol' AND parent_id = ?1")?;
         let all: Vec<i64> = stmt
             .query_map([file_id], |r| r.get(0))?
             .collect::<rusqlite::Result<_>>()?;
         drop(stmt);
         for id in all {
             if !kept.contains(&id) {
-                tx.execute("DELETE FROM node WHERE id = ?1", [id])?;
+                conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
             }
         }
     }
-    tx.commit()?;
     Ok(file_id)
 }
 
@@ -331,7 +341,11 @@ fn resolve_calls(
 
     let mut by_name: HashMap<&str, Vec<&SymRef>> = HashMap::new();
     for s in &symbols {
-        by_name.entry(s.name.as_str()).or_default().push(s);
+        // A NULL/empty name would bucket under "" and attract phantom
+        // call edges from any unresolvable callee.
+        if !s.name.is_empty() {
+            by_name.entry(s.name.as_str()).or_default().push(s);
+        }
     }
     let mut by_file_qualified: HashMap<(&str, &str), i64> = HashMap::new();
     for s in &symbols {
@@ -356,15 +370,14 @@ fn resolve_calls(
         rows.into_iter().collect()
     };
 
-    let tx = conn.unchecked_transaction()?;
     for (file_id, rel, fx) in changed {
         // Wipe edges originating from this file's symbols + its imports.
-        tx.execute(
+        conn.execute(
             "DELETE FROM edge WHERE rel = 'calls' AND src IN
                (SELECT id FROM node WHERE kind = 'symbol' AND parent_id = ?1)",
             [file_id],
         )?;
-        tx.execute(
+        conn.execute(
             "DELETE FROM edge WHERE rel = 'imports' AND src = ?1",
             [file_id],
         )?;
@@ -376,7 +389,7 @@ fn resolve_calls(
                 import_target.insert(imp.local.as_str(), target.clone());
                 if let Some(dst) = file_ids.get(&target) {
                     if *dst != *file_id {
-                        store::link(&tx, *file_id, *dst, Rel::Imports, 1.0)?;
+                        store::link(conn, *file_id, *dst, Rel::Imports, 1.0)?;
                         stats.imports += 1;
                     }
                 }
@@ -396,14 +409,14 @@ fn resolve_calls(
             };
             // Tier 1: same file.
             if let Some(c) = candidates.iter().find(|c| c.path == *rel && c.id != src) {
-                link_call(&tx, src, c.id, 1.0, true)?;
+                link_call(conn, src, c.id, 1.0, true)?;
                 stats.calls_resolved += 1;
                 continue;
             }
             // Tier 2: imported name → resolved file.
             if let Some(target) = import_target.get(call.callee.as_str()) {
                 if let Some(c) = candidates.iter().find(|c| c.path == *target) {
-                    link_call(&tx, src, c.id, 1.0, true)?;
+                    link_call(conn, src, c.id, 1.0, true)?;
                     stats.calls_resolved += 1;
                     continue;
                 }
@@ -413,12 +426,12 @@ fn resolve_calls(
             match global.len() {
                 0 => {}
                 1 => {
-                    link_call(&tx, src, global[0].id, 0.8, true)?;
+                    link_call(conn, src, global[0].id, 0.8, true)?;
                     stats.calls_resolved += 1;
                 }
                 n if n <= 3 => {
                     for c in &global {
-                        link_call(&tx, src, c.id, 1.0 / n as f64, false)?;
+                        link_call(conn, src, c.id, 1.0 / n as f64, false)?;
                         stats.calls_heuristic += 1;
                     }
                 }
@@ -426,7 +439,6 @@ fn resolve_calls(
             }
         }
     }
-    tx.commit()?;
     Ok(())
 }
 

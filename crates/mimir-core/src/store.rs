@@ -109,7 +109,12 @@ pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Node> {
     };
     if tail.len() == 26 {
         if let Ok(node) = get_node_by_uid(conn, &tail.to_uppercase()) {
-            return Ok(node);
+            // Same contract as the short-tail path below: deleted nodes
+            // resolve to NotFound, not to a ghost you can edit/mark/open.
+            if node.deleted_at.is_none() {
+                return Ok(node);
+            }
+            return Err(Error::NotFound(format!("no node matching '{raw}'")));
         }
     }
     if tail.len() < 4 {

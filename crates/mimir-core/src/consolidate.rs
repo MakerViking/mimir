@@ -11,7 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
 use crate::learn;
@@ -186,15 +186,22 @@ pub fn maybe_auto(conn: &Connection, model: &str, cadence: &str) -> Option<Repor
     if cadence != "weekly" {
         return None;
     }
-    let last: i64 = conn
+    // "No row yet" means never consolidated (run now); a real query error
+    // must NOT — it would trigger an archival pass off a corrupt read.
+    let last: i64 = match conn
         .query_row(
             "SELECT value FROM meta WHERE key = 'last_consolidate'",
             [],
             |r| r.get::<_, String>(0),
         )
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+        .optional()
+    {
+        Ok(row) => row.and_then(|v| v.parse().ok()).unwrap_or(0),
+        Err(err) => {
+            tracing::warn!(%err, "cannot read last_consolidate; skipping auto-consolidation");
+            return None;
+        }
+    };
     if now_unix() - last < 7 * 86_400 {
         return None;
     }
@@ -270,13 +277,20 @@ fn negation_mismatch(a: &str, b: &str) -> bool {
 /// Single-link clustering over the given indices.
 fn single_link(mems: &[Mem], indices: &[usize], threshold: f32) -> Vec<Vec<usize>> {
     let mut parent: HashMap<usize, usize> = indices.iter().map(|&i| (i, i)).collect();
+    // Iterative find with path compression: a recursive version overflows
+    // the stack on long merge chains (thousands of near-identical memories,
+    // e.g. after a bulk import).
     fn find(parent: &mut HashMap<usize, usize>, x: usize) -> usize {
-        let p = parent[&x];
-        if p == x {
-            return x;
+        let mut root = x;
+        while parent[&root] != root {
+            root = parent[&root];
         }
-        let root = find(parent, p);
-        parent.insert(x, root);
+        let mut cur = x;
+        while parent[&cur] != root {
+            let next = parent[&cur];
+            parent.insert(cur, root);
+            cur = next;
+        }
         root
     }
     for (pos, &a) in indices.iter().enumerate() {

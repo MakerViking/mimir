@@ -45,14 +45,14 @@ struct Tile {
 fn render(mimir: &Mimir) -> Result<String> {
     let conn = &mimir.conn;
     let now = now_unix();
-    let q1 = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(0) };
+    let q1 = |sql: &str| -> Result<i64> { Ok(conn.query_row(sql, [], |r| r.get(0))?) };
 
     // ---- headline tiles ----
     let memories =
-        q1("SELECT count(*) FROM node WHERE kind='memory' AND deleted_at IS NULL AND superseded_by IS NULL");
-    let chunks = q1("SELECT count(*) FROM node WHERE kind='chunk' AND deleted_at IS NULL");
-    let symbols = q1("SELECT count(*) FROM node WHERE kind='symbol' AND deleted_at IS NULL");
-    let edges = q1("SELECT count(*) FROM edge");
+        q1("SELECT count(*) FROM node WHERE kind='memory' AND deleted_at IS NULL AND superseded_by IS NULL")?;
+    let chunks = q1("SELECT count(*) FROM node WHERE kind='chunk' AND deleted_at IS NULL")?;
+    let symbols = q1("SELECT count(*) FROM node WHERE kind='symbol' AND deleted_at IS NULL")?;
+    let edges = q1("SELECT count(*) FROM edge")?;
     let tiles = [
         Tile {
             label: "memories",
@@ -75,10 +75,10 @@ fn render(mimir: &Mimir) -> Result<String> {
             unit: "",
         },
     ];
-    let projects = q1("SELECT count(*) FROM node WHERE kind='project' AND deleted_at IS NULL");
+    let projects = q1("SELECT count(*) FROM node WHERE kind='project' AND deleted_at IS NULL")?;
     let collections =
-        q1("SELECT count(*) FROM node WHERE kind='collection' AND deleted_at IS NULL");
-    let files = q1("SELECT count(*) FROM node WHERE kind='file' AND deleted_at IS NULL");
+        q1("SELECT count(*) FROM node WHERE kind='collection' AND deleted_at IS NULL")?;
+    let files = q1("SELECT count(*) FROM node WHERE kind='file' AND deleted_at IS NULL")?;
 
     // ---- memory types ----
     let mut stmt = conn.prepare(
@@ -167,24 +167,23 @@ fn render(mimir: &Mimir) -> Result<String> {
 
     // ---- graph + hygiene + storage ----
     let calls_resolved =
-        q1("SELECT count(*) FROM edge WHERE rel='calls' AND json_extract(meta,'$.resolved')=1");
+        q1("SELECT count(*) FROM edge WHERE rel='calls' AND json_extract(meta,'$.resolved')=1")?;
     let calls_heuristic =
-        q1("SELECT count(*) FROM edge WHERE rel='calls' AND json_extract(meta,'$.resolved')=0");
-    let imports = q1("SELECT count(*) FROM edge WHERE rel='imports'");
-    let links = q1("SELECT count(*) FROM edge WHERE rel IN ('about','relates','links','mentions')");
-    let embedded = q1("SELECT count(*) FROM embedding");
+        q1("SELECT count(*) FROM edge WHERE rel='calls' AND json_extract(meta,'$.resolved')=0")?;
+    let imports = q1("SELECT count(*) FROM edge WHERE rel='imports'")?;
+    let links =
+        q1("SELECT count(*) FROM edge WHERE rel IN ('about','relates','links','mentions')")?;
+    let embedded = q1("SELECT count(*) FROM embedding")?;
     let embeddable = q1(
         "SELECT count(*) FROM node WHERE deleted_at IS NULL AND body IS NOT NULL
          AND kind IN ('memory','chunk','annotation','symbol')",
-    );
-    let superseded = q1("SELECT count(*) FROM node WHERE superseded_by IS NOT NULL");
+    )?;
+    let superseded = q1("SELECT count(*) FROM node WHERE superseded_by IS NOT NULL")?;
     let archived =
-        q1("SELECT count(*) FROM node WHERE deleted_at IS NOT NULL AND json_extract(meta,'$.archived')=1");
-    let pinned = q1("SELECT count(*) FROM node WHERE pinned=1 AND deleted_at IS NULL");
-    let events_total = q1("SELECT count(*) FROM recall_event");
-    let db_bytes = std::fs::metadata(&mimir.paths.db_file)
-        .map(|m| m.len())
-        .unwrap_or(0);
+        q1("SELECT count(*) FROM node WHERE deleted_at IS NOT NULL AND json_extract(meta,'$.archived')=1")?;
+    let pinned = q1("SELECT count(*) FROM node WHERE pinned=1 AND deleted_at IS NULL")?;
+    let events_total = q1("SELECT count(*) FROM recall_event")?;
+    let db_bytes = std::fs::metadata(&mimir.paths.db_file)?.len();
 
     // ================= fragments =================
     let tiles_html: String = tiles
@@ -343,7 +342,7 @@ fn render(mimir: &Mimir) -> Result<String> {
         .replace("{{LINKS}}", &fmt_n(links))
         .replace("{{EMBEDDED}}", &fmt_n(embedded))
         .replace("{{COVERAGE}}", &format!("{coverage:.0}"))
-        .replace("{{MODEL}}", &mimir.config.embedding.model)
+        .replace("{{MODEL}}", &esc(&mimir.config.embedding.model))
         .replace("{{SUPERSEDED}}", &fmt_n(superseded))
         .replace("{{ARCHIVED}}", &fmt_n(archived))
         .replace("{{ARCHIVED_CLASS}}", if archived > 0 { "gold" } else { "" })

@@ -73,7 +73,15 @@ fn find_duplicate(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<N
         strength_alpha: 0.0,
     };
     for hit in search::search(conn, &query)? {
-        let existing = hit.node.body.as_deref().unwrap_or_default();
+        // Title-only memories (some imports) have no body — compare against
+        // the title so they still participate in duplicate detection.
+        let existing = hit
+            .node
+            .body
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .or(hit.node.title.as_deref())
+            .unwrap_or_default();
         if jaccard(text, existing) >= NEAR_DUP_JACCARD {
             return Ok(Some(hit.node));
         }
