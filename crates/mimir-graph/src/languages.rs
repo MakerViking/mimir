@@ -12,6 +12,9 @@ pub enum Lang {
     Tsx,
     Python,
     Go,
+    Java,
+    Ruby,
+    C,
 }
 
 impl Lang {
@@ -23,6 +26,9 @@ impl Lang {
             "tsx" | "jsx" | "js" | "mjs" | "cjs" => Lang::Tsx,
             "py" | "pyi" => Lang::Python,
             "go" => Lang::Go,
+            "java" => Lang::Java,
+            "rb" | "rake" => Lang::Ruby,
+            "c" | "h" => Lang::C,
             _ => return None,
         })
     }
@@ -33,6 +39,9 @@ impl Lang {
             Lang::TypeScript | Lang::Tsx => "typescript",
             Lang::Python => "python",
             Lang::Go => "go",
+            Lang::Java => "java",
+            Lang::Ruby => "ruby",
+            Lang::C => "c",
         }
     }
 
@@ -43,6 +52,9 @@ impl Lang {
             Lang::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
             Lang::Python => tree_sitter_python::LANGUAGE.into(),
             Lang::Go => tree_sitter_go::LANGUAGE.into(),
+            Lang::Java => tree_sitter_java::LANGUAGE.into(),
+            Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
+            Lang::C => tree_sitter_c::LANGUAGE.into(),
         }
     }
 
@@ -128,6 +140,37 @@ impl Lang {
                 }
                 _ => None,
             },
+            Lang::Java => match node.kind() {
+                "class_declaration" => Some((text(node.child_by_field_name("name")?), "class")),
+                "interface_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "interface"))
+                }
+                "enum_declaration" => Some((text(node.child_by_field_name("name")?), "enum")),
+                "record_declaration" => Some((text(node.child_by_field_name("name")?), "class")),
+                "method_declaration" => Some((text(node.child_by_field_name("name")?), "method")),
+                "constructor_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "method"))
+                }
+                _ => None,
+            },
+            Lang::Ruby => match node.kind() {
+                "class" => Some((const_name(node.child_by_field_name("name")?, src), "class")),
+                "module" => Some((const_name(node.child_by_field_name("name")?, src), "module")),
+                "method" => Some((text(node.child_by_field_name("name")?), "method")),
+                // def self.foo — a class method.
+                "singleton_method" => Some((text(node.child_by_field_name("name")?), "method")),
+                _ => None,
+            },
+            Lang::C => match node.kind() {
+                "function_definition" => Some((
+                    c_declarator_name(node.child_by_field_name("declarator")?, src)?,
+                    "function",
+                )),
+                "struct_specifier" => Some((text(node.child_by_field_name("name")?), "struct")),
+                "union_specifier" => Some((text(node.child_by_field_name("name")?), "struct")),
+                "enum_specifier" => Some((text(node.child_by_field_name("name")?), "enum")),
+                _ => None,
+            },
         }
     }
 
@@ -208,6 +251,29 @@ impl Lang {
                 match f.kind() {
                     "identifier" => Some(text(f)),
                     "selector_expression" => f.child_by_field_name("field").map(text),
+                    _ => None,
+                }
+            }
+            Lang::Java => {
+                if node.kind() != "method_invocation" {
+                    return None;
+                }
+                node.child_by_field_name("name").map(text)
+            }
+            Lang::Ruby => {
+                // `foo(...)`, `obj.foo(...)`, `obj.foo` — the method name.
+                if node.kind() != "call" {
+                    return None;
+                }
+                node.child_by_field_name("method").map(text)
+            }
+            Lang::C => {
+                if node.kind() != "call_expression" {
+                    return None;
+                }
+                let f = node.child_by_field_name("function")?;
+                match f.kind() {
+                    "identifier" => Some(text(f)),
                     _ => None,
                 }
             }
@@ -361,6 +427,42 @@ impl Lang {
                     source: path,
                 });
             }
+            Lang::Java => {
+                // import a.b.C;  /  import static a.b.C.m;  → bind the last segment.
+                if node.kind() != "import_declaration" {
+                    return;
+                }
+                let mut cursor = node.walk();
+                let Some(scoped) = node
+                    .children(&mut cursor)
+                    .find(|c| c.kind() == "scoped_identifier")
+                else {
+                    return;
+                };
+                let source = text(scoped);
+                let local = source.rsplit('.').next().unwrap_or(&source).to_string();
+                out.push(ImportRef { local, source });
+            }
+            Lang::C => {
+                // #include "foo.h" / <foo.h> → a file→file edge by path.
+                if node.kind() != "preproc_include" {
+                    return;
+                }
+                let Some(path_node) = node.child_by_field_name("path") else {
+                    return;
+                };
+                let source = text(path_node).trim_matches(['"', '<', '>']).to_string();
+                let local = source
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&source)
+                    .trim_end_matches(".h")
+                    .to_string();
+                out.push(ImportRef { local, source });
+            }
+            // Ruby's `require` is a method call, not an import node; calls
+            // still resolve same-file (tier 1) and globally by name (tier 3).
+            Lang::Ruby => {}
         }
     }
 
@@ -386,7 +488,13 @@ impl Lang {
                 Some(cleaned.lines().next().unwrap_or("").trim().to_string())
                     .filter(|s| !s.is_empty())
             }
-            Lang::Rust | Lang::Go | Lang::TypeScript | Lang::Tsx => {
+            Lang::Rust
+            | Lang::Go
+            | Lang::TypeScript
+            | Lang::Tsx
+            | Lang::Java
+            | Lang::C
+            | Lang::Ruby => {
                 // Contiguous comment siblings directly above the node
                 // (a blank line breaks the chain; `//!` belongs to the
                 // module, not this item).
@@ -420,6 +528,7 @@ impl Lang {
                             .trim_start_matches("/*")
                             .trim_end_matches("*/")
                             .trim_start_matches('*')
+                            .trim_start_matches('#') // Ruby line comments
                             .trim()
                             .to_string()
                     })
@@ -443,6 +552,34 @@ fn base_type_name(ty: Node, src: &str) -> String {
             .map(|t| src[t.byte_range()].to_string())
             .unwrap_or_else(|| src[ty.byte_range()].to_string()),
         _ => src[ty.byte_range()].to_string(),
+    }
+}
+
+/// Ruby class/module name: a bare `constant` or `A::B` scope_resolution —
+/// keep the last segment as the local name.
+fn const_name(node: Node, src: &str) -> String {
+    let full = src[node.byte_range()].to_string();
+    full.rsplit("::").next().unwrap_or(&full).to_string()
+}
+
+/// C function name: unwrap pointer/function declarators down to the
+/// identifier — `*foo(...)`, `foo(...)`, `(*foo)(...)` all yield "foo".
+fn c_declarator_name(node: Node, src: &str) -> Option<String> {
+    match node.kind() {
+        "identifier" => Some(src[node.byte_range()].to_string()),
+        "function_declarator" | "pointer_declarator" | "parenthesized_declarator" => {
+            c_declarator_name(node.child_by_field_name("declarator")?, src)
+        }
+        _ => {
+            // Fall back to the first identifier descendant.
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if let Some(name) = c_declarator_name(child, src) {
+                    return Some(name);
+                }
+            }
+            None
+        }
     }
 }
 

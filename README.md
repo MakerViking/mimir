@@ -65,9 +65,10 @@ they're a side effect; the point is the links.
   you want maximum precision over speed. No model downloaded? Everything
   still works, BM25-only.
 - **Code graph.** Tree-sitter symbol extraction (Rust, TypeScript/JS,
-  Python, Go) with call/import edges: `graph callers`, `impact` (blast
-  radius of a diff), `path`, `hubs` — and code symbols participate in
-  semantic recall. Link memories to functions and they surface together.
+  Python, Go, Java, Ruby, C) with call/import edges: `graph callers`,
+  `impact` (blast radius of a diff), `path`, `hubs` — and code symbols
+  participate in semantic recall. Link memories to functions and they
+  surface together.
 - **Self-learning.** Recall usage strengthens what helps (`mark` for
   explicit feedback); typed half-life decay quiets what doesn't; weekly
   LLM-free consolidation dedups, flags contradictions, distills clusters,

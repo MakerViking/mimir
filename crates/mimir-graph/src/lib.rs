@@ -233,4 +233,68 @@ mod tests {
         let load = resolve_symbol(&conn, proj.id, "load").unwrap();
         assert!(graph.callers(fetch.id, 2).iter().any(|r| r.id == load.id));
     }
+
+    /// Each newer language: a file extracts its symbols and resolves a
+    /// same-file call (tier 1), proving the grammar wiring is correct.
+    fn extracts(file: &str, src: &str, expect_symbols: &[&str], caller: &str, callee: &str) {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), file, src);
+        let mimir = Mimir::open_in_memory().unwrap();
+        let proj = project(&mimir.conn, dir.path());
+        let mut conn = mimir.conn;
+        update(&mut conn, &proj, dir.path()).unwrap();
+        for sym in expect_symbols {
+            assert!(
+                resolve_symbol(&conn, proj.id, sym).is_ok(),
+                "{file}: expected symbol `{sym}`"
+            );
+        }
+        let graph = CodeGraph::load(&conn, proj.id).unwrap();
+        let callee_sym = resolve_symbol(&conn, proj.id, callee).unwrap();
+        let caller_sym = resolve_symbol(&conn, proj.id, caller).unwrap();
+        assert!(
+            graph
+                .callers(callee_sym.id, 2)
+                .iter()
+                .any(|r| r.id == caller_sym.id),
+            "{file}: expected call {caller} -> {callee}"
+        );
+    }
+
+    #[test]
+    fn java_extraction() {
+        extracts(
+            "Main.java",
+            "class Main {\n  void run() { helper(); }\n  int helper() { return 42; }\n}\n",
+            &["Main", "run", "helper"],
+            "run",
+            "helper",
+        );
+    }
+
+    #[test]
+    fn ruby_extraction() {
+        // `helper()` with parens is an unambiguous call; a bare paren-less
+        // `helper` is indistinguishable from a local variable in Ruby and is
+        // deliberately not captured (it would flood the graph with false
+        // edges). Symbols (class/module/method) always extract.
+        extracts(
+            "app.rb",
+            "class App\n  def run\n    helper()\n  end\n  def helper\n    42\n  end\nend\n",
+            &["App", "run", "helper"],
+            "run",
+            "helper",
+        );
+    }
+
+    #[test]
+    fn c_extraction() {
+        extracts(
+            "main.c",
+            "int helper(void) { return 42; }\nint run(void) { return helper(); }\n",
+            &["helper", "run"],
+            "run",
+            "helper",
+        );
+    }
 }
