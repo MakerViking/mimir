@@ -5,3 +5,5 @@
 .mimir-home/
 handoff.md
 assets/launch-video.mp4
+.playwright-mcp/
+.DS_Store

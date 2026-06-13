@@ -5,6 +5,14 @@
   </picture>
 </div>
 
+<div align="center">
+
+[![crates.io](https://img.shields.io/crates/v/mimir-mem.svg)](https://crates.io/crates/mimir-mem)
+[![CI](https://github.com/MakerViking/mimir/actions/workflows/ci.yml/badge.svg)](https://github.com/MakerViking/mimir/actions/workflows/ci.yml)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
+</div>
+
 **Unified, local-first memory for AI coding agents.** One SQLite store where
 typed memories, indexed docs, and code symbols are all nodes in one graph —
 searched together by hybrid BM25 + local-ONNX semantic retrieval, and exposed
@@ -19,6 +27,16 @@ to agents as a single, globally-registered MCP server.
 </div>
 
 ![Mimir benchmark: 7–360× faster than the tools it replaces](assets/benchmark.svg)
+
+> **How this was measured.** Not a formal benchmark — a switch-over test on
+> my own real data, run on the same machine against the three tools Mimir
+> replaces (OpenBrain, QMD, Graphify): same queries, same corpus, wall-clock
+> timed. Corpus: **104 memories, 642 doc chunks, and a 2,495-file TypeScript
+> repo (11,735 symbols)**. CPU numbers; the GPU build is faster still (recall
+> 22 ms → 7 ms). Each bar names the operation and the tool it beats — the
+> 360× is one task (code-graph refresh: Graphify's 3m 18s vs Mimir's 0.55s),
+> not a blended average. Numbers move with corpus size and hardware; treat
+> them as "what happened when I switched," not a universal promise.
 
 ## Why
 
@@ -82,9 +100,13 @@ cargo install mimir-mem                 # the binary is named `mimir`
 cargo install --path crates/mimir-cli   # …or from a checkout
 ```
 
-### Optional GPU acceleration
+That's the whole install. CPU-only by default, and it's plenty fast —
+the GPU build is an optional power-user step, tucked away below.
 
-CPU-only by default — GPU is an opt-in build feature (pick **one**):
+<details>
+<summary><b>Optional GPU acceleration</b> (Vulkan / CUDA — opt-in build)</summary>
+
+GPU is an opt-in build feature (pick **one**):
 
 ```sh
 # Cross-vendor: Vulkan (Linux), D3D12 (Windows), Metal (macOS) via Dawn.
@@ -107,6 +129,8 @@ Notes:
 
 Measured on an RX 6900 XT (Vulkan): bulk embedding 2.3× faster, recall
 22 ms → 7 ms, `--rerank` 1.9 s → 0.14 s.
+
+</details>
 
 ## Quickstart
 
