@@ -253,7 +253,9 @@ pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<usize
         return Ok(0);
     }
 
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE: take the writer lock up front so a concurrent writer waits
+    // (busy_timeout) instead of erroring on a DEFERRED read→write upgrade.
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     let mut to_embed: Vec<&Pending> = Vec::new();
     for p in &pending {
         // Same content already embedded under another node? Copy it.

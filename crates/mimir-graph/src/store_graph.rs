@@ -46,8 +46,10 @@ pub fn update(conn: &mut Connection, project: &Node, root: &Path) -> Result<Grap
     // One transaction for the whole update: file/symbol upserts and the
     // call-edge rebuild commit together. A crash mid-update used to leave
     // committed file hashes with missing call edges — and the hash
-    // short-circuit then skipped those files forever.
-    let tx = conn.transaction()?;
+    // short-circuit then skipped those files forever. IMMEDIATE so a
+    // concurrent writer waits (busy_timeout) rather than erroring on a
+    // DEFERRED read→write lock upgrade.
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
 
     for entry in ignore::WalkBuilder::new(root).build() {
         let entry = match entry {

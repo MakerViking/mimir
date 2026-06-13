@@ -130,6 +130,13 @@ INSERT INTO node_fts(node_fts) VALUES ('rebuild');
 CREATE INDEX node_symbol_stable ON node(json_extract(meta, '$.stable_id')) WHERE kind = 'symbol';
 CREATE INDEX node_symbol_name   ON node(json_extract(meta, '$.name'))      WHERE kind = 'symbol';
 "#,
+    // v4: embed_pending copies an existing vector for identical content via
+    // WHERE model=? AND content_hash=? — one lookup per pending node. Without
+    // this index that probe full-scans the embedding table, making a bulk
+    // (re-)embed O(N^2).
+    r#"
+CREATE INDEX embedding_model_hash ON embedding(model, content_hash);
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

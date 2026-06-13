@@ -56,7 +56,22 @@ struct Mem {
 }
 
 /// Run all four passes. `dry_run` reports without writing.
+///
+/// The mutating run is wrapped in a single transaction so it is all-or-
+/// nothing: a mid-run error must not leave, e.g., a "Distilled:" summary
+/// node without its `summarizes` edges (which would surface as recall noise
+/// and re-distill forever, since coverage is measured by those edges).
 pub fn consolidate(conn: &Connection, model: &str, dry_run: bool) -> Result<Report> {
+    if dry_run {
+        return consolidate_inner(conn, model, true);
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let report = consolidate_inner(&tx, model, false)?;
+    tx.commit()?;
+    Ok(report)
+}
+
+fn consolidate_inner(conn: &Connection, model: &str, dry_run: bool) -> Result<Report> {
     let mut report = Report::default();
     let mems = load_memories(conn, model)?;
 

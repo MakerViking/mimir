@@ -239,3 +239,50 @@ fn concurrent_writers_and_readers_no_sqlite_busy() {
     writer.join().unwrap();
     reader.join().unwrap();
 }
+
+#[test]
+fn multiple_concurrent_writers_never_lock() {
+    // The previous test had ONE writer; WAL handles that trivially. The real
+    // hazard is two+ writers overlapping: with DEFERRED transactions one
+    // aborts with "database is locked" on the read→write lock upgrade. With
+    // IMMEDIATE transactions + busy_timeout they serialize and wait. Each
+    // recall also writes (record_shown), so a recall+remember loop is a
+    // genuine writer.
+    let h = Harness::new();
+    h.ok(&["init", "--no-model"]);
+    let home = h.home.path().to_path_buf();
+    let cwd = h.cwd.path().to_path_buf();
+
+    let worker = |home: std::path::PathBuf, cwd: std::path::PathBuf, tag: usize| {
+        std::thread::spawn(move || {
+            for i in 0..10 {
+                for args in [
+                    vec![
+                        "remember".to_string(),
+                        format!("writer {tag} fact {i} about pumps and valves"),
+                        "--force".to_string(),
+                    ],
+                    vec!["recall".to_string(), "pumps valves".to_string()],
+                ] {
+                    let out = Command::new(env!("CARGO_BIN_EXE_mimir"))
+                        .args(&args)
+                        .env("MIMIR_HOME", &home)
+                        .env("HOME", &home)
+                        .current_dir(&cwd)
+                        .output()
+                        .expect("spawn");
+                    let err = String::from_utf8_lossy(&out.stderr);
+                    assert!(out.status.success(), "w{tag} {args:?}: {err}");
+                    assert!(!err.contains("locked"), "SQLITE_BUSY leaked: {err}");
+                }
+            }
+        })
+    };
+
+    let handles: Vec<_> = (0..3)
+        .map(|t| worker(home.clone(), cwd.clone(), t))
+        .collect();
+    for handle in handles {
+        handle.join().unwrap();
+    }
+}

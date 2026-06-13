@@ -998,7 +998,10 @@ fn parse_kind_filter(kind: &str) -> Result<Vec<Kind>> {
 
 /// "12h" | "7d" | "2w" | "3m" | "1y" → unix cutoff.
 fn parse_since(s: &str) -> Result<i64> {
-    let (num, unit) = s.split_at(s.len().saturating_sub(1));
+    // Split on the last CHARACTER, not the last byte — a multibyte unit
+    // (e.g. "5µ") would otherwise slice mid-codepoint and panic.
+    let split = s.char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+    let (num, unit) = s.split_at(split);
     let n: i64 = num
         .parse()
         .with_context(|| format!("bad --since '{s}' (use e.g. 12h, 7d, 2w, 3m, 1y)"))?;
@@ -1045,6 +1048,20 @@ fn node_json(node: &Node, projects: &HashMap<i64, String>) -> serde_json::Value 
         "access_count": node.access_count,
         "strength": node.strength,
     })
+}
+
+#[cfg(test)]
+mod since_tests {
+    use super::parse_since;
+
+    #[test]
+    fn multibyte_unit_errors_not_panics() {
+        // Regression: split_at on a byte offset panicked mid-codepoint.
+        assert!(parse_since("5µ").is_err());
+        assert!(parse_since("7€").is_err());
+        assert!(parse_since("").is_err());
+        assert!(parse_since("3d").is_ok());
+    }
 }
 
 #[cfg(test)]

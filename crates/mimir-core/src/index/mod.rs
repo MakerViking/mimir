@@ -309,7 +309,7 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
             .unwrap_or_else(|| rel.clone());
         let chunks = chunker::chunk_markdown(&stem, &content);
 
-        let tx = conn.transaction()?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let file_id = match &existing {
             Some(f) => {
                 tx.execute(

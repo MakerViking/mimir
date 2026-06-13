@@ -267,7 +267,10 @@ pub fn record_shown(
     query_hash: &[u8],
     hits: &[(i64, i64, f64)], // (node_id, rank, score)
 ) -> Result<()> {
-    let tx = conn.unchecked_transaction()?;
+    // IMMEDIATE: recall's own write must wait for a concurrent writer, not
+    // abort on a DEFERRED read→write lock upgrade (busy_timeout can't wait
+    // on an upgrade).
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
     {
         let mut stmt = tx.prepare_cached(
             "INSERT INTO recall_event (node_id, event, query_hash, rank, score, at)
