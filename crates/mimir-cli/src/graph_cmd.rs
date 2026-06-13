@@ -9,9 +9,11 @@ use mimir_graph::{resolve_symbol, symbol_line, CodeGraph};
 
 /// Current project or a clear error (the graph is per-project by nature).
 fn project(mimir: &Mimir) -> Result<Node> {
-    mimir
-        .project_for_cwd(&std::env::current_dir()?)?
-        .context("not inside a project (the code graph needs a git repository)")
+    mimir.project_for_cwd(&std::env::current_dir()?)?.context(
+        "not inside a project. The code graph needs a project root \
+             (.git/.hg/.svn/.jj); for code outside version control, \
+             `touch .mimir` at the root to mark it.",
+    )
 }
 
 pub fn build() -> Result<()> {

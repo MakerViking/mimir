@@ -13,9 +13,11 @@ use serde_json::json;
 
 pub fn viz(out: Option<String>, open: bool, max_nodes: usize) -> Result<()> {
     let mimir = Mimir::open()?;
-    let proj = mimir
-        .project_for_cwd(&std::env::current_dir()?)?
-        .context("not inside a project (run from a repo, or pass --help)")?;
+    let proj = mimir.project_for_cwd(&std::env::current_dir()?)?.context(
+        "not inside a project. Mimir scopes the graph to a project root \
+             (a dir with .git/.hg/.svn/.jj). For code outside version control, \
+             run `touch .mimir` at the root to mark it, then retry.",
+    )?;
     let html = render(
         &mimir,
         proj.id,

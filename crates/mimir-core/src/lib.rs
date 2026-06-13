@@ -234,7 +234,7 @@ impl Mimir {
     }
 
     /// Resolve (and lazily register) the project for a working directory.
-    /// Returns None outside any git repository.
+    /// Returns None outside any project root (see `scope::ROOT_MARKERS`).
     pub fn project_for_cwd(&self, cwd: &Path) -> Result<Option<Node>> {
         let Some(root) = scope::find_project_root(cwd) else {
             return Ok(None);

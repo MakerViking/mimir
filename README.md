@@ -184,9 +184,12 @@ configured via JSON, the entry is simply:
 ```
 
 The project is detected from the directory the client launches the server
-in (override with the `MIMIR_PROJECT` env var). And agents without MCP can
-just shell out — the CLI's default output is the same token-lean format
-the server returns.
+in (override with the `MIMIR_PROJECT` env var). A project root is any
+directory holding a `.git`, `.hg`, `.svn`, or `.jj` — and for code that
+lives outside version control (a Windows drive, an unpacked archive, a
+config tree), `touch .mimir` at the root marks it as a project. And agents
+without MCP can just shell out — the CLI's default output is the same
+token-lean format the server returns.
 
 `mimir init` also installs a set of `/m-*` slash commands for the agent
 CLIs it finds on the machine — Claude Code, Codex, OpenCode, Gemini CLI

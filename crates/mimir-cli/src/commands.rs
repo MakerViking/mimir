@@ -57,7 +57,8 @@ const SLASH_COMMANDS: &[SlashCmd] = &[
         desc: "Open the interactive Mimir graph visualization (current project)",
         body: "Run `mimir graph viz --open {args}` with your shell tool from the current \
             project root, then report the output path it prints. If it fails with \
-            \"not inside a project\", tell the user to run it from inside a git repository.",
+            \"not inside a project\", relay the suggestion in the error: it needs a \
+            project root (.git/.hg/.svn/.jj), or `touch .mimir` to mark one.",
         allowed: Some("Bash(mimir graph viz:*)"),
     },
     SlashCmd {
