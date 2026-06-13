@@ -5,6 +5,14 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 
+## [0.6.0] — 2026-06-13
+### Added
+- **Code-graph languages: Java, Ruby, and C** (joining Rust, TypeScript/JS,
+  Python, Go) — symbol extraction, call resolution, and import/include edges.
+- `CHANGELOG.md`, `SECURITY.md` (private disclosure + threat model), and
+  `CONTRIBUTING.md`.
+- Direct integration tests for the MCP tool handlers.
+
 ## [0.5.6] — 2026-06-13
 ### Fixed
 - **Scale:** `resolve_ref` (used by `get`/`mark`/`edit`/`link`) no longer
@@ -68,7 +76,8 @@ the `mimir-mem` crate, and the on-disk schema move together.
   self-learning strength/decay, LLM-free weekly consolidation, importers,
   the MCP server, the dashboard, and prebuilt binaries.
 
-[Unreleased]: https://github.com/MakerViking/mimir/compare/v0.5.6...HEAD
+[Unreleased]: https://github.com/MakerViking/mimir/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/MakerViking/mimir/releases/tag/v0.6.0
 [0.5.6]: https://github.com/MakerViking/mimir/releases/tag/v0.5.6
 [0.5.5]: https://github.com/MakerViking/mimir/releases/tag/v0.5.5
 [0.5.4]: https://github.com/MakerViking/mimir/releases/tag/v0.5.4
