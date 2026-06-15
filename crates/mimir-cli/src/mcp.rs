@@ -591,6 +591,23 @@ pub fn run() -> Result<()> {
         });
     }
 
+    // Optional background sync (own connection, non-fatal, WAL-safe). Logs via
+    // tracing, never stdout — stdout is the MCP protocol channel. Gated on the
+    // [sync] config so there is zero cost when sync is off.
+    if engine.config.sync.enabled() && engine.config.sync.auto {
+        let interval = engine.config.sync.interval_mins.max(1);
+        std::thread::spawn(move || loop {
+            match mimir_core::Mimir::open() {
+                Ok(mut m) => match crate::sync::perform(&mut m) {
+                    Ok(summary) => tracing::info!("auto-sync: {summary}"),
+                    Err(e) => tracing::warn!("auto-sync failed: {e}"),
+                },
+                Err(e) => tracing::warn!("auto-sync open failed: {e}"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(interval * 60));
+        });
+    }
+
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let service = MimirServer::new(engine, project_id)

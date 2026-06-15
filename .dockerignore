@@ -1,0 +1,7 @@
+target/
+.git/
+assets/launch-video.mp4
+.playwright-mcp/
+**/*.db
+**/*.db-wal
+**/*.db-shm

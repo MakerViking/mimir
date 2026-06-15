@@ -286,3 +286,96 @@ fn multiple_concurrent_writers_never_lock() {
         handle.join().unwrap();
     }
 }
+
+#[test]
+fn server_mode_sync_roundtrip_and_auth() {
+    use std::process::Stdio;
+    let bin = env!("CARGO_BIN_EXE_mimir");
+    // Per-test-binary port to avoid collisions with parallel test binaries.
+    let port: u16 = 40000 + (std::process::id() % 2000) as u16;
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let token = "test-token-xyz";
+
+    let hub = tempfile::tempdir().unwrap();
+    let c1 = tempfile::tempdir().unwrap();
+    let c2 = tempfile::tempdir().unwrap();
+
+    let init = |home: &Path| {
+        let out = Command::new(bin)
+            .args(["init", "--no-model"])
+            .env("MIMIR_HOME", home)
+            .env("HOME", home)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+    };
+    init(hub.path());
+    init(c1.path());
+    init(c2.path());
+    // Minimal config puts the clients in server mode (other sections default).
+    for c in [c1.path(), c2.path()] {
+        std::fs::write(
+            c.join("config.toml"),
+            format!("[sync]\nmode = \"server\"\nendpoint = \"{endpoint}\"\n"),
+        )
+        .unwrap();
+    }
+
+    let mut hubproc = Command::new(bin)
+        .args(["serve", "--bind", &format!("127.0.0.1:{port}")])
+        .env("MIMIR_HOME", hub.path())
+        .env("HOME", hub.path())
+        .env("MIMIR_SYNC_TOKEN", token)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let client = |home: &Path, tok: &str, args: &[&str]| -> Output {
+        Command::new(bin)
+            .args(args)
+            .env("MIMIR_HOME", home)
+            .env("HOME", home)
+            .env("MIMIR_SYNC_TOKEN", tok)
+            .output()
+            .unwrap()
+    };
+
+    // Wait for the hub to accept connections.
+    let mut ready = false;
+    for _ in 0..50 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if client(c1.path(), token, &["sync", "pull"]).status.success() {
+            ready = true;
+            break;
+        }
+    }
+    assert!(ready, "hub did not become ready");
+
+    client(
+        c1.path(),
+        token,
+        &[
+            "remember",
+            "gearbox oil change interval is 2000 hours",
+            "-t",
+            "note",
+            "-g",
+        ],
+    );
+    assert!(client(c1.path(), token, &["sync"]).status.success());
+    assert!(client(c2.path(), token, &["sync"]).status.success());
+    let recall = client(c2.path(), token, &["recall", "gearbox oil"]);
+    let stdout = String::from_utf8_lossy(&recall.stdout);
+    assert!(
+        stdout.contains("gearbox"),
+        "c2 recalled the synced memory: {stdout}"
+    );
+
+    // Wrong token is rejected.
+    let bad = client(c2.path(), "wrong-token", &["sync"]);
+    assert!(!bad.status.success(), "wrong token must fail");
+
+    let _ = hubproc.kill();
+    let _ = hubproc.wait();
+}

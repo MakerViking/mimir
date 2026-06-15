@@ -235,6 +235,22 @@ Only apps already present get them, and existing command files are never
 overwritten, so your edits survive upgrades (re-run `mimir init` any
 time; it's idempotent).
 
+## Optional: centralized sync
+
+Want your memories on more than one machine? Mimir has an **opt-in** sync layer
+— off by default, with zero added cost and the zero-telemetry promise intact
+unless you turn it on. It shares your **global memories** (local-SQLite stays
+authoritative; merges are last-write-wins), via whichever path suits you:
+
+- **File** — point it at a folder Syncthing/Dropbox/iCloud/git already
+  replicates. No server, no token: `[sync] mode = "file", dir = "~/Synced/mimir"`.
+- **Server** — run a hub with the same binary (`mimir serve`), deployable via
+  the included `Dockerfile`/`docker-compose.yml` on a NAS, Pi, VPS, or any
+  Docker host, reached over your tailnet or behind TLS.
+
+Then `mimir sync` (or enable background sync). Full setup, recipes, and the
+security model are in **[docs/sync.md](docs/sync.md)**.
+
 ## How it works
 
 Everything is a node — memories, files, chunks, projects, collections, tags,

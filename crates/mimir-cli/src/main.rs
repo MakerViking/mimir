@@ -5,6 +5,7 @@ mod graph_cmd;
 mod graph_viz;
 mod mcp;
 mod report;
+mod sync;
 
 use clap::{Parser, Subcommand};
 
@@ -199,6 +200,17 @@ enum Command {
     },
     /// Run the MCP stdio server (what Claude Code launches).
     Mcp,
+    /// Sync memories with the central store (optional; see docs/sync.md).
+    Sync {
+        #[command(subcommand)]
+        cmd: Option<SyncCmd>,
+    },
+    /// Run a sync hub other installs push/pull against (`[sync]` server mode).
+    Serve {
+        /// Address to bind, e.g. 0.0.0.0:7777 for tailnet access.
+        #[arg(long, default_value = "127.0.0.1:7777")]
+        bind: String,
+    },
     /// Build and query the code graph of the current project.
     Graph {
         #[command(subcommand)]
@@ -217,6 +229,16 @@ enum ImportCmd {
         /// Path to index.yml (default: ~/.config/qmd/index.yml).
         file: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum SyncCmd {
+    /// Send local changes to the central store.
+    Push,
+    /// Fetch and merge remote changes.
+    Pull,
+    /// Show sync configuration and pending changes.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -450,6 +472,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Dashboard { out, open } => dashboard::dashboard(out, open),
         Command::Report => report::report(cli.json),
         Command::Mcp => mcp::run(),
+        Command::Sync { cmd } => match cmd {
+            None => sync::sync(),
+            Some(SyncCmd::Push) => sync::push(),
+            Some(SyncCmd::Pull) => sync::pull(),
+            Some(SyncCmd::Status) => sync::status(),
+        },
+        Command::Serve { bind } => sync::serve(bind),
         Command::Graph { cmd } => match cmd {
             GraphCmd::Build | GraphCmd::Update => graph_cmd::build(),
             GraphCmd::Callers { symbol, depth } => graph_cmd::callers(&symbol, depth),

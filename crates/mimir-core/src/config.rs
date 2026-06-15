@@ -51,6 +51,45 @@ pub struct Config {
     pub output: OutputConfig,
     pub consolidate: ConsolidateConfig,
     pub auto: AutoConfig,
+    pub sync: SyncConfig,
+}
+
+/// OPTIONAL centralized sync of global memories. Off by default — when
+/// `mode = "off"` nothing runs and there is zero added cost. See docs/sync.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    /// "off" (default) | "file" (a replicated folder) | "server" (a `mimir
+    /// serve` hub).
+    pub mode: String,
+    /// file mode: a directory your file-sync tool (Syncthing/Dropbox/…)
+    /// replicates between machines.
+    pub dir: String,
+    /// server mode: the hub URL, e.g. "http://unraid.tailnet:7777". The bearer
+    /// token comes from the MIMIR_SYNC_TOKEN env var, never config.
+    pub endpoint: String,
+    /// Background-sync cadence in minutes (only when `auto = true`).
+    pub interval_mins: u64,
+    /// Run a background sync loop in the MCP server (opt-in).
+    pub auto: bool,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        SyncConfig {
+            mode: "off".into(),
+            dir: String::new(),
+            endpoint: String::new(),
+            interval_mins: 30,
+            auto: false,
+        }
+    }
+}
+
+impl SyncConfig {
+    pub fn enabled(&self) -> bool {
+        self.mode != "off"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
