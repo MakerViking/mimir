@@ -9,6 +9,8 @@ env:
   CARGO_TERM_COLOR: always
   # ort pulls prebuilt onnxruntime; keep CI deterministic and quiet.
   RUST_BACKTRACE: "1"
+  # Run JS-based actions on Node 24 (GitHub forces this from 2026-06-16).
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   test:
