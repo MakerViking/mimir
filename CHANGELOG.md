@@ -4,6 +4,15 @@ All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
+### Added
+- **Optional centralized sync** (off by default): share global memories across
+  installs via a replicated **file** folder (Syncthing/Dropbox/…) or a
+  **`mimir serve`** hub (Docker image + compose included). `mimir sync`,
+  `mimir serve`, a `[sync]` config section, opt-in background sync, and a
+  config-gated `/m-sync` slash command. See [docs/sync.md](docs/sync.md).
+### Fixed
+- `store::soft_delete` now bumps `updated_at` (so deletes propagate in sync and
+  are visible to change-tracking).
 
 ## [0.6.0] — 2026-06-13
 ### Added

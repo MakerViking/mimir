@@ -164,8 +164,10 @@ pub fn touch_updated(conn: &Connection, id: i64) -> Result<()> {
 }
 
 pub fn soft_delete(conn: &Connection, id: i64) -> Result<()> {
+    // Bump updated_at too: replication finds tombstones via updated_at, so a
+    // delete that didn't advance it would never propagate.
     conn.execute(
-        "UPDATE node SET deleted_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+        "UPDATE node SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
         params![id, now_unix()],
     )?;
     Ok(())

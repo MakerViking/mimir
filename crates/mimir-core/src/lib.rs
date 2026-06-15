@@ -15,6 +15,7 @@ pub mod index;
 pub mod learn;
 pub mod memory;
 pub mod model;
+pub mod replicate;
 pub mod scope;
 pub mod search;
 pub mod store;

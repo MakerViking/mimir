@@ -1,0 +1,19 @@
+# Mimir sync hub. Set MIMIR_SYNC_TOKEN (e.g. in a .env file beside this) and:
+#   docker compose up -d
+# Then point clients at it: [sync] mode="server", endpoint="http://<host>:7777",
+# with the same MIMIR_SYNC_TOKEN in their environment. See docs/sync.md.
+services:
+  mimir-hub:
+    build: .
+    container_name: mimir-hub
+    restart: unless-stopped
+    ports:
+      - "7777:7777"
+    volumes:
+      - mimir-data:/data
+    environment:
+      # Required. Generate one with: openssl rand -hex 24
+      - MIMIR_SYNC_TOKEN=${MIMIR_SYNC_TOKEN:?set MIMIR_SYNC_TOKEN (e.g. in a .env file)}
+
+volumes:
+  mimir-data:

@@ -33,7 +33,7 @@ pub fn init(no_model: bool) -> Result<()> {
             }
         }
     }
-    install_agent_commands();
+    install_agent_commands(&config);
     println!();
     println!("Register the MCP server once, globally:");
     println!("  claude mcp add --scope user mimir -- mimir mcp");
@@ -118,16 +118,32 @@ const SLASH_COMMANDS: &[SlashCmd] = &[
     },
 ];
 
+/// Installed only when `[sync]` is enabled (re-run `mimir init` after enabling).
+const SYNC_SLASH_COMMANDS: &[SlashCmd] = &[SlashCmd {
+    name: "m-sync",
+    desc: "Sync Mimir memories with the central store",
+    body: "Run `mimir sync` with your shell tool and show the push/pull summary. \
+        If it reports an auth or connection error, check MIMIR_SYNC_TOKEN and the \
+        [sync] endpoint/dir in the Mimir config.",
+    allowed: Some("Bash(mimir sync:*)"),
+}];
+
 /// Install the `/m-*` slash commands for the agent CLIs that support
 /// user-level custom commands. Installed only for apps already present on
 /// the machine; existing files are never overwritten (user edits win).
 /// Re-running `mimir init` after an upgrade refreshes missing files.
-fn install_agent_commands() {
+fn install_agent_commands(config: &Config) {
     // An isolated instance (tests, scratch homes) must not touch the user's
     // agent configs — MIMIR_HOME means "everything under one directory".
     if std::env::var_os("MIMIR_HOME").is_some() {
         return;
     }
+    // /m-sync is only useful (and only installed) when sync is enabled.
+    let extra: &[SlashCmd] = if config.sync.enabled() {
+        SYNC_SLASH_COMMANDS
+    } else {
+        &[]
+    };
 
     let md = |cmd: &SlashCmd, with_allowed: bool| {
         let allowed = match (with_allowed, cmd.allowed) {
@@ -180,7 +196,7 @@ fn install_agent_commands() {
             continue;
         }
         let mut wrote = Vec::new();
-        for cmd in SLASH_COMMANDS {
+        for cmd in SLASH_COMMANDS.iter().chain(extra) {
             let content = if *ext == "toml" {
                 toml(cmd)
             } else {
