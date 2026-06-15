@@ -1757,7 +1757,7 @@ checksum = "6877bb514081ee2a7ff5ef9de3281f14a4dd4bceac4c09388074a6b5df8a139a"
 
 [[package]]
 name = "mimir-graph"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "blake3",
  "ignore",
@@ -1779,7 +1779,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-mem"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1803,7 +1803,7 @@ dependencies = [
 
 [[package]]
 name = "mimir-mem-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "blake3",
  "directories",

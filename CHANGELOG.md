@@ -3,16 +3,23 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
-## [Unreleased]
+## [0.7.0] — 2026-06-15
 ### Added
 - **Optional centralized sync** (off by default): share global memories across
   installs via a replicated **file** folder (Syncthing/Dropbox/…) or a
   **`mimir serve`** hub (Docker image + compose included). `mimir sync`,
   `mimir serve`, a `[sync]` config section, opt-in background sync, and a
   config-gated `/m-sync` slash command. See [docs/sync.md](docs/sync.md).
+- `recall --min-score` filters out hits below a fused relevance threshold, and
+  `--json` records now include the hit's fused score. (Thanks to @nworks3d.)
 ### Fixed
 - `store::soft_delete` now bumps `updated_at` (so deletes propagate in sync and
   are visible to change-tracking).
+- **Windows:** projects on UNC network shares can now be indexed —
+  `canonical_root` rewrites the verbatim `\\?\UNC\server\share` form to a valid
+  `\\server\share` path instead of an unopenable `UNC\…`. (Thanks to @nworks3d.)
+- `recall` collapses exact-duplicate content before truncating, so duplicates no
+  longer crowd distinct results out of a `--limit`. (Thanks to @nworks3d.)
 
 ## [0.6.0] — 2026-06-13
 ### Added
@@ -85,7 +92,8 @@ the `mimir-mem` crate, and the on-disk schema move together.
   self-learning strength/decay, LLM-free weekly consolidation, importers,
   the MCP server, the dashboard, and prebuilt binaries.
 
-[Unreleased]: https://github.com/MakerViking/mimir/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/MakerViking/mimir/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/MakerViking/mimir/releases/tag/v0.7.0
 [0.6.0]: https://github.com/MakerViking/mimir/releases/tag/v0.6.0
 [0.5.6]: https://github.com/MakerViking/mimir/releases/tag/v0.5.6
 [0.5.5]: https://github.com/MakerViking/mimir/releases/tag/v0.5.5
