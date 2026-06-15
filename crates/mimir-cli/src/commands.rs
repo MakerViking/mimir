@@ -407,6 +407,7 @@ pub fn recall(
     full: bool,
     rerank: bool,
     linked: bool,
+    min_score: Option<f64>,
 ) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let query = SearchQuery {
@@ -417,7 +418,10 @@ pub fn recall(
         strength_alpha: mimir.config.scoring.strength_alpha,
         text,
     };
-    let hits = mimir.search_with(&query, rerank)?;
+    let mut hits = mimir.search_with(&query, rerank)?;
+    if let Some(min) = min_score {
+        hits.retain(|hit| hit.score >= min);
+    }
 
     let query_hash = blake3::hash(query.text.as_bytes());
     let shown: Vec<(i64, i64, f64)> = hits
@@ -446,7 +450,9 @@ pub fn recall(
     }
     for hit in &hits {
         if json {
-            println!("{}", node_json(&hit.node, &projects));
+            let mut value = node_json(&hit.node, &projects);
+            value["score"] = serde_json::json!(hit.score);
+            println!("{value}");
         } else if full {
             print_full(&hit.node, &mimir, &projects)?;
             println!();

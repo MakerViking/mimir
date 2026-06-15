@@ -92,6 +92,18 @@ pub fn search_hybrid(
         })
         .collect::<Result<_>>()?;
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
+    // Collapse exact-duplicate content before truncating: the same file indexed
+    // under two collection paths surfaces as separate nodes with identical
+    // title+body. Keep the highest-ranked occurrence so `limit` yields distinct
+    // results instead of copies of one document.
+    use std::hash::{DefaultHasher, Hash, Hasher};
+    let mut seen = std::collections::HashSet::new();
+    hits.retain(|hit| {
+        let mut hasher = DefaultHasher::new();
+        hit.node.title.hash(&mut hasher);
+        hit.node.body.hash(&mut hasher);
+        seen.insert(hasher.finish())
+    });
     hits.truncate(query.limit);
     Ok(hits)
 }
@@ -186,6 +198,44 @@ mod tests {
         store::soft_delete(&conn, chunk.id).unwrap();
         let hits = search(&conn, &q("zebra")).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn collapses_exact_duplicate_content() {
+        let conn = db::open_in_memory().unwrap();
+        // The same content indexed twice (one file under two collection paths)
+        // must surface once; a hit with the same words but a different title is
+        // genuinely distinct and must remain.
+        add(
+            &conn,
+            Kind::Chunk,
+            None,
+            "dup title",
+            "identical alpha body",
+        );
+        add(
+            &conn,
+            Kind::Chunk,
+            None,
+            "dup title",
+            "identical alpha body",
+        );
+        add(
+            &conn,
+            Kind::Chunk,
+            None,
+            "other title",
+            "identical alpha body words",
+        );
+        let hits = search(&conn, &q("identical")).unwrap();
+        let dups = hits
+            .iter()
+            .filter(|h| h.node.title.as_deref() == Some("dup title"))
+            .count();
+        assert_eq!(dups, 1, "exact duplicates must collapse to one");
+        assert!(hits
+            .iter()
+            .any(|h| h.node.title.as_deref() == Some("other title")));
     }
 
     #[test]

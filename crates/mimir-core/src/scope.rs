@@ -30,15 +30,27 @@ pub fn canonical_root(root: &Path) -> String {
     dunce_canonicalize(root).to_string_lossy().into_owned()
 }
 
-/// Best-effort canonicalization that avoids Windows \\?\ extended paths.
+/// Best-effort canonicalization that avoids Windows `\\?\` extended-length
+/// paths, so the resulting identity is both stable and still openable.
 fn dunce_canonicalize(path: &Path) -> PathBuf {
     let canon = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    // Strip Windows verbatim prefix for stable, human-readable identity.
-    let s = canon.to_string_lossy();
-    if let Some(stripped) = s.strip_prefix(r"\\?\") {
-        PathBuf::from(stripped)
+    PathBuf::from(simplify_verbatim(&canon.to_string_lossy()))
+}
+
+/// Turn a Windows extended-length (`\\?\`) path into its normal form.
+/// `canonicalize` returns verbatim paths on Windows:
+///   `\\?\C:\dir`         -> `C:\dir`
+///   `\\?\UNC\srv\share`  -> `\\srv\share`
+/// Stripping only `\\?\` leaves an invalid `UNC\srv\share` that fails to open,
+/// which broke indexing of projects on network shares. The UNC form must be
+/// rewritten to a leading `\\`. Any non-verbatim input is returned unchanged.
+fn simplify_verbatim(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+        rest.to_string()
     } else {
-        canon
+        s.to_string()
     }
 }
 
@@ -82,5 +94,22 @@ mod tests {
     fn none_outside_any_project() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(find_project_root(tmp.path()), None);
+    }
+
+    #[test]
+    fn simplify_verbatim_rewrites_unc_and_drive_paths() {
+        // Drive paths just lose the verbatim prefix.
+        assert_eq!(simplify_verbatim(r"\\?\C:\dir\proj"), r"C:\dir\proj");
+        // UNC paths must become a real \\server\share path, not "UNC\...".
+        assert_eq!(
+            simplify_verbatim(r"\\?\UNC\server\share\proj"),
+            r"\\server\share\proj"
+        );
+        // Already-normal paths are left untouched.
+        assert_eq!(
+            simplify_verbatim(r"\\server\share\proj"),
+            r"\\server\share\proj"
+        );
+        assert_eq!(simplify_verbatim("/home/user/proj"), "/home/user/proj");
     }
 }
