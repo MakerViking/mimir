@@ -8,7 +8,7 @@ use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope}
 use mimir_core::search::SearchQuery;
 use mimir_core::{db, store, Mimir};
 
-pub fn init(no_model: bool) -> Result<()> {
+pub fn init(no_model: bool, hooks: bool) -> Result<()> {
     let paths = Paths::resolve()?;
     let config = Config::load(&paths.config_file)?;
     config.save(&paths.config_file)?;
@@ -34,10 +34,159 @@ pub fn init(no_model: bool) -> Result<()> {
         }
     }
     install_agent_commands(&config);
+    if hooks {
+        if let Err(err) = install_hooks() {
+            eprintln!("hooks   install failed: {err}");
+        }
+    }
     println!();
     println!("Register the MCP server once, globally:");
     println!("  claude mcp add --scope user mimir -- mimir mcp");
+    if !hooks {
+        println!();
+        println!("Token-saving hooks (filter command output + inject project rules) are opt-in:");
+        println!("  mimir init --hooks");
+    }
     Ok(())
+}
+
+/// The PreToolUse hook script: delegates all rewrite logic to `mimir rewrite`,
+/// so rules live in the Rust binary (single source of truth), not this file.
+const MIMIR_REWRITE_SH: &str = r#"#!/usr/bin/env bash
+# mimir-hook-version: 1
+# Mimir PreToolUse hook — rewrites noisy commands through `mimir run` to save
+# tokens. All logic lives in `mimir rewrite`. Requires: mimir, jq.
+command -v jq >/dev/null 2>&1 || exit 0
+command -v mimir >/dev/null 2>&1 || exit 0
+INPUT=$(cat)
+CMD=$(printf '%s' "$INPUT" | jq -r '.tool_input.command // empty')
+[ -z "$CMD" ] && exit 0
+REWRITTEN=$(mimir rewrite "$CMD" 2>/dev/null) || exit 0
+[ "$CMD" = "$REWRITTEN" ] && exit 0
+UPDATED=$(printf '%s' "$INPUT" | jq -c --arg cmd "$REWRITTEN" '.tool_input | .command = $cmd')
+jq -n --argjson updated "$UPDATED" '{
+  "hookSpecificOutput": {
+    "hookEventName": "PreToolUse",
+    "permissionDecision": "allow",
+    "permissionDecisionReason": "Mimir token-saving rewrite",
+    "updatedInput": $updated
+  }
+}'
+"#;
+
+/// Install the opt-in Claude Code hooks: a PreToolUse(Bash) rewrite hook and a
+/// SessionStart hook that injects the project rules pack. Idempotent, backs up
+/// settings.json, and never clobbers existing hooks.
+fn install_hooks() -> Result<()> {
+    if std::env::var_os("MIMIR_HOME").is_some() {
+        return Ok(()); // isolated instances never touch the user's agent config
+    }
+    let base = directories::BaseDirs::new().context("cannot resolve home directory")?;
+    let claude = base.home_dir().join(".claude");
+    if !claude.is_dir() {
+        println!("hooks   ~/.claude not found — skipping (is Claude Code installed?)");
+        return Ok(());
+    }
+
+    // 1. Write the PreToolUse delegate script (executable).
+    let hooks_dir = claude.join("hooks");
+    std::fs::create_dir_all(&hooks_dir)?;
+    let script = hooks_dir.join("mimir-rewrite.sh");
+    std::fs::write(&script, MIMIR_REWRITE_SH)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
+    }
+    let script_str = script.to_string_lossy().into_owned();
+
+    // 2. Merge into settings.json (back it up first).
+    let settings_path = claude.join("settings.json");
+    let mut root: serde_json::Value = match std::fs::read_to_string(&settings_path) {
+        Ok(text) => {
+            std::fs::write(claude.join("settings.json.mimir-bak"), &text)?;
+            serde_json::from_str(&text).context("settings.json is not valid JSON")?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
+        Err(e) => return Err(e.into()),
+    };
+    if !root.is_object() {
+        bail!("settings.json is not a JSON object");
+    }
+    let hooks = root
+        .as_object_mut()
+        .unwrap()
+        .entry("hooks")
+        .or_insert_with(|| serde_json::json!({}));
+    let hooks = hooks
+        .as_object_mut()
+        .context("settings.json `hooks` is not an object")?;
+
+    let mut messages: Vec<String> = Vec::new();
+
+    // SessionStart: inject the rules pack (stdout becomes session context).
+    let session = hooks
+        .entry("SessionStart")
+        .or_insert_with(|| serde_json::json!([]));
+    let session_arr = session
+        .as_array_mut()
+        .context("hooks.SessionStart is not an array")?;
+    if entries_mention(session_arr, "mimir rules show") {
+        messages.push("SessionStart already installed".into());
+    } else {
+        session_arr.push(serde_json::json!({
+            "hooks": [{ "type": "command", "command": "mimir rules show" }]
+        }));
+        messages.push("SessionStart (project rules) added".into());
+    }
+
+    // PreToolUse(Bash): the rewrite hook. Skip if another rewrite hook (e.g.
+    // RTK) is present — running both would double-wrap commands.
+    let pre = hooks
+        .entry("PreToolUse")
+        .or_insert_with(|| serde_json::json!([]));
+    let pre_arr = pre
+        .as_array_mut()
+        .context("hooks.PreToolUse is not an array")?;
+    if entries_mention(pre_arr, "mimir-rewrite") {
+        messages.push("PreToolUse already installed".into());
+    } else if entries_mention(pre_arr, "rtk") || entries_mention(pre_arr, "rewrite") {
+        messages.push(
+            "PreToolUse SKIPPED — another rewrite hook (e.g. RTK) is present. Remove it \
+             from ~/.claude/settings.json, then re-run `mimir init --hooks`."
+                .into(),
+        );
+    } else {
+        pre_arr.push(serde_json::json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": script_str }]
+        }));
+        messages.push("PreToolUse (command filter) added".into());
+    }
+
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+    println!("hooks   {}", messages.join("; "));
+    println!(
+        "hooks   backup at {}",
+        claude.join("settings.json.mimir-bak").display()
+    );
+    Ok(())
+}
+
+/// True if any hook entry (or its nested hooks) has a command containing `needle`.
+fn entries_mention(entries: &[serde_json::Value], needle: &str) -> bool {
+    entries.iter().any(|e| {
+        e.get("hooks")
+            .and_then(|h| h.as_array())
+            .map(|arr| {
+                arr.iter().any(|h| {
+                    h.get("command")
+                        .and_then(|c| c.as_str())
+                        .is_some_and(|c| c.contains(needle))
+                })
+            })
+            .unwrap_or(false)
+    })
 }
 
 /// One Mimir slash command: name carries the `m-` prefix (collision safety
@@ -74,6 +223,13 @@ const SLASH_COMMANDS: &[SlashCmd] = &[
         body: "Run `mimir report` with your shell tool and show its complete output \
             verbatim in a code block. Do not summarize or reformat the table.",
         allowed: Some("Bash(mimir report:*)"),
+    },
+    SlashCmd {
+        name: "m-savings",
+        desc: "Mimir token-savings report (outline/peek/command-filter/proxy)",
+        body: "Run `mimir savings` with your shell tool and show its complete output \
+            verbatim. It reports tokens saved today/week/month/all-time and by source.",
+        allowed: Some("Bash(mimir savings:*)"),
     },
     SlashCmd {
         name: "m-scan",
@@ -240,6 +396,20 @@ pub fn embed(fetch: bool, rerank: bool) -> Result<()> {
     }
     let n = mimir.embed_pending()?;
     println!("embedded {n} node(s)");
+    Ok(())
+}
+
+/// Count tokens in stdin (or the given text) with Mimir's bundled tokenizer —
+/// the same counter the savings ledger uses, handy for measuring/benchmarking.
+pub fn tokens(text: Vec<String>) -> Result<()> {
+    let input = if text.is_empty() {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        buf
+    } else {
+        text.join(" ")
+    };
+    println!("{}", mimir_core::tokens::count(&input));
     Ok(())
 }
 

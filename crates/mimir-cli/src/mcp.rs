@@ -24,7 +24,9 @@ memories (gotchas, decisions, insights, ideas, notes, person-notes), indexed doc
 code symbols, in one searchable store. Norms: SEARCH BEFORE CAPTURE — call recall before \
 remember to avoid duplicates (remember also refuses near-duplicates). Recall at the start of \
 non-trivial tasks (debugging, architecture, 'how did we do X'). Capture concise reusable facts, \
-not session noise. Use get to read full bodies (this also teaches Mimir what is useful).";
+not session noise. Use get to read full bodies (this also teaches Mimir what is useful). \
+To understand code cheaply, prefer `outline` (a file/dir's signature map) and `peek` (one symbol's \
+body) over reading whole files — they cost a fraction of the tokens.";
 
 #[derive(Clone)]
 pub struct MimirServer {
@@ -121,6 +123,28 @@ pub struct LinkArgs {
     /// Relation: relates | about | links | mentions | supersedes (default relates).
     #[serde(default)]
     pub rel: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct OutlineArgs {
+    /// File or directory to outline, relative to the project (default: whole project).
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct PeekArgs {
+    /// Symbol: short id, qualified name, or unique bare name.
+    pub symbol: String,
+}
+
+/// Filesystem root for the detected project (None outside any project).
+fn project_root(m: &Mimir, project_id: Option<i64>) -> Option<std::path::PathBuf> {
+    let id = project_id?;
+    store::get_node(&m.conn, id)
+        .ok()?
+        .path
+        .map(std::path::PathBuf::from)
 }
 
 #[tool_router]
@@ -443,6 +467,57 @@ impl MimirServer {
                     "unknown op '{other}' (callers|calls|impact|node|path|hubs)"
                 )),
             }
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Dense signature map of a file or directory: one line per symbol (signature + first doc line), no bodies. Prefer this over reading a whole file when you only need its structure — it costs a fraction of the tokens."
+    )]
+    async fn outline(&self, Parameters(args): Parameters<OutlineArgs>) -> String {
+        let project_id = self.project_id;
+        self.blocking(move |m| {
+            let cwd = project_root(m, project_id)
+                .or_else(|| std::env::current_dir().ok())
+                .ok_or("cannot resolve a working directory")?;
+            let target = args.target.as_deref().unwrap_or(".");
+            let o = crate::context_cmd::outline_paths(target, &cwd).map_err(engine_err)?;
+            let _ = mimir_core::savings::record(
+                &m.conn,
+                project_id,
+                mimir_core::savings::source::OUTLINE,
+                o.tokens_before,
+                o.tokens_after,
+                serde_json::json!({ "target": target, "files": o.files }),
+            );
+            Ok(o.text)
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Print one symbol's body by name (resolved via the project's code graph), instead of reading the whole file. Build the graph first with `mimir graph build`."
+    )]
+    async fn peek(&self, Parameters(args): Parameters<PeekArgs>) -> String {
+        let project_id = self.project_id;
+        self.blocking(move |m| {
+            let Some(pid) = project_id else {
+                return Err("no project detected (peek needs the per-project code graph)".into());
+            };
+            let root = project_root(m, Some(pid)).ok_or("project has no root")?;
+            let p = crate::context_cmd::peek_symbol(&m.conn, pid, &root, &args.symbol)
+                .map_err(engine_err)?;
+            let _ = mimir_core::savings::record(
+                &m.conn,
+                Some(pid),
+                mimir_core::savings::source::PEEK,
+                p.tokens_before,
+                p.tokens_after,
+                serde_json::json!({ "symbol": args.symbol, "path": p.path }),
+            );
+            // peek_symbol already resolved it — record the access without a re-lookup.
+            let _ = mimir_core::learn::record_opened(&m.conn, p.symbol_id);
+            Ok(p.text)
         })
         .await
     }

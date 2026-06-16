@@ -16,9 +16,11 @@ pub mod learn;
 pub mod memory;
 pub mod model;
 pub mod replicate;
+pub mod savings;
 pub mod scope;
 pub mod search;
 pub mod store;
+pub mod tokens;
 
 use std::path::Path;
 

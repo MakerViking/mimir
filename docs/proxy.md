@@ -1,0 +1,81 @@
+# `mimir proxy` — optional local API proxy
+
+Mimir's proxy sits between your AI client and `api.anthropic.com` and optimizes
+the **request body** to cut token cost, then records what it saved. It is
+**off by default** — you start it explicitly — and it is our own
+implementation, not derived from any other tool.
+
+## What it actually does (and doesn't)
+
+You cannot compress text and have the API bill fewer tokens — the API tokenizes
+whatever it receives. So the proxy only saves money by *changing request
+content*:
+
+- **Prompt-cache breakpoints** (default **on**, safe). If your client set **no**
+  `cache_control` anywhere, the proxy adds ephemeral breakpoints on the system
+  prompt and the last message — the stable prefix that repeats across turns.
+  Cached input is billed at ~10%. Savings are **measured**, not estimated: the
+  proxy reads `usage.cache_read_input_tokens` from the response and records the
+  real reduction — and only on requests where it actually introduced the
+  caching (if your client already caches, e.g. Claude Code, it does nothing).
+- **Block dedup** (default **on**, safe/lossless). When the same large content
+  block (a re-read file, a repeated tool result) appears more than once, later
+  copies are replaced with `[identical to an earlier block …]`. The model still
+  sees the content once. Disable with `--no-dedup` / `[proxy] dedup = false`.
+- **Prune stale tool results** (default **off**, lossy). Replaces large
+  `tool_result` blocks in older turns with a short placeholder. This changes
+  what the model sees, so it's opt-in (`--prune` or `[proxy] prune = true`).
+
+Everything else — every other path, method, header and the entire streaming
+(SSE) response — is forwarded **verbatim**. Your `x-api-key` / auth headers are
+passed through untouched; the proxy never reads or stores your key.
+
+## Security
+
+The proxy is a **man-in-the-middle on your prompts and completions**. Run it
+only on `127.0.0.1` (the default). It buffers the `POST /v1/messages` body to
+rewrite it; responses are streamed, never buffered.
+
+## Usage
+
+```sh
+# start it (own process; leave it running)
+mimir proxy                      # 127.0.0.1:8788 — cache on, dedup on, prune off
+mimir proxy --dry-run            # measure only — forward bodies unchanged
+mimir proxy --prune              # also enable lossy tool-result pruning
+mimir proxy --no-cache           # disable the cache pass
+mimir proxy --no-dedup           # disable the dedup pass
+
+# point your client at it
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
+```
+
+Then watch the effect:
+
+```sh
+mimir savings              # proxy_cache / proxy_dedup / proxy_prune rows, in $
+mimir savings --oneline    # compact segment for a statusline
+```
+
+## Config (`[proxy]` in config.toml)
+
+```toml
+[proxy]
+bind     = "127.0.0.1:8788"
+upstream = "https://api.anthropic.com"
+cache    = true     # add cache breakpoints when the client set none
+dedup    = true     # elide later identical large blocks (lossless)
+prune    = false    # lossy: elide stale tool results
+
+[savings]
+input_price_per_mtok = 3.0   # set to your model's input price (e.g. 15.0 for Opus)
+```
+
+## Caveats
+
+- `proxy_cache` savings are **measured** from `usage.cache_read_input_tokens`
+  (90% of the cached input), recorded only when the proxy introduced the
+  caching. `proxy_dedup`/`proxy_prune` are measured at the request.
+- It mirrors the Anthropic request shape; a future breaking API change could
+  require an update. The proxy fails safe — on any parse error it forwards the
+  original body unchanged.

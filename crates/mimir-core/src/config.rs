@@ -52,6 +52,56 @@ pub struct Config {
     pub consolidate: ConsolidateConfig,
     pub auto: AutoConfig,
     pub sync: SyncConfig,
+    pub proxy: ProxyConfig,
+    pub savings: SavingsConfig,
+}
+
+/// Pricing for the token-savings analytics (`mimir savings`, dashboard).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SavingsConfig {
+    /// Input-token price in USD per million tokens, used to turn tokens saved
+    /// into dollars. Default is Sonnet-tier ($3/MTok); set to your model's
+    /// input price (e.g. 15.0 for Opus) for an accurate figure.
+    pub input_price_per_mtok: f64,
+}
+
+impl Default for SavingsConfig {
+    fn default() -> Self {
+        SavingsConfig {
+            input_price_per_mtok: 3.0,
+        }
+    }
+}
+
+/// OPTIONAL local API proxy (`mimir proxy`). Off until you run it; these are
+/// just its defaults. See docs/proxy.md — it is a man-in-the-middle on your
+/// Anthropic traffic, so it ships conservative (cache on, pruning off).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProxyConfig {
+    /// Address to listen on; point ANTHROPIC_BASE_URL here.
+    pub bind: String,
+    /// Upstream API base URL.
+    pub upstream: String,
+    /// Add prompt-cache breakpoints when the client set none (safe, ~10% billing).
+    pub cache: bool,
+    /// Replace later identical large blocks with a placeholder (safe, lossless).
+    pub dedup: bool,
+    /// Prune stale tool_result blocks from older turns (lossy — opt in).
+    pub prune: bool,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        ProxyConfig {
+            bind: "127.0.0.1:8788".into(),
+            upstream: "https://api.anthropic.com".into(),
+            cache: true,
+            dedup: true,
+            prune: false,
+        }
+    }
 }
 
 /// OPTIONAL centralized sync of global memories. Off by default — when
