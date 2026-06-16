@@ -82,6 +82,17 @@ pub fn report(json: bool) -> Result<()> {
         ("results shown", event_counts("shown")?),
         ("memories opened", event_counts("opened")?),
         ("marked useful", event_counts("useful")?),
+        (
+            "tokens saved",
+            counts(
+                "SELECT COALESCE(sum(CASE WHEN at>=?1 THEN tokens_before-tokens_after END),0),
+                        COALESCE(sum(CASE WHEN at>=?2 THEN tokens_before-tokens_after END),0),
+                        COALESCE(sum(CASE WHEN at>=?3 THEN tokens_before-tokens_after END),0),
+                        COALESCE(sum(CASE WHEN at>=?4 THEN tokens_before-tokens_after END),0),
+                        COALESCE(sum(tokens_before-tokens_after),0)
+                 FROM savings_event",
+            )?,
+        ),
     ];
 
     // Most-recalled memories this month, for a human hook at the bottom.

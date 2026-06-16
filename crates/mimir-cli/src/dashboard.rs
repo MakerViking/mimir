@@ -313,6 +313,31 @@ fn render(mimir: &Mimir) -> Result<String> {
         0.0
     };
 
+    // ---- token savings (outline/peek/filter/proxy) ----
+    let saved_all = mimir_core::savings::totals(conn, None)?;
+    let saved_by_source = mimir_core::savings::by_source(conn, None)?;
+    let max_sv = saved_by_source
+        .iter()
+        .map(|(_, t)| t.saved())
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    let savings_rows: String = if saved_by_source.is_empty() {
+        r#"<div class="empty">no token savings recorded yet — try outline/peek or `mimir run`</div>"#.into()
+    } else {
+        saved_by_source
+            .iter()
+            .map(|(src, t)| {
+                format!(
+                    r#"<div class="hrow"><span class="hlabel">{}</span><span class="hbar"><i class="grow-x" style="width:{:.1}%"></i></span><span class="hval">{}</span></div>"#,
+                    esc(src),
+                    100.0 * t.saved() as f64 / max_sv as f64,
+                    fmt_n(t.saved())
+                )
+            })
+            .collect()
+    };
+
     let html = TEMPLATE
         .replace("{{GENERATED}}", &mimir_core::format::full_date(now))
         .replace("{{VERSION}}", env!("CARGO_PKG_VERSION"))
@@ -348,7 +373,21 @@ fn render(mimir: &Mimir) -> Result<String> {
         .replace("{{ARCHIVED}}", &fmt_n(archived))
         .replace("{{ARCHIVED_CLASS}}", if archived > 0 { "gold" } else { "" })
         .replace("{{PINNED}}", &fmt_n(pinned))
-        .replace("{{EVENTS}}", &fmt_n(events_total));
+        .replace("{{EVENTS}}", &fmt_n(events_total))
+        .replace("{{SAVED_TOTAL}}", &fmt_n(saved_all.saved()))
+        .replace("{{SAVED_BEFORE}}", &fmt_n(saved_all.before))
+        .replace("{{SAVED_EVENTS}}", &fmt_n(saved_all.events))
+        .replace(
+            "{{SAVED_USD}}",
+            &format!(
+                "${:.2}",
+                mimir_core::savings::to_dollars(
+                    saved_all.saved(),
+                    mimir.config.savings.input_price_per_mtok
+                )
+            ),
+        )
+        .replace("{{SAVINGS_ROWS}}", &savings_rows);
     Ok(html)
 }
 
@@ -535,6 +574,17 @@ footer span{margin-left:auto}
   <div class="panel s6">
     <h2>Knowledge by project</h2>
     {{PROJECT_ROWS}}
+  </div>
+
+  <div class="panel s12">
+    <h2>Token savings — dense context &amp; filtered output</h2>
+    <div class="kv">
+      <div><span>tokens saved</span><b class="teal">{{SAVED_TOTAL}}</b></div>
+      <div><span>≈ saved</span><b class="gold">{{SAVED_USD}}</b></div>
+      <div><span>source tokens seen</span><b>{{SAVED_BEFORE}}</b></div>
+      <div><span>savings events</span><b>{{SAVED_EVENTS}}</b></div>
+    </div>
+    {{SAVINGS_ROWS}}
   </div>
 
   <div class="panel s6">

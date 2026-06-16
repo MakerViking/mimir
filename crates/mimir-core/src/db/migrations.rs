@@ -137,6 +137,24 @@ CREATE INDEX node_symbol_name   ON node(json_extract(meta, '$.name'))      WHERE
     r#"
 CREATE INDEX embedding_model_hash ON embedding(model, content_hash);
 "#,
+    // v5: token-savings ledger. Every context-shrinking operation (outline,
+    // peek, command-output filter, proxy cache/prune) appends a row recording
+    // tokens before vs after, so the dashboard/report can total real savings.
+    // Standalone table (no node FK): the proxy runs as a separate process and
+    // some savings aren't tied to any node.
+    r#"
+CREATE TABLE savings_event (
+  id            INTEGER PRIMARY KEY,
+  at            INTEGER NOT NULL,
+  project_id    INTEGER,
+  source        TEXT NOT NULL,
+  tokens_before INTEGER NOT NULL,
+  tokens_after  INTEGER NOT NULL,
+  meta          TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX savings_at     ON savings_event(at);
+CREATE INDEX savings_source ON savings_event(source);
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

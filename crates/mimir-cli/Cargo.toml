@@ -23,10 +23,12 @@ gpu-cuda = ["mimir-core/gpu-cuda"]
 [dependencies]
 mimir-core.workspace = true
 mimir-graph.workspace = true
+mimir-proxy.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
 directories.workspace = true
+ignore.workspace = true
 libc = "0.2"
 rmcp.workspace = true
 rusqlite.workspace = true

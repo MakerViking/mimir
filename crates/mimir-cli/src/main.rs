@@ -1,10 +1,17 @@
 mod commands;
+mod context_cmd;
 mod dashboard;
+mod filters;
 mod fsutil;
 mod graph_cmd;
 mod graph_viz;
 mod mcp;
+mod proxy_cmd;
 mod report;
+mod rewrite_cmd;
+mod rules_cmd;
+mod run_cmd;
+mod savings_cmd;
 mod sync;
 
 use clap::{Parser, Subcommand};
@@ -31,11 +38,30 @@ enum Command {
         /// Skip the embedding-model download (search stays BM25-only).
         #[arg(long)]
         no_model: bool,
+        /// Also install the opt-in Claude Code hooks (command filter + rules).
+        #[arg(long)]
+        hooks: bool,
+    },
+    /// Rewrite a shell command to use `mimir run` (used by the PreToolUse hook).
+    Rewrite {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
     },
     /// Store overview: counts by kind, scope, database size.
     Status,
     /// Activity table: day / week / month / year / all-time.
     Report,
+    /// Token-savings analytics (outline/peek/filter/proxy).
+    Savings {
+        /// Print a compact one-line segment (for a statusline).
+        #[arg(long)]
+        oneline: bool,
+    },
+    /// Count tokens in stdin or the given text (Mimir's bundled tokenizer).
+    Tokens {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        text: Vec<String>,
+    },
     /// Health checks: database integrity, FTS availability, model presence.
     Doctor,
     /// Capture a memory (refuses near-duplicates unless --force).
@@ -204,6 +230,24 @@ enum Command {
     },
     /// Run the MCP stdio server (what Claude Code launches).
     Mcp,
+    /// Run the optional local API proxy (prompt-cache optimization; see docs/proxy.md).
+    Proxy {
+        /// Address to bind (default from [proxy] config, 127.0.0.1:8788).
+        #[arg(long)]
+        bind: Option<String>,
+        /// Measure only: forward request bodies unchanged.
+        #[arg(long)]
+        dry_run: bool,
+        /// Disable the prompt-cache breakpoint pass.
+        #[arg(long)]
+        no_cache: bool,
+        /// Disable the (safe) repeated-block dedup pass.
+        #[arg(long)]
+        no_dedup: bool,
+        /// Enable lossy pruning of stale tool results (off by default).
+        #[arg(long)]
+        prune: bool,
+    },
     /// Sync memories with the central store (optional; see docs/sync.md).
     Sync {
         #[command(subcommand)]
@@ -220,6 +264,41 @@ enum Command {
         #[command(subcommand)]
         cmd: GraphCmd,
     },
+    /// Dense signature map of a file or directory (read structure, not bodies).
+    Outline {
+        /// File or directory (default: current directory).
+        #[arg(default_value = ".")]
+        target: String,
+    },
+    /// Print one symbol's body by name (resolved via the code graph).
+    Peek {
+        /// Symbol: short id, qualified name, or unique bare name.
+        symbol: String,
+    },
+    /// Per-project rules pack (architecture/conventions surfaced at session start).
+    Rules {
+        #[command(subcommand)]
+        cmd: RulesCmd,
+    },
+    /// Run a command, printing token-lean output (drops build/progress noise).
+    Run {
+        /// Print raw, unfiltered output (debugging).
+        #[arg(long)]
+        raw: bool,
+        /// The command to run, e.g. `mimir run -- cargo build`.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        cmd: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RulesCmd {
+    /// Set/replace the rules pack (text from args, or stdin if omitted).
+    Set { text: Vec<String> },
+    /// Print the rules pack (what the SessionStart hook injects).
+    Show,
+    /// Remove the rules pack.
+    Clear,
 }
 
 #[derive(Subcommand)]
@@ -369,7 +448,8 @@ fn main() {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Init { no_model } => commands::init(no_model),
+        Command::Init { no_model, hooks } => commands::init(no_model, hooks),
+        Command::Rewrite { cmd } => rewrite_cmd::rewrite(cmd),
         Command::Status => commands::status(cli.json),
         Command::Doctor => commands::doctor(),
         Command::Remember {
@@ -477,7 +557,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Export => commands::export(),
         Command::Dashboard { out, open } => dashboard::dashboard(out, open),
         Command::Report => report::report(cli.json),
+        Command::Savings { oneline } => savings_cmd::savings(cli.json, oneline),
+        Command::Tokens { text } => commands::tokens(text),
         Command::Mcp => mcp::run(),
+        Command::Proxy {
+            bind,
+            dry_run,
+            no_cache,
+            no_dedup,
+            prune,
+        } => proxy_cmd::run(bind, dry_run, no_cache, no_dedup, prune),
         Command::Sync { cmd } => match cmd {
             None => sync::sync(),
             Some(SyncCmd::Push) => sync::push(),
@@ -502,5 +591,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 max_nodes,
             } => graph_viz::viz(out, open, max_nodes),
         },
+        Command::Outline { target } => context_cmd::outline(&target, cli.json),
+        Command::Peek { symbol } => context_cmd::peek(&symbol, cli.json),
+        Command::Rules { cmd } => match cmd {
+            RulesCmd::Set { text } => rules_cmd::set(text),
+            RulesCmd::Show => rules_cmd::show(),
+            RulesCmd::Clear => rules_cmd::clear(),
+        },
+        Command::Run { raw, cmd } => run_cmd::run(raw, cmd),
     }
 }
