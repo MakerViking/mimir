@@ -3,6 +3,27 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [0.8.0] — 2026-06-16
+### Added
+- **Token-savings system** — Mimir now measures and reduces token spend, with a
+  `savings_event` ledger (schema v5), a bundled tokenizer, and `mimir savings`
+  (with dollar figures via `[savings]`, `--oneline` for statuslines) + a
+  `/m-savings` slash command and dashboard panel.
+- **`outline` / `peek`** — dense signature maps (code via tree-sitter, plus
+  markdown/JSON/YAML) and single-symbol bodies, as MCP tools and CLI. Reading a
+  file's outline costs ~12% of reading the whole file.
+- **`run` / `rewrite`** — command-output filters (cargo, git, npm/pnpm/yarn/bun,
+  pytest, go, make, docker/podman, pip, jest/vitest/eslint/tsc/next,
+  terraform/tofu) via a declarative registry with an always-keep-errors safety
+  net and a generic head+tail+signal volume cap. Opt-in PreToolUse hook
+  installer (`mimir init --hooks`) replaces standalone output-filtering tools.
+- **`rules`** — a per-project pinned "rules pack" auto-injected at session start
+  via a SessionStart hook, so the agent stops re-deriving conventions.
+- **Optional API proxy** (new `mimir-mem-proxy` crate, off by default):
+  `mimir proxy` adds prompt-cache breakpoints (savings measured from
+  `usage.cache_read_input_tokens`), lossless repeated-block dedup, and opt-in
+  pruning. See [docs/proxy.md](docs/proxy.md) and [docs/benchmarks.md](docs/benchmarks.md).
+
 ## [0.7.0] — 2026-06-15
 ### Added
 - **Optional centralized sync** (off by default): share global memories across
