@@ -71,11 +71,27 @@ fn rules_for(program: &str) -> Option<&'static Noise> {
     })
 }
 
-/// True if Mimir has a dedicated handler for `program` (i.e. it's worth
-/// auto-wrapping in `mimir run`). The single source of truth the PreToolUse
-/// rewrite shares, so adding a handler makes the command rewrite-eligible too.
+/// High-volume "content" commands whose output *is* the signal (coreutils,
+/// search, listings, kubectl). We deliberately do NOT run the per-line noise
+/// verdict on these — dropping a matched/listed line would be lossy. `mimir
+/// run` instead applies only the non-lossy volume cap (head + tail + every
+/// signal line, with the bulky middle elided behind a visible marker).
+const CONTENT_CMDS: &[&str] = &[
+    "cat", "head", "tail", "ls", "find", "grep", "rg", "egrep", "fgrep", "ps", "df", "du", "tree",
+    "kubectl",
+];
+
+/// True for a [`CONTENT_CMDS`] command — cap-only handling, never line-dropped.
+pub fn is_content(program: &str) -> bool {
+    CONTENT_CMDS.contains(&program)
+}
+
+/// True if Mimir should auto-wrap `program` in `mimir run`: either it has a
+/// dedicated noise handler, or it's a high-volume content command we volume-cap.
+/// The single source of truth the PreToolUse rewrite shares, so adding a handler
+/// (or content command) makes it rewrite-eligible too.
 pub fn is_filterable(program: &str) -> bool {
-    rules_for(program).is_some()
+    rules_for(program).is_some() || is_content(program)
 }
 
 /// Decide one line. `is_signal` wins first; then the program's rules (or the
@@ -415,6 +431,10 @@ mod tests {
         assert!(is_filterable("docker-compose"));
         assert!(is_filterable("terraform"));
         assert!(!is_filterable("node")); // runs user apps — not filtered
-        assert!(!is_filterable("ls"));
+                                         // content commands are filterable (cap-only), but never noise-handled
+        assert!(is_filterable("ls"));
+        assert!(is_content("ls"));
+        assert!(rules_for("ls").is_none()); // cap-only: no per-line noise rules
+        assert!(!is_content("cargo")); // noise-handled, not a content command
     }
 }
