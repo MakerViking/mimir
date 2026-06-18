@@ -236,6 +236,76 @@ pub fn ensure_project(conn: &Connection, root: &str, name: &str) -> Result<Node>
     insert_node(conn, new)
 }
 
+/// Find a project node by its portable sync key (`meta.portable_key`).
+pub fn find_project_by_key(conn: &Connection, key: &str) -> Result<Option<Node>> {
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {NODE_COLS} FROM node
+                 WHERE kind = 'project' AND json_extract(meta, '$.portable_key') = ?1"
+            ),
+            [key],
+            row_to_node,
+        )
+        .optional()?)
+}
+
+/// Record a project's portable sync identity (`meta.portable_key` + `meta.sync`).
+/// Idempotent and a no-op when unchanged, so it's cheap to call on every project
+/// resolution. `key = None` clears the stored key (project stays local-only).
+pub fn set_project_identity(
+    conn: &Connection,
+    project_id: i64,
+    key: Option<&str>,
+    sync: bool,
+) -> Result<()> {
+    let (cur_key, cur_sync): (Option<String>, bool) = conn.query_row(
+        "SELECT json_extract(meta, '$.portable_key'),
+                COALESCE(json_extract(meta, '$.sync'), 0)
+         FROM node WHERE id = ?1",
+        [project_id],
+        |r| Ok((r.get(0)?, r.get::<_, i64>(1)? != 0)),
+    )?;
+    if cur_key.as_deref() == key && cur_sync == sync {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE node
+         SET meta = json_set(json_set(meta, '$.portable_key', ?2), '$.sync', json(?3))
+         WHERE id = ?1 AND kind = 'project'",
+        params![project_id, key, if sync { "true" } else { "false" }],
+    )?;
+    Ok(())
+}
+
+/// Bind an existing keyed (possibly synced-shadow) project to this machine's
+/// local path + display name, clearing the shadow marker. Used when a project
+/// that first arrived via sync is opened locally.
+pub fn adopt_project(conn: &Connection, project_id: i64, path: &str, name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE node
+         SET path = ?2, title = ?3, meta = json_remove(meta, '$.shadow')
+         WHERE id = ?1 AND kind = 'project'",
+        params![project_id, path, name],
+    )?;
+    Ok(())
+}
+
+/// Resolve a project by portable key for sync apply, creating a path-less
+/// **shadow** project if none exists yet (adopted when the project is later
+/// opened locally). Ensures a pulled project memory always has a project to
+/// attach to, even before that project exists on this machine.
+pub fn resolve_or_shadow_project(conn: &Connection, key: &str) -> Result<i64> {
+    if let Some(p) = find_project_by_key(conn, key)? {
+        return Ok(p.id);
+    }
+    let name = key.rsplit('/').next().unwrap_or(key).to_string();
+    let mut new = NewNode::new(Kind::Project);
+    new.title = Some(name);
+    new.meta = Some(serde_json::json!({ "portable_key": key, "sync": true, "shadow": true }));
+    Ok(insert_node(conn, new)?.id)
+}
+
 /// Live file nodes whose relative path ends with `suffix` (max 3).
 pub fn files_by_path_suffix(conn: &Connection, suffix: &str) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(&format!(
@@ -341,6 +411,35 @@ mod tests {
 
     fn conn() -> Connection {
         db::open_in_memory().unwrap()
+    }
+
+    #[test]
+    fn project_identity_set_and_lookup_by_key() {
+        let c = conn();
+        let p = ensure_project(&c, "/abs/path/proj", "proj").unwrap();
+        assert!(find_project_by_key(&c, "git:github.com/o/r")
+            .unwrap()
+            .is_none());
+
+        set_project_identity(&c, p.id, Some("git:github.com/o/r"), true).unwrap();
+        let found = find_project_by_key(&c, "git:github.com/o/r").unwrap();
+        assert_eq!(found.map(|n| n.id), Some(p.id));
+
+        // sync flag stored as JSON boolean.
+        let sync: i64 = c
+            .query_row(
+                "SELECT json_extract(meta,'$.sync') FROM node WHERE id=?1",
+                [p.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sync, 1);
+
+        // Clearing the key makes it unfindable again (local-only).
+        set_project_identity(&c, p.id, None, false).unwrap();
+        assert!(find_project_by_key(&c, "git:github.com/o/r")
+            .unwrap()
+            .is_none());
     }
 
     fn memory(conn: &Connection, title: &str, body: &str) -> Node {

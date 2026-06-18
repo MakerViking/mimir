@@ -155,6 +155,15 @@ CREATE TABLE savings_event (
 CREATE INDEX savings_at     ON savings_event(at);
 CREATE INDEX savings_source ON savings_event(source);
 "#,
+    // v6: project-scoped sync. A project node carries a portable key in
+    // meta.portable_key (a committed `.mimir` id or the normalized git remote) —
+    // identity that's stable across machines, unlike the absolute path. Index it
+    // so sync can resolve a memory's project by key, and so a pulled "shadow"
+    // project is adopted when the same project is opened locally.
+    r#"
+CREATE INDEX node_project_pkey
+  ON node(json_extract(meta, '$.portable_key')) WHERE kind = 'project';
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

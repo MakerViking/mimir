@@ -127,6 +127,96 @@ pub fn project_name(root: &Path) -> String {
         .unwrap_or_else(|| root.to_string_lossy().into_owned())
 }
 
+/// Parsed `.mimir` marker. A `touch`ed / empty file yields all-defaults.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MimirMarker {
+    /// Stable, machine-independent project id (the portable key, when present).
+    pub id: Option<String>,
+    /// Opt this project's memories into sync.
+    pub sync: bool,
+}
+
+/// Read and parse the `.mimir` marker as TOML (`id = "..."`, `sync = true`).
+/// `None` if absent or unparseable; an empty file parses to defaults.
+pub fn read_mimir_marker(root: &Path) -> Option<MimirMarker> {
+    let txt = std::fs::read_to_string(root.join(".mimir")).ok()?;
+    let val: toml::Value = toml::from_str(&txt).ok()?;
+    Some(MimirMarker {
+        id: val.get("id").and_then(|v| v.as_str()).map(str::to_owned),
+        sync: val.get("sync").and_then(|v| v.as_bool()).unwrap_or(false),
+    })
+}
+
+/// A project's **portable key** — identity that is the same on every machine
+/// (unlike the absolute path), so project-scoped memories can sync. Order:
+///   1. a committed `.mimir` `id` (source of truth — survives renames/moves),
+///   2. else the normalized `origin` remote from `.git/config`,
+///   3. else `None` (not portable → the project's memories stay local-only).
+pub fn portable_key(root: &Path) -> Option<String> {
+    if let Some(id) = read_mimir_marker(root).and_then(|m| m.id) {
+        return Some(id);
+    }
+    git_origin_key(root)
+}
+
+/// Whether this project opts its memories into sync (`sync = true` in `.mimir`).
+pub fn sync_opt_in(root: &Path) -> bool {
+    read_mimir_marker(root).map(|m| m.sync).unwrap_or(false)
+}
+
+/// A fresh, machine-independent project id (ULID) for a `.mimir` marker.
+pub fn new_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+
+/// `git:<host>/<path>` from the `origin` remote in `.git/config`, read as a
+/// file (no git subprocess — matching the rest of scope detection). `None` if
+/// there's no repo or no origin remote.
+fn git_origin_key(root: &Path) -> Option<String> {
+    let cfg = std::fs::read_to_string(root.join(".git").join("config")).ok()?;
+    parse_git_origin_url(&cfg).map(|url| format!("git:{}", normalize_remote(&url)))
+}
+
+/// Find `url = …` under `[remote "origin"]` in a git config file.
+fn parse_git_origin_url(cfg: &str) -> Option<String> {
+    let mut in_origin = false;
+    for line in cfg.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_origin = t.replace(char::is_whitespace, "") == "[remote\"origin\"]";
+            continue;
+        }
+        if in_origin {
+            if let Some(rest) = t.strip_prefix("url") {
+                if let Some(v) = rest.trim_start().strip_prefix('=') {
+                    return Some(v.trim().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Normalize a git remote URL to a `host/path` key: scheme/user stripped,
+/// trailing `.git` removed, lowercased. `git@github.com:Org/Repo.git` and
+/// `https://github.com/Org/Repo.git` both → `github.com/org/repo`.
+fn normalize_remote(url: &str) -> String {
+    let u = url.trim();
+    let host_path = if let Some(rest) = u.strip_prefix("git@") {
+        rest.replacen(':', "/", 1) // scp-like: git@host:path
+    } else {
+        let after_scheme = u.split_once("://").map(|(_, r)| r).unwrap_or(u);
+        after_scheme
+            .split_once('@')
+            .map(|(_, r)| r.to_string())
+            .unwrap_or_else(|| after_scheme.to_string())
+    };
+    host_path
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,6 +328,59 @@ mod tests {
         let bare = tmp.path().join("scratch");
         std::fs::create_dir_all(&bare).unwrap();
         assert_eq!(detect(&bare), Detection::NotFound { from: bare });
+    }
+
+    #[test]
+    fn portable_key_prefers_mimir_id_over_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".mimir"), "id = \"PROJ123\"\nsync = true\n").unwrap();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join(".git/config"),
+            "[remote \"origin\"]\n\turl = git@github.com:Org/Repo.git\n",
+        )
+        .unwrap();
+        assert_eq!(portable_key(root).as_deref(), Some("PROJ123"));
+        assert!(sync_opt_in(root));
+    }
+
+    #[test]
+    fn portable_key_falls_back_to_git_origin() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::write(
+            root.join(".git/config"),
+            "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = https://github.com/MakerViking/Mimir.git\n",
+        )
+        .unwrap();
+        assert_eq!(
+            portable_key(root).as_deref(),
+            Some("git:github.com/makerviking/mimir")
+        );
+        assert!(!sync_opt_in(root)); // no .mimir → not opted in
+    }
+
+    #[test]
+    fn portable_key_none_without_id_or_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join(".mimir"), b"").unwrap(); // touched, empty
+        assert_eq!(portable_key(root), None);
+        assert!(!sync_opt_in(root));
+    }
+
+    #[test]
+    fn normalize_remote_forms_converge() {
+        for url in [
+            "git@github.com:Org/Repo.git",
+            "https://github.com/Org/Repo.git",
+            "ssh://git@github.com/Org/Repo.git",
+            "https://github.com/Org/Repo",
+        ] {
+            assert_eq!(normalize_remote(url), "github.com/org/repo", "{url}");
+        }
     }
 
     #[test]

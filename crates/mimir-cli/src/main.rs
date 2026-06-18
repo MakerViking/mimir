@@ -6,6 +6,7 @@ mod fsutil;
 mod graph_cmd;
 mod graph_viz;
 mod mcp;
+mod project_cmd;
 mod proxy_cmd;
 mod report;
 mod rewrite_cmd;
@@ -280,6 +281,11 @@ enum Command {
         #[command(subcommand)]
         cmd: RulesCmd,
     },
+    /// Project identity for cross-machine sync (the `.mimir` marker).
+    Project {
+        #[command(subcommand)]
+        cmd: ProjectCmd,
+    },
     /// Run a command, printing token-lean output (drops build/progress noise).
     Run {
         /// Print raw, unfiltered output (debugging).
@@ -299,6 +305,16 @@ enum RulesCmd {
     Show,
     /// Remove the rules pack.
     Clear,
+}
+
+#[derive(Subcommand)]
+enum ProjectCmd {
+    /// Write/refresh `.mimir` with a stable id (and `--sync` to replicate this
+    /// project's memories across machines). Commit the file so every clone shares it.
+    Init {
+        #[arg(long)]
+        sync: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -601,6 +617,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             RulesCmd::Set { text } => rules_cmd::set(text),
             RulesCmd::Show => rules_cmd::show(),
             RulesCmd::Clear => rules_cmd::clear(),
+        },
+        Command::Project { cmd } => match cmd {
+            ProjectCmd::Init { sync } => project_cmd::init(sync),
         },
         Command::Run { raw, cmd } => run_cmd::run(raw, cmd),
     }
