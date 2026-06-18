@@ -246,7 +246,17 @@ impl Mimir {
             scope::Detection::Found { root, .. } => {
                 let canonical = scope::canonical_root(root);
                 let name = scope::project_name(root);
-                Some(store::ensure_project(&self.conn, &canonical, &name)?)
+                let node = store::ensure_project(&self.conn, &canonical, &name)?;
+                // Keep the project's portable sync identity fresh in meta (cheap,
+                // no-op when unchanged) so project-scoped sync can resolve it by a
+                // machine-stable key without touching the filesystem.
+                store::set_project_identity(
+                    &self.conn,
+                    node.id,
+                    scope::portable_key(root).as_deref(),
+                    scope::sync_opt_in(root),
+                )?;
+                Some(node)
             }
             scope::Detection::NotFound { .. } => None,
         };
