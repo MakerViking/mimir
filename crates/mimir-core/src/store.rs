@@ -278,6 +278,34 @@ pub fn set_project_identity(
     Ok(())
 }
 
+/// Bind an existing keyed (possibly synced-shadow) project to this machine's
+/// local path + display name, clearing the shadow marker. Used when a project
+/// that first arrived via sync is opened locally.
+pub fn adopt_project(conn: &Connection, project_id: i64, path: &str, name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE node
+         SET path = ?2, title = ?3, meta = json_remove(meta, '$.shadow')
+         WHERE id = ?1 AND kind = 'project'",
+        params![project_id, path, name],
+    )?;
+    Ok(())
+}
+
+/// Resolve a project by portable key for sync apply, creating a path-less
+/// **shadow** project if none exists yet (adopted when the project is later
+/// opened locally). Ensures a pulled project memory always has a project to
+/// attach to, even before that project exists on this machine.
+pub fn resolve_or_shadow_project(conn: &Connection, key: &str) -> Result<i64> {
+    if let Some(p) = find_project_by_key(conn, key)? {
+        return Ok(p.id);
+    }
+    let name = key.rsplit('/').next().unwrap_or(key).to_string();
+    let mut new = NewNode::new(Kind::Project);
+    new.title = Some(name);
+    new.meta = Some(serde_json::json!({ "portable_key": key, "sync": true, "shadow": true }));
+    Ok(insert_node(conn, new)?.id)
+}
+
 /// Live file nodes whose relative path ends with `suffix` (max 3).
 pub fn files_by_path_suffix(conn: &Connection, suffix: &str) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(&format!(

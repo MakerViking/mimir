@@ -1,11 +1,15 @@
 //! Transport-agnostic replication for the OPTIONAL sync layer.
 //!
-//! MVP scope: GLOBAL memories (`kind='memory' AND project_id IS NULL`) and the
-//! edges between two such memories. Identity is the node `uid` (a globally
-//! unique ULID), so merges are uid-keyed last-write-wins on `updated_at` —
-//! convergent and idempotent across machines. Tombstones ride along as
-//! `deleted_at`. Local-only signals (strength, access_count, recall_event) and
-//! embeddings are never synced; a peer recomputes embeddings locally.
+//! Scope: GLOBAL memories, plus memories of **sync-enabled projects** (those
+//! with a portable key — see `scope::portable_key`), and the edges among synced
+//! memories. A project memory carries its project's portable key on the wire; on
+//! apply it resolves to the local project, creating a path-less *shadow* project
+//! if that project hasn't been opened on this machine yet (adopted on first
+//! local open). Identity is the node `uid` (a globally unique ULID), so merges
+//! are uid-keyed last-write-wins on `updated_at` — convergent and idempotent
+//! across machines. Tombstones ride along as `deleted_at`. Local-only signals
+//! (strength, access_count, recall_event) and embeddings are never synced; a
+//! peer recomputes embeddings locally.
 
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
@@ -30,6 +34,10 @@ pub struct SyncRecord {
     pub created_at: i64,
     pub updated_at: i64,
     pub deleted_at: Option<i64>,
+    /// Portable key of the owning project (`None` = global memory). Absent on the
+    /// wire for global records, so existing global-only peers are unaffected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_key: Option<String>,
 }
 
 /// A memory↔memory edge on the wire, identified by endpoint uids.
@@ -60,18 +68,26 @@ pub struct ApplyStats {
     pub tombstones: usize,
 }
 
-/// "Changed since `since`" = global memories whose latest activity
+/// SQL predicate (memory alias `m` LEFT JOINed to its project alias `p`)
+/// selecting the memories that replicate: globals (`project_id IS NULL`), plus
+/// memories of a sync-enabled project that carries a portable key.
+const SYNCABLE: &str = "m.kind='memory' AND (m.project_id IS NULL OR \
+    (json_extract(p.meta,'$.sync')=1 AND json_extract(p.meta,'$.portable_key') IS NOT NULL))";
+
+/// "Changed since `since`" = syncable memories whose latest activity
 /// (max of updated_at and deleted_at) is newer than `since`, plus all edges
 /// among synced memories (sparse; shipped whole and upserted idempotently).
 pub fn changes_since(conn: &Connection, since: i64) -> Result<SyncBatch> {
-    let mut stmt = conn.prepare(
-        "SELECT uid, subkind, title, body, tags_text, pinned, content_hash, meta,
-                created_at, updated_at, deleted_at
-         FROM node
-         WHERE kind='memory' AND project_id IS NULL
-           AND max(updated_at, COALESCE(deleted_at, 0)) > ?1
-         ORDER BY max(updated_at, COALESCE(deleted_at, 0)) ASC",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT m.uid, m.subkind, m.title, m.body, m.tags_text, m.pinned, m.content_hash, m.meta,
+                m.created_at, m.updated_at, m.deleted_at,
+                json_extract(p.meta,'$.portable_key') AS project_key
+         FROM node m
+         LEFT JOIN node p ON p.id = m.project_id AND p.kind='project'
+         WHERE {SYNCABLE}
+           AND max(m.updated_at, COALESCE(m.deleted_at, 0)) > ?1
+         ORDER BY max(m.updated_at, COALESCE(m.deleted_at, 0)) ASC",
+    ))?;
     let nodes = stmt
         .query_map([since], |r: &Row| {
             let hash: Option<Vec<u8>> = r.get("content_hash")?;
@@ -89,18 +105,26 @@ pub fn changes_since(conn: &Connection, since: i64) -> Result<SyncBatch> {
                 created_at: r.get("created_at")?,
                 updated_at: r.get("updated_at")?,
                 deleted_at: r.get("deleted_at")?,
+                project_key: r.get("project_key")?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     drop(stmt);
 
+    // Edges between two syncable memories (each endpoint global, or in a
+    // sync-enabled keyed project).
     let mut estmt = conn.prepare(
         "SELECT s.uid, d.uid, e.rel, e.weight, e.created_at
          FROM edge e
          JOIN node s ON s.id = e.src
          JOIN node d ON d.id = e.dst
-         WHERE s.kind='memory' AND s.project_id IS NULL
-           AND d.kind='memory' AND d.project_id IS NULL",
+         LEFT JOIN node sp ON sp.id = s.project_id AND sp.kind='project'
+         LEFT JOIN node dp ON dp.id = d.project_id AND dp.kind='project'
+         WHERE s.kind='memory' AND d.kind='memory'
+           AND (s.project_id IS NULL OR (json_extract(sp.meta,'$.sync')=1
+                    AND json_extract(sp.meta,'$.portable_key') IS NOT NULL))
+           AND (d.project_id IS NULL OR (json_extract(dp.meta,'$.sync')=1
+                    AND json_extract(dp.meta,'$.portable_key') IS NOT NULL))",
     )?;
     let edges = estmt
         .query_map([], |r: &Row| {
@@ -131,8 +155,12 @@ pub fn snapshot(conn: &Connection) -> Result<SyncBatch> {
 pub fn current_high_watermark(conn: &Connection) -> Result<i64> {
     let v: Option<i64> = conn
         .query_row(
-            "SELECT max(max(updated_at, COALESCE(deleted_at, 0)))
-             FROM node WHERE kind='memory' AND project_id IS NULL",
+            &format!(
+                "SELECT max(max(m.updated_at, COALESCE(m.deleted_at, 0)))
+                 FROM node m
+                 LEFT JOIN node p ON p.id = m.project_id AND p.kind='project'
+                 WHERE {SYNCABLE}"
+            ),
             [],
             |r| r.get(0),
         )
@@ -148,15 +176,23 @@ pub fn apply_changes(conn: &Connection, batch: &SyncBatch) -> Result<ApplyStats>
     for n in &batch.nodes {
         let hash: Option<Vec<u8>> = n.content_hash.as_deref().and_then(from_hex);
         let tags_text = n.tags.join(" ");
-        // Insert as a global memory; on uid conflict, overwrite only the synced
-        // fields and only when the incoming record is strictly newer. Local
-        // signals (strength, access_count, …) are never touched.
+        // Resolve the owning project from its portable key (None = global). A
+        // key with no local project yet gets a path-less shadow project, adopted
+        // when that project is later opened locally.
+        let project_id: Option<i64> = match n.project_key.as_deref() {
+            None => None,
+            Some(key) => Some(store::resolve_or_shadow_project(conn, key)?),
+        };
+        // Upsert; on uid conflict, overwrite only the synced fields and only when
+        // the incoming record is strictly newer. Local signals (strength,
+        // access_count, …) are never touched.
         let changed = conn.execute(
-            "INSERT INTO node (uid, kind, subkind, title, body, tags_text, content_hash,
+            "INSERT INTO node (uid, kind, subkind, project_id, title, body, tags_text, content_hash,
                                meta, pinned, created_at, updated_at, deleted_at)
-             VALUES (?1, 'memory', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+             VALUES (?1, 'memory', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(uid) DO UPDATE SET
-               subkind=excluded.subkind, title=excluded.title, body=excluded.body,
+               subkind=excluded.subkind, project_id=excluded.project_id,
+               title=excluded.title, body=excluded.body,
                tags_text=excluded.tags_text, content_hash=excluded.content_hash,
                meta=excluded.meta, pinned=excluded.pinned,
                updated_at=excluded.updated_at, deleted_at=excluded.deleted_at
@@ -168,6 +204,7 @@ pub fn apply_changes(conn: &Connection, batch: &SyncBatch) -> Result<ApplyStats>
             params![
                 n.uid,
                 n.mtype,
+                project_id,
                 n.title,
                 n.body,
                 tags_text,
@@ -315,6 +352,88 @@ mod tests {
         }
     }
 
+    fn synced_project(conn: &Connection, key: &str) -> i64 {
+        let p = store::ensure_project(conn, &format!("/local/{key}"), "proj").unwrap();
+        store::set_project_identity(conn, p.id, Some(key), true).unwrap();
+        p.id
+    }
+
+    fn proj_mem(conn: &Connection, pid: i64, text: &str) -> crate::model::Node {
+        match remember(
+            conn,
+            Remember {
+                text: text.into(),
+                mtype: MemoryType::Note,
+                tags: vec!["t".into()],
+                project_id: Some(pid),
+                force: true,
+            },
+        )
+        .unwrap()
+        {
+            crate::memory::RememberOutcome::Created(n) => n,
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn project_memory_syncs_via_key_and_creates_shadow() {
+        let a = db::open_in_memory().unwrap();
+        let pid = synced_project(&a, "git:github.com/o/r");
+        let g = mem(&a, "global fact");
+        let pm = proj_mem(&a, pid, "project fact");
+
+        let batch = snapshot(&a).unwrap();
+        assert_eq!(batch.nodes.len(), 2, "global + synced-project memory");
+        let pr = batch.nodes.iter().find(|r| r.uid == pm.uid).unwrap();
+        assert_eq!(pr.project_key.as_deref(), Some("git:github.com/o/r"));
+        let gr = batch.nodes.iter().find(|r| r.uid == g.uid).unwrap();
+        assert_eq!(gr.project_key, None);
+
+        // Fresh peer: a shadow project is created and the memory attaches to it;
+        // the global memory stays global.
+        let b = db::open_in_memory().unwrap();
+        apply_changes(&b, &batch).unwrap();
+        let shadow = store::find_project_by_key(&b, "git:github.com/o/r")
+            .unwrap()
+            .expect("shadow project created");
+        let attached: Option<i64> = b
+            .query_row("SELECT project_id FROM node WHERE uid=?1", [&pm.uid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(attached, Some(shadow.id));
+        let gpid: Option<i64> = b
+            .query_row("SELECT project_id FROM node WHERE uid=?1", [&g.uid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(gpid, None, "global stays global on the peer");
+    }
+
+    #[test]
+    fn unsynced_project_memory_stays_local() {
+        let a = db::open_in_memory().unwrap();
+        let p = store::ensure_project(&a, "/local/x", "x").unwrap();
+        // Has a key but sync=false → excluded from replication.
+        store::set_project_identity(&a, p.id, Some("git:github.com/o/r"), false).unwrap();
+        proj_mem(&a, p.id, "private fact");
+        mem(&a, "global fact");
+        let batch = snapshot(&a).unwrap();
+        assert_eq!(batch.nodes.len(), 1, "only the global memory syncs");
+        assert_eq!(batch.nodes[0].project_key, None);
+    }
+
+    #[test]
+    fn record_without_project_key_deserializes_as_global() {
+        // An old global-only peer omits the field entirely.
+        let json = r#"{"uid":"01ABC","type":"note","title":null,"body":"x","tags":[],
+            "pinned":false,"content_hash":null,"meta":{},"created_at":1,"updated_at":1,
+            "deleted_at":null}"#;
+        let rec: SyncRecord = serde_json::from_str(json).unwrap();
+        assert_eq!(rec.project_key, None);
+    }
+
     #[test]
     fn roundtrip_and_idempotent() {
         let a = db::open_in_memory().unwrap();
@@ -366,6 +485,7 @@ mod tests {
                 created_at: n.created_at,
                 updated_at: 1,
                 deleted_at: None,
+                project_key: None,
             }],
             edges: vec![],
             watermark: 0,
@@ -414,6 +534,7 @@ mod tests {
                 created_at: n.created_at,
                 updated_at: n.updated_at,
                 deleted_at: None,
+                project_key: None,
             }],
             edges: vec![],
             watermark: 0,

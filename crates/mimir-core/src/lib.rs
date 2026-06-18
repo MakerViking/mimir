@@ -246,16 +246,27 @@ impl Mimir {
             scope::Detection::Found { root, .. } => {
                 let canonical = scope::canonical_root(root);
                 let name = scope::project_name(root);
-                let node = store::ensure_project(&self.conn, &canonical, &name)?;
+                let key = scope::portable_key(root);
+                let sync = scope::sync_opt_in(root);
+                // If a project with this portable key already exists (e.g. a
+                // shadow created by sync apply before this checkout was opened),
+                // adopt it onto this machine's path instead of making a duplicate.
+                let node = match key
+                    .as_deref()
+                    .map(|k| store::find_project_by_key(&self.conn, k))
+                    .transpose()?
+                    .flatten()
+                {
+                    Some(existing) => {
+                        store::adopt_project(&self.conn, existing.id, &canonical, &name)?;
+                        store::get_node(&self.conn, existing.id)?
+                    }
+                    None => store::ensure_project(&self.conn, &canonical, &name)?,
+                };
                 // Keep the project's portable sync identity fresh in meta (cheap,
                 // no-op when unchanged) so project-scoped sync can resolve it by a
                 // machine-stable key without touching the filesystem.
-                store::set_project_identity(
-                    &self.conn,
-                    node.id,
-                    scope::portable_key(root).as_deref(),
-                    scope::sync_opt_in(root),
-                )?;
+                store::set_project_identity(&self.conn, node.id, key.as_deref(), sync)?;
                 Some(node)
             }
             scope::Detection::NotFound { .. } => None,
