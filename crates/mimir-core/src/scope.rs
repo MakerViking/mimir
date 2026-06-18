@@ -7,21 +7,87 @@ use std::path::{Path, PathBuf};
 /// root.
 pub const ROOT_MARKERS: &[&str] = &[".git", ".hg", ".svn", ".jj", ".mimir"];
 
-/// Walk up from `start` to find the enclosing project root (a directory
-/// containing one of `ROOT_MARKERS`). Returns None when none is found.
-pub fn find_project_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = if start.is_absolute() {
-        start.to_path_buf()
+/// Build-system files that mark a project root when no VCS/explicit marker is
+/// found (a lower-priority second pass). A `const` so it's trivial to extend.
+pub const PROJECT_MARKERS: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "pyproject.toml",
+    "go.mod",
+    "go.work",
+    "deno.json",
+    "deno.jsonc",
+    "pnpm-workspace.yaml",
+];
+
+/// Outcome of resolving a project root from a directory. `Found.via` is the
+/// marker that identified the root (for "detected via …" reporting); `NotFound`
+/// carries where the search started so callers can explain the global fallback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Detection {
+    Found { root: PathBuf, via: &'static str },
+    NotFound { from: PathBuf },
+}
+
+fn absolutize(start: &Path) -> Option<PathBuf> {
+    if start.is_absolute() {
+        Some(start.to_path_buf())
     } else {
-        std::env::current_dir().ok()?.join(start)
-    };
+        Some(std::env::current_dir().ok()?.join(start))
+    }
+}
+
+/// Deepest ancestor of `start` (inclusive) containing any of `markers`, with the
+/// marker that matched.
+fn walk_up(start: &Path, markers: &[&'static str]) -> Option<(PathBuf, &'static str)> {
+    let mut dir = start.to_path_buf();
     loop {
-        if ROOT_MARKERS.iter().any(|m| dir.join(m).exists()) {
-            return Some(dir);
+        if let Some(&m) = markers.iter().find(|m| dir.join(m).exists()) {
+            return Some((dir, m));
         }
         if !dir.pop() {
             return None;
         }
+    }
+}
+
+/// Resolve the project root from `start`, first match wins:
+/// 1. a VCS/explicit root (`ROOT_MARKERS`) — deepest from `start`, so a nested
+///    `.mimir` overrides and a git root wins over a deeper build file;
+/// 2. else the nearest build-file root (`PROJECT_MARKERS`);
+/// 3. else `NotFound` (global scope, explained by the caller).
+pub fn detect(start: &Path) -> Detection {
+    let Some(abs) = absolutize(start) else {
+        return Detection::NotFound {
+            from: start.to_path_buf(),
+        };
+    };
+    if let Some((root, via)) = walk_up(&abs, ROOT_MARKERS) {
+        return Detection::Found { root, via };
+    }
+    if let Some((root, via)) = walk_up(&abs, PROJECT_MARKERS) {
+        return Detection::Found { root, via };
+    }
+    Detection::NotFound { from: abs }
+}
+
+/// Just the root path (no reason). Thin wrapper over [`detect`] for callers that
+/// only need to scope; all of them transparently gain build-file detection.
+pub fn find_project_root(start: &Path) -> Option<PathBuf> {
+    match detect(start) {
+        Detection::Found { root, .. } => Some(root),
+        Detection::NotFound { .. } => None,
+    }
+}
+
+/// Human label for a `Detection::Found.via` marker (`.git` → `git`).
+pub fn via_label(via: &str) -> &str {
+    match via {
+        ".git" => "git",
+        ".hg" => "hg",
+        ".svn" => "svn",
+        ".jj" => "jj",
+        other => other,
     }
 }
 
@@ -94,6 +160,84 @@ mod tests {
     fn none_outside_any_project() {
         let tmp = tempfile::tempdir().unwrap();
         assert_eq!(find_project_root(tmp.path()), None);
+    }
+
+    #[test]
+    fn detects_git_root_via() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("proj");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        assert_eq!(
+            detect(&root),
+            Detection::Found {
+                root: root.clone(),
+                via: ".git"
+            }
+        );
+        assert_eq!(via_label(".git"), "git");
+    }
+
+    #[test]
+    fn detects_non_git_build_marker() {
+        for marker in ["Cargo.toml", "package.json", "pyproject.toml"] {
+            let tmp = tempfile::tempdir().unwrap();
+            let root = tmp.path().join("proj");
+            let nested = root.join("src/deep");
+            std::fs::create_dir_all(&nested).unwrap();
+            std::fs::write(root.join(marker), b"").unwrap();
+            assert_eq!(
+                detect(&nested),
+                Detection::Found {
+                    root: root.clone(),
+                    via: marker
+                },
+                "{marker} should scope the project from a nested dir"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_build_marker_deepest_wins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("workspace");
+        let inner = outer.join("packages/app");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(outer.join("package.json"), b"").unwrap();
+        std::fs::write(inner.join("package.json"), b"").unwrap();
+        // From the inner dir, the nearest (deepest) marker wins.
+        assert_eq!(
+            detect(&inner),
+            Detection::Found {
+                root: inner.clone(),
+                via: "package.json"
+            }
+        );
+    }
+
+    #[test]
+    fn vcs_root_wins_over_deeper_build_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let pkg = repo.join("crates/sub");
+        std::fs::create_dir_all(&pkg).unwrap();
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::write(pkg.join("Cargo.toml"), b"").unwrap();
+        // Phase A (git) wins even though Cargo.toml is deeper/nearer.
+        assert_eq!(
+            detect(&pkg),
+            Detection::Found {
+                root: repo.clone(),
+                via: ".git"
+            }
+        );
+    }
+
+    #[test]
+    fn bare_dir_is_not_found() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bare = tmp.path().join("scratch");
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(detect(&bare), Detection::NotFound { from: bare });
     }
 
     #[test]

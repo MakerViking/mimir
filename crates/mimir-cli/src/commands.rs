@@ -419,7 +419,11 @@ pub fn status(json: bool) -> Result<()> {
     let db_size = std::fs::metadata(&mimir.paths.db_file)
         .with_context(|| format!("stat {}", mimir.paths.db_file.display()))?
         .len();
-    let project = mimir.project_for_cwd(&std::env::current_dir()?)?;
+    let (project, detection) = mimir.detect_project(&std::env::current_dir()?)?;
+    let via = match &detection {
+        mimir_core::scope::Detection::Found { via, .. } => Some(mimir_core::scope::via_label(via)),
+        mimir_core::scope::Detection::NotFound { .. } => None,
+    };
 
     if json {
         let counts_json: serde_json::Map<String, serde_json::Value> = counts
@@ -432,19 +436,28 @@ pub fn status(json: bool) -> Result<()> {
                 "db": mimir.paths.db_file,
                 "db_bytes": db_size,
                 "project": project.as_ref().and_then(|p| p.title.clone()),
+                "project_path": project.as_ref().and_then(|p| p.path.clone()),
+                "scope": if project.is_some() { "project" } else { "global" },
+                "detected_via": via,
                 "counts": counts_json,
             })
         );
         return Ok(());
     }
 
-    match &project {
-        Some(p) => println!(
-            "project {} ({})",
+    match (&project, &detection) {
+        (Some(p), _) => println!(
+            "project {} ({})  [via: {}]",
             p.title.as_deref().unwrap_or("?"),
-            p.path.as_deref().unwrap_or("?")
+            p.path.as_deref().unwrap_or("?"),
+            via.unwrap_or("?")
         ),
-        None => println!("project (none — global scope)"),
+        (None, mimir_core::scope::Detection::NotFound { from }) => println!(
+            "project (none) — no git root or project marker found above {}; \
+             using global scope (touch .mimir here to make it a project)",
+            from.display()
+        ),
+        (None, _) => println!("project (none — global scope)"),
     }
     if counts.is_empty() {
         println!("store   empty");

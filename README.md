@@ -209,12 +209,17 @@ configured via JSON, the entry is simply:
 ```
 
 The project is detected from the directory the client launches the server
-in (override with the `MIMIR_PROJECT` env var). A project root is any
-directory holding a `.git`, `.hg`, `.svn`, or `.jj` — and for code that
-lives outside version control (a Windows drive, an unpacked archive, a
-config tree), `touch .mimir` at the root marks it as a project. And agents
-without MCP can just shell out — the CLI's default output is the same
-token-lean format the server returns.
+in (override with the `MIMIR_PROJECT` env var), walking up from there in
+order: (1) a VCS / explicit root — `.git`, `.hg`, `.svn`, `.jj`, or a
+`touch .mimir` marker; else (2) the nearest build file — `Cargo.toml`,
+`package.json`, `pyproject.toml`, `go.mod`, `go.work`, `deno.json`, or
+`pnpm-workspace.yaml`; else (3) global scope. Identity is the resolved root
+path, so the same folder always maps to the same project, git or not — no
+per-project init. Mimir never degrades silently: `mimir status` always shows
+the detected project and how it was found (`[via: Cargo.toml]`), or, when
+nothing matches, says so and points at `touch .mimir`. And agents without MCP
+can just shell out — the CLI's default output is the same token-lean format
+the server returns.
 
 `mimir init` also installs a set of `/m-*` slash commands for the agent
 CLIs it finds on the machine — Claude Code, Codex, OpenCode, Gemini CLI

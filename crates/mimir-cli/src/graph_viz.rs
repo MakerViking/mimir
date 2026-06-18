@@ -14,28 +14,14 @@ use serde_json::json;
 pub fn viz(out: Option<String>, open: bool, max_nodes: usize) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let proj = mimir.project_for_cwd(&std::env::current_dir()?)?.context(
-        "not inside a project. Mimir scopes the graph to a project root \
-             (a dir with .git/.hg/.svn/.jj). For code outside version control, \
-             run `touch .mimir` at the root to mark it, then retry.",
+        "not inside a project. Mimir scopes the graph to a project root — a VCS \
+             marker (.git/.hg/.svn/.jj), a build file (Cargo.toml/package.json/…), \
+             or `touch .mimir`.",
     )?;
 
-    // First run in a project: no symbols yet. Build the graph so /m-graph is
-    // one step — otherwise the viz renders empty and looks broken.
-    let symbol_count: i64 = mimir.conn.query_row(
-        "SELECT count(*) FROM node WHERE kind='symbol' AND project_id=?1 AND deleted_at IS NULL",
-        [proj.id],
-        |r| r.get(0),
-    )?;
-    if symbol_count == 0 {
-        if let Some(root) = proj.path.clone() {
-            eprintln!("building the code graph (first run for this project)…");
-            match mimir_graph::update(&mut mimir.conn, &proj, std::path::Path::new(&root)) {
-                Ok(s) => eprintln!("  {} symbols, {} call edges", s.symbols, s.calls_resolved),
-                Err(e) => eprintln!("  graph build skipped: {e}"),
-            }
-            let _ = mimir.embed_pending();
-        }
-    }
+    // First run in a project: build the graph so /m-graph is one step —
+    // otherwise the viz renders empty and looks broken.
+    crate::graph_cmd::ensure_graph(&mut mimir, &proj)?;
 
     let html = render(
         &mimir,
