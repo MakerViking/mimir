@@ -3,6 +3,21 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [0.10.0] — 2026-06-18
+### Added
+- **Project-scoped sync** — a project's memories can now replicate across
+  machines, not just global memories. Opt in with `mimir project init --sync`,
+  which writes a committed `.mimir` marker (a stable `id` + `sync = true`). The
+  project's **portable key** — the `.mimir` `id`, else the normalized git
+  `origin` remote (read from `.git/config`, no subprocess) — identifies it the
+  same way on every checkout, so project memories converge by key instead of by
+  absolute path. Pulled memories attach to a path-less *shadow* project that's
+  adopted onto the local path when the project is first opened. Only memories
+  sync — the code graph, indexed docs, and embeddings stay per-checkout. Opt-in
+  per project; unmarked projects stay local. Schema migration **v6**.
+- **`mimir project init [--sync]`** — write/refresh the `.mimir` identity marker
+  (generates a stable ULID id; `--sync` opts the project's memories into sync).
+
 ## [0.9.1] — 2026-06-18
 ### Added
 - **`mimir sync token`** — prints the active sync token (the `MIMIR_SYNC_TOKEN`
