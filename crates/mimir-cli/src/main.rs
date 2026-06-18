@@ -322,6 +322,9 @@ enum SyncCmd {
     Pull,
     /// Show sync configuration and pending changes.
     Status,
+    /// Print the active sync token (env var, else the hub's persisted token) so
+    /// it can be copied to a client. Token goes to stdout; provenance to stderr.
+    Token,
 }
 
 #[derive(Subcommand)]
@@ -572,6 +575,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             Some(SyncCmd::Push) => sync::push(),
             Some(SyncCmd::Pull) => sync::pull(),
             Some(SyncCmd::Status) => sync::status(),
+            Some(SyncCmd::Token) => sync::token(),
         },
         Command::Serve { bind } => sync::serve(bind),
         Command::Graph { cmd } => match cmd {

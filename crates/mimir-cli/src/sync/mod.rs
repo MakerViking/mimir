@@ -151,6 +151,31 @@ pub fn serve(bind: String) -> Result<()> {
     server::serve(&bind)
 }
 
+/// Print the active sync token so it can be copied to a client: the
+/// `MIMIR_SYNC_TOKEN` env var if set, else the hub's persisted token (server
+/// mode). The token goes to stdout (scriptable, e.g. `mimir sync token`); the
+/// provenance note goes to stderr.
+pub fn token() -> Result<()> {
+    if let Some(t) = std::env::var("MIMIR_SYNC_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+    {
+        println!("{t}");
+        eprintln!("(from MIMIR_SYNC_TOKEN in the environment)");
+        return Ok(());
+    }
+    let m = Mimir::open()?;
+    if let Some(t) = replicate::get_str_meta(&m.conn, "server_token")? {
+        println!("{t}");
+        eprintln!("(this hub's persisted token — set MIMIR_SYNC_TOKEN to override)");
+        return Ok(());
+    }
+    bail!(
+        "no sync token found — set MIMIR_SYNC_TOKEN, or start the hub once \
+         (`mimir serve`) to generate and persist one"
+    );
+}
+
 // ---- helpers ----
 
 fn file_dir(m: &Mimir) -> Result<std::path::PathBuf> {

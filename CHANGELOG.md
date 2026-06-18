@@ -3,6 +3,20 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [0.9.1] — 2026-06-18
+### Added
+- **`mimir sync token`** — prints the active sync token (the `MIMIR_SYNC_TOKEN`
+  env var, else the hub's persisted token) to stdout so it can be copied to a
+  client, e.g. `docker exec mimir-hub mimir sync token`. No more digging through
+  `docker logs` or SQLite to recover an auto-generated token.
+### Docs
+- README gained a **Token savings** section (outline/peek, `mimir run` output
+  filters + the non-lossy content-command cap, the optional API proxy).
+- `docs/sync.md`: documents where the auto-generated token is printed and how to
+  retrieve it, a concrete client MCP-server env snippet, and hosting/platform
+  notes (Intel Mac / older Linux / WSL2 → `cargo install`; don't host the hub in
+  WSL2; attach a persistent volume for cloud-container hubs).
+
 ## [0.9.0] — 2026-06-18
 ### Added
 - **Zero-init project detection** — non-git project directories are detected via
