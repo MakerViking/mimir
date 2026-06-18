@@ -236,14 +236,27 @@ impl Mimir {
         Ok(n)
     }
 
-    /// Resolve (and lazily register) the project for a working directory.
-    /// Returns None outside any project root (see `scope::ROOT_MARKERS`).
-    pub fn project_for_cwd(&self, cwd: &Path) -> Result<Option<Node>> {
-        let Some(root) = scope::find_project_root(cwd) else {
-            return Ok(None);
+    /// Resolve (and lazily register) the project for a working directory, plus
+    /// *how* it was detected. `Found` ⇒ the project node is ensured (created on
+    /// first contact); `NotFound` ⇒ global scope, which the caller explains
+    /// rather than degrading silently.
+    pub fn detect_project(&self, cwd: &Path) -> Result<(Option<Node>, scope::Detection)> {
+        let detection = scope::detect(cwd);
+        let node = match &detection {
+            scope::Detection::Found { root, .. } => {
+                let canonical = scope::canonical_root(root);
+                let name = scope::project_name(root);
+                Some(store::ensure_project(&self.conn, &canonical, &name)?)
+            }
+            scope::Detection::NotFound { .. } => None,
         };
-        let canonical = scope::canonical_root(&root);
-        let name = scope::project_name(&root);
-        store::ensure_project(&self.conn, &canonical, &name).map(Some)
+        Ok((node, detection))
+    }
+
+    /// Project node for a working directory, or None outside any project.
+    /// Thin wrapper over [`Mimir::detect_project`] for callers that don't need
+    /// the detection reason.
+    pub fn project_for_cwd(&self, cwd: &Path) -> Result<Option<Node>> {
+        Ok(self.detect_project(cwd)?.0)
     }
 }

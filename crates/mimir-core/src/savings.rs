@@ -1,7 +1,7 @@
 //! Token-savings ledger: append-only record of every context-shrinking
 //! operation, plus the aggregations the dashboard/report render.
 //!
-//! A "source" is one of: `outline`, `peek`, `filter`, `proxy_cache`,
+//! A "source" is one of: `outline`, `peek`, `filter`, `cap`, `proxy_cache`,
 //! `proxy_prune`. `saved = before - after` (cache savings are billed-token
 //! reductions; the rest are tokens the agent never had to read).
 
@@ -17,6 +17,9 @@ pub mod source {
     pub const OUTLINE: &str = "outline";
     pub const PEEK: &str = "peek";
     pub const FILTER: &str = "filter";
+    /// Non-lossy volume cap on high-volume content commands (coreutils/kubectl),
+    /// kept distinct from `filter` (per-line noise dropping) in the ledger.
+    pub const CAP: &str = "cap";
     pub const PROXY_CACHE: &str = "proxy_cache";
     pub const PROXY_DEDUP: &str = "proxy_dedup";
     pub const PROXY_PRUNE: &str = "proxy_prune";

@@ -7,6 +7,10 @@ tools via fake binaries on `PATH`, so each tool sees **identical input** and
 dispatches its own real handler. `cargo`/`git` fixtures are real output from
 this machine; `npm`/`pytest`/`docker` are realistic synthetic fixtures.
 
+> **Note:** RTK has since been **retired and uninstalled** — Mimir replaced it.
+> The RTK columns below are **historical** (measured at v0.8.0 while both were
+> installed); Mimir's columns, §1b, §2 and §3 are current and re-runnable.
+
 ## 1. Command-output filtering — RTK vs Mimir (identical input)
 
 | command | raw tok | RTK tok | RTK saved | Mimir tok | Mimir saved |
@@ -19,6 +23,21 @@ this machine; `npm`/`pytest`/`docker` are realistic synthetic fixtures.
 
 Where Mimir has a handler it matches or beats RTK. `git clone` and `docker`:
 RTK leaves them untouched here; Mimir's rules collapse the progress noise.
+
+## 1b. Content commands — non-lossy volume cap (coreutils/kubectl)
+
+The coreutils and `kubectl` get the **volume cap**, not the per-line noise
+filter. It only triggers on runaway output (smaller output passes through
+verbatim) and keeps head + tail + every signal line — nothing is silently
+dropped, unlike RTK's lossy line compression.
+
+| command | raw tok | Mimir tok | saved |
+|---|---:|---:|---:|
+| `find` (2000 lines) | 21001 | 1271 | **94%** |
+| `grep` (1500 lines) | 25503 | 2112 | **92%** |
+
+Cap savings are recorded under a distinct ledger source (`cap`), separate from
+the `filter` (per-line noise) source, so `mimir savings` attributes them apart.
 
 ## 2. `mimir outline` vs reading whole files (no RTK equivalent)
 
@@ -44,25 +63,34 @@ This is the single biggest lever and RTK has nothing like it.
 
 ## 4. Coverage breadth — which commands each tool wraps
 
-After expanding the handler set, RTK wraps **18 / 24** sampled commands and
-Mimir wraps **15 / 24**: cargo, git (status/clone/fetch/pull/push), npm, pnpm,
-yarn, bun, pytest, go, make, docker, podman, pip, the JS toolchain
-(jest/vitest/eslint/tsc/next), and terraform/tofu.
+Mimir wraps every command RTK does, in **two modes**:
 
-The only RTK-exclusive commands left are **`kubectl` and the coreutils**
-(`ls`/`grep`/`rg`/`find`/`ps`/`df`). Mimir deliberately does **not** filter
-those: their output *is* the signal you asked for, and compressing it is lossy.
-Dropping RTK means those commands return their full output — correct behavior,
-just not compressed.
+- **Noise handlers** (declarative per-program rules) drop progress/boilerplate
+  for the build/test/package/infra tools: cargo, git (status/clone/fetch/pull/
+  push), npm, pnpm, yarn, bun, pytest, go, make, docker, podman, pip, the JS
+  toolchain (jest/vitest/eslint/tsc/next), and terraform/tofu.
+- **A non-lossy volume cap** covers the high-volume "content" commands whose
+  output *is* the signal — the coreutils and `kubectl` (`cat`/`head`/`tail`/
+  `ls`/`find`/`grep`/`rg`/`ps`/`df`/`du`/`tree`/`kubectl`). These are **never
+  line-dropped** (that would lose a matched or listed line); output under the
+  cap passes through verbatim, and only runaway output is bounded to head +
+  tail + every signal line, with the bulky middle elided behind a visible
+  marker. `tail -f`/`journalctl -f` are left alone so the wrapper can't hang.
+
+This closes RTK's old coreutils gap **without** RTK's lossy compression: where
+RTK silently shrank `grep`/`ls` output, Mimir returns it intact unless it's
+huge, then caps it transparently.
+
+On the 24-command sample, Mimir now wraps **22 / 24** — the only misses are
+`gradle` and `mvn` (no handler yet). (RTK's historical figure was 18 / 24.)
 
 ## Verdict: RTK can be retired for the dev workflow
 
 The token-saving mechanism works, and across every noisy build/test/package/
-infra command Mimir now **matches or beats RTK**. On top of that, Mimir's
-outline (88%), peek (~90%), and the proxy are wins RTK never offered. The
-remaining RTK-only commands are coreutils where filtering is lossy by nature.
+infra command Mimir **matches or beats RTK**. The coreutils + `kubectl` that
+were once RTK-exclusive are now covered too — **non-lossily**, via the volume
+cap rather than RTK's lossy line compression. On top of that, Mimir's outline
+(88%), peek (~90%), and the proxy are wins RTK never offered.
 
 **Recommendation:** switch the PreToolUse hook to Mimir (`mimir init --hooks`,
-then remove the RTK hook). You lose only RTK's lossy compression of
-`ls`/`grep`/`find`/`ps`/`df`/`kubectl` output — which is arguably content you
-wanted to see in full anyway.
+then remove the RTK hook). Nothing about RTK's coverage is lost.

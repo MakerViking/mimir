@@ -10,10 +10,35 @@ use mimir_graph::{resolve_symbol, symbol_line, CodeGraph};
 /// Current project or a clear error (the graph is per-project by nature).
 fn project(mimir: &Mimir) -> Result<Node> {
     mimir.project_for_cwd(&std::env::current_dir()?)?.context(
-        "not inside a project. The code graph needs a project root \
-             (.git/.hg/.svn/.jj); for code outside version control, \
-             `touch .mimir` at the root to mark it.",
+        "not inside a project. The code graph needs a project root — a dir with \
+             a VCS marker (.git/.hg/.svn/.jj) or a build file (Cargo.toml/\
+             package.json/pyproject.toml/go.mod/…); otherwise `touch .mimir` to \
+             mark one.",
     )
+}
+
+/// Build the code graph on first use so queries "just work" in a freshly
+/// detected project — no manual `graph build`. No-op once symbols exist.
+/// Shared with `graph viz`.
+pub(crate) fn ensure_graph(mimir: &mut Mimir, proj: &Node) -> Result<()> {
+    let symbols: i64 = mimir.conn.query_row(
+        "SELECT count(*) FROM node WHERE kind='symbol' AND project_id=?1 AND deleted_at IS NULL",
+        [proj.id],
+        |r| r.get(0),
+    )?;
+    if symbols > 0 {
+        return Ok(());
+    }
+    let Some(root) = proj.path.clone() else {
+        return Ok(());
+    };
+    eprintln!("building the code graph (first run for this project)…");
+    match mimir_graph::update(&mut mimir.conn, proj, std::path::Path::new(&root)) {
+        Ok(s) => eprintln!("  {} symbols, {} call edges", s.symbols, s.calls_resolved),
+        Err(e) => eprintln!("  graph build skipped: {e}"),
+    }
+    let _ = mimir.embed_pending();
+    Ok(())
 }
 
 pub fn build() -> Result<()> {
@@ -51,8 +76,9 @@ pub fn calls(reference: &str, depth: usize) -> Result<()> {
 }
 
 fn walk_relation(reference: &str, depth: usize, reverse: bool) -> Result<()> {
-    let mimir = Mimir::open()?;
+    let mut mimir = Mimir::open()?;
     let proj = project(&mimir)?;
+    ensure_graph(&mut mimir, &proj)?;
     let sym = resolve_symbol(&mimir.conn, proj.id, reference)?;
     let graph = CodeGraph::load(&mimir.conn, proj.id)?;
     let reached = if reverse {
@@ -74,8 +100,9 @@ fn walk_relation(reference: &str, depth: usize, reverse: bool) -> Result<()> {
 
 /// Blast radius of changing the given files (e.g. `$(git diff --name-only)`).
 pub fn impact(files: Vec<String>, depth: usize) -> Result<()> {
-    let mimir = Mimir::open()?;
+    let mut mimir = Mimir::open()?;
     let proj = project(&mimir)?;
+    ensure_graph(&mut mimir, &proj)?;
     let graph = CodeGraph::load(&mimir.conn, proj.id)?;
 
     let mut seeds: Vec<i64> = Vec::new();
@@ -108,8 +135,9 @@ pub fn impact(files: Vec<String>, depth: usize) -> Result<()> {
 
 /// Full record for a symbol: signature/doc, edges, linked memories.
 pub fn node_info(reference: &str) -> Result<()> {
-    let mimir = Mimir::open()?;
+    let mut mimir = Mimir::open()?;
     let proj = project(&mimir)?;
+    ensure_graph(&mut mimir, &proj)?;
     let sym = resolve_symbol(&mimir.conn, proj.id, reference)?;
     println!("{}", symbol_line(&sym));
     if let Some(body) = &sym.body {
@@ -139,8 +167,9 @@ pub fn node_info(reference: &str) -> Result<()> {
 }
 
 pub fn path(a: &str, b: &str) -> Result<()> {
-    let mimir = Mimir::open()?;
+    let mut mimir = Mimir::open()?;
     let proj = project(&mimir)?;
+    ensure_graph(&mut mimir, &proj)?;
     let sa = resolve_symbol(&mimir.conn, proj.id, a)?;
     let sb = resolve_symbol(&mimir.conn, proj.id, b)?;
     let graph = CodeGraph::load(&mimir.conn, proj.id)?;
@@ -161,8 +190,9 @@ pub fn path(a: &str, b: &str) -> Result<()> {
 }
 
 pub fn hubs(limit: usize) -> Result<()> {
-    let mimir = Mimir::open()?;
+    let mut mimir = Mimir::open()?;
     let proj = project(&mimir)?;
+    ensure_graph(&mut mimir, &proj)?;
     let graph = CodeGraph::load(&mimir.conn, proj.id)?;
     let hubs = graph.hubs(limit);
     if hubs.is_empty() {
@@ -179,8 +209,9 @@ pub fn hubs(limit: usize) -> Result<()> {
 /// Label-propagation communities with heuristic names; --persist stores
 /// them as community nodes with member_of edges.
 pub fn communities(persist: bool, min_size: usize) -> Result<()> {
-    let mimir = Mimir::open()?;
+    let mut mimir = Mimir::open()?;
     let proj = project(&mimir)?;
+    ensure_graph(&mut mimir, &proj)?;
     let graph = CodeGraph::load(&mimir.conn, proj.id)?;
     let groups = graph.communities(min_size);
     if groups.is_empty() {

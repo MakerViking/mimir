@@ -3,6 +3,27 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [0.9.0] — 2026-06-18
+### Added
+- **Zero-init project detection** — non-git project directories are detected via
+  build-file markers (`Cargo.toml`/`package.json`/`pyproject.toml`/`go.mod`/
+  `go.work`/`deno.json[c]`/`pnpm-workspace.yaml`) instead of silently falling
+  back to global scope. Detection is never silent: `mimir status` shows
+  `[via: Cargo.toml]` / `[via: git]` or an explained global line plus a
+  `touch .mimir` hint (text + JSON `scope`/`detected_via`); the MCP `status`
+  tool and startup log carry the reason. CLI graph queries lazily build the
+  graph on first use.
+- **Content-command volume cap** — high-volume coreutils/search/`kubectl`
+  (`cat`/`head`/`tail`/`ls`/`find`/`grep`/`rg`/`ps`/`df`/`du`/`tree`/`kubectl`)
+  are now wrapped by `mimir run` and bounded with a **non-lossy** volume cap
+  (head + tail + every signal line; the bulky middle elided behind a visible
+  marker — never per-line dropped). `tail -f`/`journalctl -f` pass through so
+  the wrapper can't hang. Savings record under a distinct `cap` ledger source.
+### Fixed
+- **Sync hub Docker build** — build on Debian trixie (glibc 2.41); the prebuilt
+  ONNX Runtime pulled in by `fastembed`/`ort` links against glibc ≥ 2.38
+  (`__isoc23_strtoll`) and failed to link on bookworm.
+
 ## [0.8.0] — 2026-06-16
 ### Added
 - **Token-savings system** — Mimir now measures and reduces token spend, with a

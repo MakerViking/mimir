@@ -544,12 +544,29 @@ impl MimirServer {
         let project_id = self.project_id;
         self.blocking(move |m| {
             let counts = store::count_by_kind(&m.conn).map_err(engine_err)?;
+            // Read-only detection just for the "[via: …]" reason (no DB write).
+            let detection = server_cwd().map(|d| mimir_core::scope::detect(&d));
             let project = match project_id {
-                Some(id) => store::get_node(&m.conn, id)
-                    .ok()
-                    .and_then(|p| p.title)
-                    .unwrap_or_else(|| "?".into()),
-                None => "(none — global scope)".into(),
+                Some(id) => {
+                    let name = store::get_node(&m.conn, id)
+                        .ok()
+                        .and_then(|p| p.title)
+                        .unwrap_or_else(|| "?".into());
+                    let via = match &detection {
+                        Some(mimir_core::scope::Detection::Found { via, .. }) => {
+                            mimir_core::scope::via_label(via)
+                        }
+                        _ => "?",
+                    };
+                    format!("{name}  [via: {via}]")
+                }
+                None => match &detection {
+                    Some(mimir_core::scope::Detection::NotFound { from }) => format!(
+                        "(none) — no marker above {}; using global scope",
+                        from.display()
+                    ),
+                    _ => "(none — global scope)".into(),
+                },
             };
             let db_size = std::fs::metadata(&m.paths.db_file)
                 .map(|md| md.len())
@@ -580,22 +597,41 @@ impl ServerHandler for MimirServer {
     }
 }
 
+/// Where the server scopes to: `MIMIR_PROJECT` env beats the launch cwd.
+fn server_cwd() -> Option<std::path::PathBuf> {
+    std::env::var_os("MIMIR_PROJECT")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::current_dir().ok())
+}
+
 /// Entry point for `mimir mcp` (blocking; owns the tokio runtime).
 pub fn run() -> Result<()> {
     let engine = Mimir::open()?;
-    // Project scope: MIMIR_PROJECT env beats the server's cwd.
-    let cwd = std::env::var_os("MIMIR_PROJECT")
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::current_dir().ok());
-    let project_id = cwd.and_then(|d| match engine.project_for_cwd(&d) {
-        Ok(proj) => proj.map(|p| p.id),
-        Err(err) => {
-            // Without this the whole session silently degrades to global
-            // scope — wrong-scoped memories are corruption nobody notices.
-            tracing::warn!(%err, "project detection failed; serving GLOBAL scope only");
-            None
-        }
-    });
+    let project_id = match server_cwd() {
+        Some(d) => match engine.detect_project(&d) {
+            Ok((node, detection)) => {
+                // Never degrade silently: always log how scope was resolved.
+                match &detection {
+                    mimir_core::scope::Detection::Found { root, via } => tracing::info!(
+                        project = %root.display(),
+                        via = mimir_core::scope::via_label(via),
+                        "scoped to project"
+                    ),
+                    mimir_core::scope::Detection::NotFound { from } => tracing::info!(
+                        from = %from.display(),
+                        "no project marker found; serving GLOBAL scope"
+                    ),
+                }
+                node.map(|p| p.id)
+            }
+            Err(err) => {
+                // Wrong-scoped memories are corruption nobody notices.
+                tracing::warn!(%err, "project detection failed; serving GLOBAL scope only");
+                None
+            }
+        },
+        None => None,
+    };
 
     // Auto-sync the project on session start: first contact builds the code
     // graph and indexes the repo's markdown; every later start is an

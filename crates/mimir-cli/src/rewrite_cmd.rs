@@ -24,6 +24,22 @@ fn has_shell_operators(cmd: &str) -> bool {
     })
 }
 
+/// True for a command that streams until killed (`tail -f`, `journalctl -f`).
+/// `mimir run` waits for the child to exit, so wrapping these would hang the
+/// agent forever — pass them through untouched. Scoped to the follow-capable
+/// programs so unrelated `-f` flags (e.g. `grep -f patterns`) are unaffected.
+fn is_follow(base: &str, rest: &[&str]) -> bool {
+    if !matches!(base, "tail" | "journalctl") {
+        return false;
+    }
+    rest.iter().any(|a| {
+        *a == "--retry"
+            || a.starts_with("--follow")
+            // any short-flag bundle containing f/F: `-f`, `-F`, `-fn`, `-Fq`, …
+            || (a.starts_with('-') && !a.starts_with("--") && a.contains(['f', 'F']))
+    })
+}
+
 /// Returns the rewritten command if `cmd` should be wrapped, else None.
 pub fn rewritten(cmd: &str) -> Option<String> {
     let trimmed = cmd.trim();
@@ -35,12 +51,18 @@ pub fn rewritten(cmd: &str) -> Option<String> {
     if base == "mimir" {
         return None; // already ours
     }
+    let rest: Vec<&str> = parts.collect();
+    // Never wrap a follow/stream — it would hang waiting for an exit that never
+    // comes.
+    if is_follow(base, &rest) {
+        return None;
+    }
     // git wraps only its noisy subcommands; everything else with a dedicated
-    // filter is wrapped wholesale (single source of truth: `is_filterable`).
+    // filter or content cap is wrapped wholesale (single source of truth:
+    // `is_filterable`).
     let eligible = if base == "git" {
-        parts
-            .next()
-            .is_some_and(|sub| GIT_NOISY_SUBCMDS.contains(&sub))
+        rest.first()
+            .is_some_and(|sub| GIT_NOISY_SUBCMDS.contains(sub))
     } else {
         is_filterable(base)
     };
@@ -103,8 +125,41 @@ mod tests {
         assert!(rewritten("cargo build | grep error").is_none());
         assert!(rewritten("cargo build && cargo test").is_none());
         assert!(rewritten("mimir run -- cargo build").is_none());
-        assert!(rewritten("ls -la").is_none());
+        assert!(rewritten("echo hello").is_none()); // not filterable, not content
         assert!(rewritten("").is_none());
+    }
+
+    #[test]
+    fn wraps_content_commands() {
+        for cmd in [
+            "cat README.md",
+            "grep -rn foo src",
+            "rg pattern",
+            "find . -name '*.rs'",
+            "ls -la",
+            "df -h",
+            "du -sh .",
+            "kubectl get pods",
+        ] {
+            assert!(rewritten(cmd).is_some(), "should wrap: {cmd}");
+        }
+    }
+
+    #[test]
+    fn does_not_wrap_follow_streams() {
+        // `mimir run` waits for exit; a follow would hang forever.
+        assert!(rewritten("tail -f /var/log/syslog").is_none());
+        assert!(rewritten("tail -F app.log").is_none());
+        assert!(rewritten("tail --follow=name x").is_none());
+        assert!(rewritten("journalctl -f").is_none());
+    }
+
+    #[test]
+    fn wraps_non_follow_tail_and_unrelated_dash_f() {
+        // a bounded tail is fine to cap …
+        assert!(rewritten("tail -n 5000 big.log").is_some());
+        // … and `-f` on a non-follow program (grep pattern file) is not a follow.
+        assert!(rewritten("grep -f patterns.txt data.txt").is_some());
     }
 
     #[test]

@@ -38,7 +38,8 @@ fn find_rules(conn: &Connection, project_id: i64) -> Result<Option<Node>> {
 fn project(mimir: &Mimir) -> Result<Node> {
     mimir.project_for_cwd(&std::env::current_dir()?)?.context(
         "not inside a project. The rules pack is per-project; it needs a \
-             project root (.git/.hg/.svn/.jj), or `touch .mimir` to mark one.",
+             project root — a VCS marker (.git/.hg/.svn/.jj), a build file \
+             (Cargo.toml/package.json/pyproject.toml/go.mod/…), or `touch .mimir`.",
     )
 }
 

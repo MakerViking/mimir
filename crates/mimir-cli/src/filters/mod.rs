@@ -9,7 +9,7 @@
 
 mod rules;
 
-pub(crate) use rules::is_filterable;
+pub(crate) use rules::{is_content, is_filterable};
 use rules::{is_signal, verdict, Verdict};
 
 /// Above this many kept lines, the generic volume cap kicks in.
@@ -27,6 +27,14 @@ pub fn filter_output(program: &str, raw: &str) -> String {
     let cleaned = strip_ansi(raw);
     let base = base_program(program);
 
+    // Content commands (coreutils/search/listings/kubectl): their output *is*
+    // the signal you asked for, so we never drop individual lines — only bound
+    // runaway volume. Non-lossy by construction (head + tail + signal kept).
+    if is_content(base) {
+        let lines: Vec<&str> = cleaned.lines().collect();
+        return volume_cap(&lines);
+    }
+
     // Pass 1: drop per-program noise + collapse blank runs.
     let mut kept: Vec<&str> = Vec::new();
     let mut prev_blank = false;
@@ -42,16 +50,21 @@ pub fn filter_output(program: &str, raw: &str) -> String {
         prev_blank = blank;
     }
 
-    if kept.len() <= VOLUME_CAP {
-        return join_lines(&kept);
+    // Pass 2: any command can still dump thousands of lines — bound the volume.
+    volume_cap(&kept)
+}
+
+/// Bound runaway output: under [`VOLUME_CAP`] lines, return them unchanged;
+/// otherwise keep the head, the tail, and every signal line in between, eliding
+/// the rest with a visible count so nothing important vanishes silently.
+fn volume_cap(lines: &[&str]) -> String {
+    if lines.len() <= VOLUME_CAP {
+        return join_lines(lines);
     }
-    // Pass 2 (volume cap): any command can still dump thousands of lines. Keep
-    // the head, the tail, and every signal line in between; elide the rest with
-    // a visible count so nothing important vanishes silently.
-    let n = kept.len();
+    let n = lines.len();
     let mut out = String::new();
     let mut elided = 0usize;
-    for (i, line) in kept.iter().enumerate() {
+    for (i, line) in lines.iter().enumerate() {
         if i < VOLUME_EDGE || i >= n - VOLUME_EDGE || is_signal(line) {
             if elided > 0 {
                 out.push_str(&format!("[… {elided} lines elided by mimir …]\n"));
@@ -204,5 +217,30 @@ mod tests {
         assert!(out.contains("error: buried in the middle"), "signal kept");
         assert!(out.contains("elided by mimir"), "middle elided with marker");
         assert!(out.lines().count() < 300, "much smaller than 1100 lines");
+    }
+
+    #[test]
+    fn content_command_is_non_lossy_on_small_output() {
+        // Lines that the cargo/pip rules WOULD drop must survive for `cat`:
+        // content commands never run the per-line noise verdict.
+        let raw = "Compiling foo\nDownloading bar\nhello world\n\n\nkeep me\n";
+        let out = filter_output("cat", raw);
+        assert!(out.contains("Compiling foo"), "{out}");
+        assert!(out.contains("Downloading bar"), "{out}");
+        assert!(out.contains("hello world"), "{out}");
+        assert!(out.contains("keep me"), "{out}");
+    }
+
+    #[test]
+    fn content_command_caps_runaway_output() {
+        let mut raw = String::new();
+        for i in 0..2000 {
+            raw.push_str(&format!("match {i}\n"));
+        }
+        let out = filter_output("grep", &raw);
+        assert!(out.contains("match 0"), "head kept");
+        assert!(out.contains("match 1999"), "tail kept");
+        assert!(out.contains("elided by mimir"), "middle elided");
+        assert!(out.lines().count() < 300, "bounded well under 2000");
     }
 }

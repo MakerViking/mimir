@@ -105,6 +105,41 @@ for name in cargo git npm pytest docker; do
 done
 
 # ---------------------------------------------------------------------------
+# 1b. Content commands — non-lossy volume cap (coreutils/kubectl)
+# ---------------------------------------------------------------------------
+# Large fixtures so the cap triggers (it only bounds RUNAWAY output; anything
+# under the cap passes through verbatim). Mimir keeps head + tail + every signal
+# line and elides the middle behind a visible marker — lossless in the sense
+# that no line is silently dropped, unlike RTK's compression.
+{ for i in $(seq 1 2000); do echo "./src/module_$((i%80))/file_$i.rs"; done; } > "$FX/find.txt"
+{ for i in $(seq 1 1500); do echo "src/x.rs:$i:    let value_$i = compute($i);"; done; } > "$FX/grep.txt"
+for name in find grep; do
+  cat > "$FAKE/$name" <<EOF
+#!/usr/bin/env bash
+cat "$FX/$name.txt"
+exit 0
+EOF
+  chmod +x "$FAKE/$name"
+done
+{
+echo
+echo "## 1b. Content commands — non-lossy volume cap (coreutils/kubectl)"
+echo
+printf '| command | raw tok | Mimir tok | saved |\n'
+printf '|---|---:|---:|---:|\n'
+} >> "$REPORT"
+declare -A CSUB=( [find]=". -type f" [grep]="-rn value src" )
+for name in find grep; do
+  sub=${CSUB[$name]}
+  lines=$(wc -l < "$FX/$name.txt")
+  raw=$(cat "$FX/$name.txt" | tok)
+  mim_out=$(PATH="$FAKE:$PATH" "$M" run -- $name $sub 2>&1); mim_t=$(printf '%s' "$mim_out" | tok)
+  printf '| %s (%s lines) | %s | %s | %s%% |\n' \
+    "$name" "$lines" "$raw" "$mim_t" "$(pct "$raw" "$mim_t")" >> "$REPORT"
+done
+echo "_The cap only triggers on runaway output; smaller output passes through verbatim. It is **non-lossy** (head + tail + every signal line kept, middle elided with a visible marker), unlike RTK's lossy line compression._" >> "$REPORT"
+
+# ---------------------------------------------------------------------------
 # 2. outline vs reading whole files (Mimir-only; RTK has no equivalent)
 # ---------------------------------------------------------------------------
 {

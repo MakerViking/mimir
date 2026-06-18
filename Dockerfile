@@ -6,12 +6,16 @@
 #   docker build -t mimir-hub .
 #   docker run -e MIMIR_SYNC_TOKEN=... -v mimir:/data -p 7777:7777 mimir-hub
 
-FROM rust:1-bookworm AS builder
+# trixie (glibc 2.41), not bookworm (2.36): the prebuilt ONNX Runtime that
+# `ort` (via `fastembed`) downloads is linked against glibc >=2.38 and
+# references __isoc23_strtoll, so it won't link on bookworm.
+FROM rust:1-trixie AS builder
 WORKDIR /src
 COPY . .
 RUN cargo build --release -p mimir-mem
 
-FROM debian:bookworm-slim
+# Runtime base must match the builder's glibc (>=2.38) for the static ORT code.
+FROM debian:trixie-slim
 RUN useradd -m -u 10001 mimir && mkdir -p /data && chown mimir /data
 COPY --from=builder /src/target/release/mimir /usr/local/bin/mimir
 USER mimir

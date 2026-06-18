@@ -366,7 +366,8 @@ pub fn peek(reference: &str, json: bool) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let proj = mimir.project_for_cwd(&cwd)?.context(
         "not inside a project. `peek` resolves symbols from the code graph, \
-         which is per-project (.git/.hg/.svn/.jj or `touch .mimir`).",
+         which is per-project (a VCS marker, a build file like Cargo.toml/\
+         package.json, or `touch .mimir`).",
     )?;
     let root = PathBuf::from(proj.path.as_deref().context("project has no root")?);
     let p = peek_symbol(&mimir.conn, proj.id, &root, reference)?;
