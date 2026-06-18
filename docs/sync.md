@@ -10,15 +10,44 @@ this code runs and the zero-telemetry promise is unchanged.
 
 - **Global memories** (the ones you store with `-g` / `global: true`) and the
   links between them.
+- **Project-scoped memories of opted-in projects** — see
+  [Project-scoped memories](#project-scoped-memories) below.
 - Each install stays authoritative over its own SQLite store; sync is
   uid-keyed **last-write-wins** (newest edit wins, deletes propagate), so it's
   convergent and safe to run from any machine in any order.
 
-**Not synced** (by design): project-scoped memories (paths differ per machine —
-planned for a later release), the code graph and indexed docs (they're tied to a
-specific checkout/folder on each machine), and your usage signals (strength,
-recall history). Embeddings aren't shipped either — each machine recomputes them
-locally, so there's nothing heavy on the wire.
+**Not synced** (by design): project memories of projects you haven't opted in,
+the code graph and indexed docs (they're tied to a specific checkout/folder on
+each machine), and your usage signals (strength, recall history). Embeddings
+aren't shipped either — each machine recomputes them locally, so there's nothing
+heavy on the wire.
+
+## Project-scoped memories
+
+By default only **global** memories sync, because a project's identity is its
+absolute path — which differs on every machine (`~/dev/app` here, `~/code/app`
+there). To sync a project's memories, give it a **portable key** that's the same
+on every checkout, and opt it in:
+
+```sh
+cd your-project
+mimir project init --sync     # writes .mimir with a stable id + sync = true
+git add .mimir && git commit  # so every clone shares the identity
+```
+
+`.mimir` is a tiny committed marker:
+
+```toml
+id   = "01JZ8X…"   # stable, machine-independent project id (the portable key)
+sync = true        # opt this project's memories into sync
+```
+
+The portable key is the committed `.mimir` `id` if present, else the normalized
+`origin` git remote (e.g. `git:github.com/you/app`), else nothing — in which
+case the project stays local. On another machine, pulled project memories attach
+to a **shadow** project keyed the same way; the first time you open that project
+locally, Mimir adopts the shadow onto your local path. Only memories travel — the
+code graph, indexed docs, and embeddings stay per-checkout.
 
 ## Pick a transport
 
@@ -153,5 +182,6 @@ enabled**. After turning sync on in `config.toml`, re-run `mimir init` to add it
 
 ## Scope & roadmap
 
-This is the MVP: global memories + their links. Planned next: project-scoped
-memories (mapped across machines), and optionally docs/code-graph sync.
+Synced today: global memories and their links, plus opted-in project memories
+(via a portable key). Optional future work: an `all-git` mode that keys every
+git project by its remote without a committed `.mimir`, and docs/code-graph sync.

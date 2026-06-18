@@ -164,6 +164,11 @@ pub fn sync_opt_in(root: &Path) -> bool {
     read_mimir_marker(root).map(|m| m.sync).unwrap_or(false)
 }
 
+/// A fresh, machine-independent project id (ULID) for a `.mimir` marker.
+pub fn new_id() -> String {
+    ulid::Ulid::new().to_string()
+}
+
 /// `git:<host>/<path>` from the `origin` remote in `.git/config`, read as a
 /// file (no git subprocess — matching the rest of scope detection). `None` if
 /// there's no repo or no origin remote.
