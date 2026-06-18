@@ -9,8 +9,8 @@
 
 mod rules;
 
-pub(crate) use rules::is_filterable;
-use rules::{is_content, is_signal, verdict, Verdict};
+pub(crate) use rules::{is_content, is_filterable};
+use rules::{is_signal, verdict, Verdict};
 
 /// Above this many kept lines, the generic volume cap kicks in.
 const VOLUME_CAP: usize = 400;

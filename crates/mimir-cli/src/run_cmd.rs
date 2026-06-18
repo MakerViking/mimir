@@ -51,6 +51,13 @@ pub fn run(raw: bool, cmd: Vec<String>) -> Result<()> {
         let before = tokens::count(&raw_out) + tokens::count(&raw_err);
         let after = tokens::count(&out_text) + tokens::count(&err_text);
         if before > after {
+            // Content commands (coreutils/kubectl) are volume-capped, not
+            // line-filtered — record them under a distinct ledger source.
+            let source = if filters::is_content(filters::base_program(&program)) {
+                savings::source::CAP
+            } else {
+                savings::source::FILTER
+            };
             // Best-effort ledger write; never let bookkeeping fail the command.
             if let Ok(mimir) = Mimir::open() {
                 let project_id = std::env::current_dir()
@@ -60,7 +67,7 @@ pub fn run(raw: bool, cmd: Vec<String>) -> Result<()> {
                 let _ = savings::record(
                     &mimir.conn,
                     project_id,
-                    savings::source::FILTER,
+                    source,
                     before,
                     after,
                     json!({ "cmd": program }),
