@@ -101,6 +101,11 @@ cargo install mimir-mem                 # the binary is named `mimir`
 cargo install --path crates/mimir-cli   # …or from a checkout
 ```
 
+Use the from-source path on **Intel Macs** (no prebuilt) and on **older Linux /
+WSL2** distros (the prebuilt Linux binary targets a recent glibc). WSL2 works
+fine as a sync *client*; see [docs/sync.md](docs/sync.md) for where to run the
+optional *hub*.
+
 That's the whole install. CPU-only by default, and it's plenty fast —
 the GPU build is an optional power-user step, tucked away below.
 
@@ -239,6 +244,25 @@ and Cursor (the `m-` prefix keeps them clear of your own commands):
 Only apps already present get them, and existing command files are never
 overwritten, so your edits survive upgrades (re-run `mimir init` any
 time; it's idempotent).
+
+## Token savings
+
+Mimir doubles as a token-saving layer for your agent — and it's **measured, not
+vibes**: `mimir savings` reports the tokens (and dollars) avoided, with a
+dashboard panel and a `/m-savings` command.
+
+- **`outline` / `peek`** — read a file's *shape* (signatures via tree-sitter,
+  plus markdown/JSON/YAML) or a single symbol's body instead of the whole file.
+  Typically **~88–95% fewer tokens** than a full read — the biggest single lever.
+- **`mimir run -- <cmd>`** — run a command and strip the noise: build/test/
+  package/infra progress chatter is dropped (errors and warnings are *always*
+  kept), and high-volume `cat`/`grep`/`find`/`ls`/`kubectl`/… output is
+  **volume-capped non-lossily** (head + tail + every signal line; the bulky
+  middle elided behind a visible marker). `mimir init --hooks` wires this in as
+  a PreToolUse hook so it happens automatically.
+- **Optional API proxy** (`mimir proxy`, off by default) — adds prompt-cache
+  breakpoints and lossless repeated-block dedup to Anthropic API traffic. See
+  [docs/proxy.md](docs/proxy.md) and [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Optional: centralized sync
 

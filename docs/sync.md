@@ -43,8 +43,14 @@ no ports, no token. Security is whatever your file-sync tool already provides.
 
 For central control, or if you don't use a file-sync tool, run a hub. The same
 `mimir` binary is the hub via `mimir serve`; it can live on anything that's
-always on — a NAS (Unraid/Synology/TrueNAS), a Raspberry Pi, a VPS, or any
+always on — a NAS (Unraid/Synology/TrueNAS/QNAP), a Raspberry Pi, a VPS, or any
 Docker host.
+
+> **Where *not* to host it:** inside **WSL2** — its NAT'd network isn't reachable
+> by other machines without `netsh portproxy` or mirrored-networking mode (WSL2
+> is fine as a *client*, though). On ephemeral cloud-container platforms
+> (Fly.io/Railway/Render), attach a **persistent volume** — the SQLite store
+> must survive restarts.
 
 **Run the hub with Docker (recommended):**
 
@@ -60,8 +66,10 @@ docker compose up -d        # listens on :7777, data in a named volume
 MIMIR_SYNC_TOKEN=$(openssl rand -hex 24) MIMIR_HOME=/srv/mimir mimir serve --bind 0.0.0.0:7777
 ```
 
-If you don't set `MIMIR_SYNC_TOKEN`, the hub generates one, prints it, and
-persists it (restarts reuse it).
+If you don't set `MIMIR_SYNC_TOKEN`, the hub generates one, prints it to its log
+(stderr → `docker logs mimir-hub`), and persists it (restarts reuse it).
+Retrieve it anytime with **`mimir sync token`** — e.g.
+`docker exec mimir-hub mimir sync token` prints just the token on stdout.
 
 **Point each client** at the hub — in `config.toml`:
 
@@ -72,13 +80,23 @@ endpoint = "http://your-host:7777"
 ```
 
 and put the **same token in the environment** (never in the config file, which
-is plaintext):
+is plaintext) — in **two** places:
 
 ```sh
-export MIMIR_SYNC_TOKEN=...   # in your shell profile, and the MCP server's env
+# 1. your shell profile, for manual `mimir sync`:
+export MIMIR_SYNC_TOKEN=<token>          # ~/.zshenv, ~/.bashrc, fish conf.d, …
 ```
 
-Then `mimir sync`.
+```jsonc
+// 2. the MCP server's env, so background auto-sync runs under your agent.
+//    Claude Code — ~/.claude.json (or a project .mcp.json):
+"mcpServers": {
+  "mimir": { "command": "mimir", "args": ["mcp"],
+             "env": { "MIMIR_SYNC_TOKEN": "<token>" } }
+}
+```
+
+Grab `<token>` from the hub with `mimir sync token`. Then `mimir sync`.
 
 #### Reaching the hub safely
 
@@ -98,6 +116,7 @@ mimir sync            # full sync (push + pull, or snapshot + merge in file mode
 mimir sync push       # send local changes only
 mimir sync pull       # fetch + merge remote changes only
 mimir sync status     # mode, endpoint/dir, pending changes, token presence
+mimir sync token      # print the active token (env, else the hub's persisted one)
 ```
 
 ### Background sync
