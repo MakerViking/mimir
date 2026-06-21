@@ -15,6 +15,8 @@ pub enum Lang {
     Java,
     Ruby,
     C,
+    CSharp,
+    Sql,
 }
 
 impl Lang {
@@ -29,6 +31,8 @@ impl Lang {
             "java" => Lang::Java,
             "rb" | "rake" => Lang::Ruby,
             "c" | "h" => Lang::C,
+            "cs" | "csx" => Lang::CSharp,
+            "sql" => Lang::Sql,
             _ => return None,
         })
     }
@@ -42,6 +46,8 @@ impl Lang {
             Lang::Java => "java",
             Lang::Ruby => "ruby",
             Lang::C => "c",
+            Lang::CSharp => "csharp",
+            Lang::Sql => "sql",
         }
     }
 
@@ -55,6 +61,8 @@ impl Lang {
             Lang::Java => tree_sitter_java::LANGUAGE.into(),
             Lang::Ruby => tree_sitter_ruby::LANGUAGE.into(),
             Lang::C => tree_sitter_c::LANGUAGE.into(),
+            Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Lang::Sql => tree_sitter_sequel_tsql::LANGUAGE.into(),
         }
     }
 
@@ -171,6 +179,40 @@ impl Lang {
                 "enum_specifier" => Some((text(node.child_by_field_name("name")?), "enum")),
                 _ => None,
             },
+            Lang::CSharp => match node.kind() {
+                // Both `namespace Foo { .. }` and file-scoped `namespace Foo;`
+                // — a scope that qualifies the types nested under it.
+                "namespace_declaration" | "file_scoped_namespace_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "namespace"))
+                }
+                "class_declaration" => Some((text(node.child_by_field_name("name")?), "class")),
+                "interface_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "interface"))
+                }
+                "struct_declaration" => Some((text(node.child_by_field_name("name")?), "struct")),
+                "enum_declaration" => Some((text(node.child_by_field_name("name")?), "enum")),
+                // Records are reference types by default; treat as a class.
+                "record_declaration" => Some((text(node.child_by_field_name("name")?), "class")),
+                "record_struct_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "struct"))
+                }
+                "method_declaration" => Some((text(node.child_by_field_name("name")?), "method")),
+                "property_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "property"))
+                }
+                // Constructor's name field is the enclosing type identifier.
+                "constructor_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "constructor"))
+                }
+                _ => None,
+            },
+            Lang::Sql => match node.kind() {
+                "create_table" => sql_def_name(node, src).map(|n| (n, "table")),
+                "create_view" => sql_def_name(node, src).map(|n| (n, "view")),
+                "create_function" => sql_def_name(node, src).map(|n| (n, "function")),
+                "create_procedure" => sql_def_name(node, src).map(|n| (n, "procedure")),
+                _ => None,
+            },
         }
     }
 
@@ -274,6 +316,34 @@ impl Lang {
                 let f = node.child_by_field_name("function")?;
                 match f.kind() {
                     "identifier" => Some(text(f)),
+                    _ => None,
+                }
+            }
+            Lang::CSharp => {
+                if node.kind() != "invocation_expression" {
+                    return None;
+                }
+                let f = node.child_by_field_name("function")?;
+                match f.kind() {
+                    "identifier" => Some(text(f)),
+                    // obj.Method() / Type.Method() — the rightmost name.
+                    "member_access_expression" => f.child_by_field_name("name").map(text),
+                    _ => None,
+                }
+            }
+            Lang::Sql => {
+                // SQL has no calls; reuse the call edge for table dependencies.
+                // A table reference is an `object_reference` sitting in a query
+                // relation (FROM/JOIN), a DELETE/UPDATE `from` target, or a
+                // column's `REFERENCES` (foreign key) clause. The enclosing
+                // CREATE … is the caller, so the edge is view/proc/table → table.
+                if node.kind() != "object_reference" {
+                    return None;
+                }
+                match node.parent()?.kind() {
+                    "relation" | "from" | "column_definition" => {
+                        Some(text(node.child_by_field_name("name").unwrap_or(node)))
+                    }
                     _ => None,
                 }
             }
@@ -460,9 +530,42 @@ impl Lang {
                     .to_string();
                 out.push(ImportRef { local, source });
             }
+            Lang::CSharp => {
+                // `using A.B;` / `using static A.B.C;` / `using X = A.B;` —
+                // bind the last namespace segment, or the alias when present.
+                if node.kind() != "using_directive" {
+                    return;
+                }
+                let mut cursor = node.walk();
+                let names: Vec<String> = node
+                    .children(&mut cursor)
+                    .filter(|c| {
+                        matches!(
+                            c.kind(),
+                            "identifier" | "qualified_name" | "alias_qualified_name"
+                        )
+                    })
+                    .map(text)
+                    .collect();
+                match names.as_slice() {
+                    // `using Alias = Some.Namespace;`
+                    [alias, source, ..] => out.push(ImportRef {
+                        local: alias.clone(),
+                        source: source.clone(),
+                    }),
+                    // `using Some.Namespace;` — local is the last segment.
+                    [source] => out.push(ImportRef {
+                        local: source.rsplit('.').next().unwrap_or(source).to_string(),
+                        source: source.clone(),
+                    }),
+                    [] => {}
+                }
+            }
             // Ruby's `require` is a method call, not an import node; calls
             // still resolve same-file (tier 1) and globally by name (tier 3).
             Lang::Ruby => {}
+            // SQL has no import construct.
+            Lang::Sql => {}
         }
     }
 
@@ -494,13 +597,27 @@ impl Lang {
             | Lang::Tsx
             | Lang::Java
             | Lang::C
-            | Lang::Ruby => {
+            | Lang::CSharp
+            | Lang::Ruby
+            | Lang::Sql => {
                 // Contiguous comment siblings directly above the node
                 // (a blank line breaks the chain; `//!` belongs to the
                 // module, not this item).
+                // SQL wraps each `CREATE …` in a `statement`, so the comment
+                // is a sibling of that wrapper — climb to it first.
+                let mut anchor = node;
+                if matches!(self, Lang::Sql) {
+                    while let Some(p) = anchor.parent() {
+                        if p.kind() == "statement" {
+                            anchor = p;
+                        } else {
+                            break;
+                        }
+                    }
+                }
                 let mut lines: Vec<String> = Vec::new();
-                let mut expect_row = node.start_position().row;
-                let mut prev = node.prev_sibling();
+                let mut expect_row = anchor.start_position().row;
+                let mut prev = anchor.prev_sibling();
                 while let Some(p) = prev {
                     if !p.kind().contains("comment")
                         || expect_row.saturating_sub(p.end_position().row) > 1
@@ -524,6 +641,7 @@ impl Lang {
                             .trim_start_matches("///")
                             .trim_start_matches("//!")
                             .trim_start_matches("//")
+                            .trim_start_matches("--") // SQL line comments
                             .trim_start_matches("/**")
                             .trim_start_matches("/*")
                             .trim_end_matches("*/")
@@ -542,6 +660,18 @@ impl Lang {
             }
         }
     }
+}
+
+/// SQL `CREATE TABLE`/`VIEW`/`FUNCTION`/`PROCEDURE` name: the first
+/// `object_reference` child; keep its bare `name` field (drops any schema
+/// qualifier so `dbo.users` and `users` resolve to the same bucket).
+fn sql_def_name(node: Node, src: &str) -> Option<String> {
+    let mut cursor = node.walk();
+    let obj = node
+        .children(&mut cursor)
+        .find(|c| c.kind() == "object_reference")?;
+    let name = obj.child_by_field_name("name").unwrap_or(obj);
+    Some(src[name.byte_range()].to_string())
 }
 
 /// `impl Foo`, `impl Foo<T>`, `impl Trait for Foo<T>` → "Foo".
@@ -584,8 +714,7 @@ fn c_declarator_name(node: Node, src: &str) -> Option<String> {
 }
 
 /// Go receiver `(s *Server)` → "Server".
-fn receiver_type(receiver: Node, src: &str) -> Option<String> {
-    let mut cursor = receiver.walk();
+fn receiver_type(receiver: Node, src: &str) -> Option<String> {    let mut cursor = receiver.walk();
     for child in receiver.children(&mut cursor) {
         if child.kind() == "parameter_declaration" {
             let ty = child.child_by_field_name("type")?;

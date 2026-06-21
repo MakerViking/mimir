@@ -297,4 +297,28 @@ mod tests {
             "helper",
         );
     }
+
+    #[test]
+    fn csharp_extraction() {
+        extracts(
+            "App.cs",
+            "namespace App {\n  class Worker {\n    void Run() { Help(); }\n    void Help() { }\n  }\n}\n",
+            &["Worker", "Run", "Help"],
+            "Run",
+            "Help",
+        );
+    }
+
+    #[test]
+    fn sql_extraction() {
+        // SQL has no calls; the dependency edge (view → table) rides the same
+        // resolver, so `active_orders` resolves as a "caller" of `orders`.
+        extracts(
+            "schema.sql",
+            "CREATE TABLE orders (id INT PRIMARY KEY);\nCREATE VIEW active_orders AS SELECT id FROM orders;\n",
+            &["orders", "active_orders"],
+            "active_orders",
+            "orders",
+        );
+    }
 }
