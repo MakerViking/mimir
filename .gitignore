@@ -7,3 +7,7 @@ handoff.md
 assets/launch-video.mp4
 .playwright-mcp/
 .DS_Store
+
+# Personal drafts (blog/marketing) — never shipped in the repo
+docs/medium-article.md
+docs/*-article.md
