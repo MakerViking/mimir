@@ -340,9 +340,142 @@ func (s *Server) Start() error { return listen(s.port) }
 
     #[test]
     fn broken_source_does_not_panic() {
-        for lang in [Lang::Rust, Lang::TypeScript, Lang::Python, Lang::Go] {
+        for lang in [
+            Lang::Rust,
+            Lang::TypeScript,
+            Lang::Python,
+            Lang::Go,
+            Lang::CSharp,
+            Lang::Sql,
+        ] {
             extract(lang, "fn class def func ((((");
             extract(lang, "");
         }
+    }
+
+    #[test]
+    fn csharp_extraction() {
+        let src = r#"
+using System;
+using Data = App.Models;
+
+namespace App
+{
+    // Greets users.
+    public class Greeter
+    {
+        public string Name { get; set; }
+
+        public Greeter(string name) { Name = name; }
+
+        public string Greet() { return Format(Name); }
+
+        private string Format(string n) { return n.ToUpper(); }
+    }
+
+    public interface IRunnable { void Run(); }
+
+    public struct Point { public int X; }
+
+    public record Person(string First, string Last);
+
+    public enum Mode { On, Off }
+}
+"#;
+        let fx = extract(Lang::CSharp, src);
+        let n = names(&fx);
+        assert!(n.contains(&("App", "namespace")), "{n:?}");
+        assert!(n.contains(&("App::Greeter", "class")), "{n:?}");
+        assert!(n.contains(&("App::Greeter::Greet", "method")), "{n:?}");
+        assert!(n.contains(&("App::Greeter::Format", "method")), "{n:?}");
+        assert!(n.contains(&("App::Greeter::Name", "property")), "{n:?}");
+        assert!(
+            n.contains(&("App::Greeter::Greeter", "constructor")),
+            "{n:?}"
+        );
+        assert!(n.contains(&("App::IRunnable", "interface")), "{n:?}");
+        assert!(n.contains(&("App::Point", "struct")), "{n:?}");
+        assert!(n.contains(&("App::Person", "class")), "{n:?}");
+        assert!(n.contains(&("App::Mode", "enum")), "{n:?}");
+
+        let greeter = fx
+            .symbols
+            .iter()
+            .find(|s| s.qualified == "App::Greeter")
+            .unwrap();
+        assert_eq!(greeter.doc.as_deref(), Some("Greets users."));
+
+        let calls: Vec<(&str, &str)> = fx
+            .calls
+            .iter()
+            .map(|c| (c.caller.as_str(), c.callee.as_str()))
+            .collect();
+        assert!(calls.contains(&("App::Greeter::Greet", "Format")), "{calls:?}");
+        assert!(
+            calls.contains(&("App::Greeter::Format", "ToUpper")),
+            "{calls:?}"
+        );
+
+        let imports: Vec<(&str, &str)> = fx
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i.source.as_str()))
+            .collect();
+        assert!(imports.contains(&("System", "System")), "{imports:?}");
+        assert!(imports.contains(&("Data", "App.Models")), "{imports:?}");
+    }
+
+    #[test]
+    fn sql_extraction() {
+        let src = r#"
+-- People who use the system.
+CREATE TABLE users (
+  id INT PRIMARY KEY,
+  name NVARCHAR(50)
+);
+
+CREATE TABLE orders (
+  id INT PRIMARY KEY,
+  user_id INT REFERENCES users(id)
+);
+
+CREATE VIEW active_orders AS
+  SELECT o.id FROM orders o JOIN users u ON o.user_id = u.id;
+
+CREATE FUNCTION order_count() RETURNS INT AS
+BEGIN
+  RETURN (SELECT COUNT(*) FROM orders);
+END;
+
+CREATE PROCEDURE purge AS
+BEGIN
+  DELETE FROM orders;
+END;
+"#;
+        let fx = extract(Lang::Sql, src);
+        let n = names(&fx);
+        assert!(n.contains(&("users", "table")), "{n:?}");
+        assert!(n.contains(&("orders", "table")), "{n:?}");
+        assert!(n.contains(&("active_orders", "view")), "{n:?}");
+        assert!(n.contains(&("order_count", "function")), "{n:?}");
+        assert!(n.contains(&("purge", "procedure")), "{n:?}");
+
+        let users = fx.symbols.iter().find(|s| s.qualified == "users").unwrap();
+        assert_eq!(users.doc.as_deref(), Some("People who use the system."));
+
+        // Dependency edges ride the call edge: dependent → table.
+        let calls: Vec<(&str, &str)> = fx
+            .calls
+            .iter()
+            .map(|c| (c.caller.as_str(), c.callee.as_str()))
+            .collect();
+        assert!(calls.contains(&("orders", "users")), "FK: {calls:?}");
+        assert!(calls.contains(&("active_orders", "orders")), "view: {calls:?}");
+        assert!(calls.contains(&("active_orders", "users")), "view: {calls:?}");
+        assert!(calls.contains(&("order_count", "orders")), "function: {calls:?}");
+        assert!(calls.contains(&("purge", "orders")), "procedure: {calls:?}");
+
+        // SQL has no import construct.
+        assert!(fx.imports.is_empty(), "{:?}", fx.imports);
     }
 }
