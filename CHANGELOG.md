@@ -3,6 +3,21 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [0.11.0] — 2026-06-22
+### Added
+- **C# and SQL in the code graph** — tree-sitter symbol extraction now covers
+  C# (`tree-sitter-c-sharp`) and SQL (`tree-sitter-sequel-tsql`, T-SQL). C#
+  contributes namespaces, classes, interfaces, structs, records, enums,
+  methods, properties and constructors, with call edges from method
+  invocations and import edges from `using` directives. SQL contributes
+  tables, views, functions and stored procedures; since SQL has no call graph,
+  the call edge is reused as a dependency edge (dependent → table) for foreign
+  keys, view `FROM`/`JOIN` references, and procedure/function body references.
+  Wiring a language is a single-gate change (file extension → `Lang`), so
+  `graph build`, `outline` and `peek` all pick the new languages up at once.
+  Supported code-graph languages are now Rust, TypeScript/JS, Python, Go,
+  Java, Ruby, C, C# and SQL.
+
 ## [0.10.0] — 2026-06-18
 ### Added
 - **Project-scoped sync** — a project's memories can now replicate across
