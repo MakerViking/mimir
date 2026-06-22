@@ -410,7 +410,10 @@ namespace App
             .iter()
             .map(|c| (c.caller.as_str(), c.callee.as_str()))
             .collect();
-        assert!(calls.contains(&("App::Greeter::Greet", "Format")), "{calls:?}");
+        assert!(
+            calls.contains(&("App::Greeter::Greet", "Format")),
+            "{calls:?}"
+        );
         assert!(
             calls.contains(&("App::Greeter::Format", "ToUpper")),
             "{calls:?}"
@@ -470,9 +473,18 @@ END;
             .map(|c| (c.caller.as_str(), c.callee.as_str()))
             .collect();
         assert!(calls.contains(&("orders", "users")), "FK: {calls:?}");
-        assert!(calls.contains(&("active_orders", "orders")), "view: {calls:?}");
-        assert!(calls.contains(&("active_orders", "users")), "view: {calls:?}");
-        assert!(calls.contains(&("order_count", "orders")), "function: {calls:?}");
+        assert!(
+            calls.contains(&("active_orders", "orders")),
+            "view: {calls:?}"
+        );
+        assert!(
+            calls.contains(&("active_orders", "users")),
+            "view: {calls:?}"
+        );
+        assert!(
+            calls.contains(&("order_count", "orders")),
+            "function: {calls:?}"
+        );
         assert!(calls.contains(&("purge", "orders")), "procedure: {calls:?}");
 
         // SQL has no import construct.

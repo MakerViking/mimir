@@ -714,7 +714,8 @@ fn c_declarator_name(node: Node, src: &str) -> Option<String> {
 }
 
 /// Go receiver `(s *Server)` → "Server".
-fn receiver_type(receiver: Node, src: &str) -> Option<String> {    let mut cursor = receiver.walk();
+fn receiver_type(receiver: Node, src: &str) -> Option<String> {
+    let mut cursor = receiver.walk();
     for child in receiver.children(&mut cursor) {
         if child.kind() == "parameter_declaration" {
             let ty = child.child_by_field_name("type")?;
