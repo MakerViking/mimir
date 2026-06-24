@@ -314,7 +314,11 @@ fn render(mimir: &Mimir) -> Result<String> {
     };
 
     // ---- token savings (outline/peek/filter/proxy) ----
-    let saved_all = mimir_core::savings::totals(conn, None)?;
+    // One scan covers day/week/month/all; `all` doubles as the grand totals.
+    let sv = mimir_core::savings::summary(conn, now)?;
+    let saved_all = &sv.all;
+    let price = mimir.config.savings.input_price_per_mtok;
+    let usd = |tok: i64| format!("${:.2}", mimir_core::savings::to_dollars(tok, price));
     let saved_by_source = mimir_core::savings::by_source(conn, None)?;
     let max_sv = saved_by_source
         .iter()
@@ -329,14 +333,64 @@ fn render(mimir: &Mimir) -> Result<String> {
             .iter()
             .map(|(src, t)| {
                 format!(
-                    r#"<div class="hrow"><span class="hlabel">{}</span><span class="hbar"><i class="grow-x" style="width:{:.1}%"></i></span><span class="hval">{}</span></div>"#,
+                    r#"<div class="hrow sv"><span class="hlabel">{}</span><span class="hbar"><i class="grow-x" style="width:{:.1}%"></i></span><span class="hval">{} <span class="usd">{}</span> <span class="ev">{}e</span></span></div>"#,
                     esc(src),
                     100.0 * t.saved() as f64 / max_sv as f64,
-                    fmt_n(t.saved())
+                    fmt_n(t.saved()),
+                    usd(t.saved()),
+                    fmt_n(t.events),
                 )
             })
             .collect()
     };
+
+    // Share of source tokens the agent never had to read.
+    let saved_ratio = if saved_all.before > 0 {
+        format!(
+            "{:.0}%",
+            100.0 * saved_all.saved() as f64 / saved_all.before as f64
+        )
+    } else {
+        "—".into()
+    };
+
+    // Time-window strip: today / 7d / 30d / all (tokens + $).
+    let saved_windows: String = [
+        ("today", sv.day),
+        ("7 days", sv.week),
+        ("30 days", sv.month),
+        ("all", sv.all.saved()),
+    ]
+    .iter()
+    .map(|(label, tok)| {
+        format!(
+            r#"<div><span>{label}</span><b>{}</b><i>{}</i></div>"#,
+            fmt_n(*tok),
+            usd(*tok)
+        )
+    })
+    .collect();
+
+    // Per-day savings trend over the same 14-day window as recall activity.
+    let daily = mimir_core::savings::daily_saved(conn, 14, now)?;
+    let mut saved_by_day = [0i64; 14];
+    for (day, s) in &daily {
+        let idx = (day - day0).clamp(0, 13) as usize;
+        saved_by_day[idx] += *s;
+    }
+    let max_sd = saved_by_day.iter().copied().max().unwrap_or(1).max(1);
+    let mut savings_bars = String::new();
+    for (i, &saved) in saved_by_day.iter().enumerate() {
+        let x = i as f64 * 22.0;
+        let h = 72.0 * saved as f64 / max_sd as f64;
+        savings_bars.push_str(&format!(
+            r#"<rect class="grow" style="animation-delay:{}ms" x="{:.1}" y="{:.1}" width="18" height="{:.1}" fill="var(--teal)"/>"#,
+            i * 40,
+            x + 1.0,
+            76.0 - h,
+            h.max(1.0),
+        ));
+    }
 
     let html = TEMPLATE
         .replace("{{GENERATED}}", &mimir_core::format::full_date(now))
@@ -377,6 +431,9 @@ fn render(mimir: &Mimir) -> Result<String> {
         .replace("{{SAVED_TOTAL}}", &fmt_n(saved_all.saved()))
         .replace("{{SAVED_BEFORE}}", &fmt_n(saved_all.before))
         .replace("{{SAVED_EVENTS}}", &fmt_n(saved_all.events))
+        .replace("{{SAVED_RATIO}}", &saved_ratio)
+        .replace("{{SAVED_WINDOWS}}", &saved_windows)
+        .replace("{{SAVINGS_BARS}}", &savings_bars)
         .replace(
             "{{SAVED_USD}}",
             &format!(
@@ -513,6 +570,14 @@ h2::before{content:"◈ ";color:var(--teal)}
 .kv span{color:var(--dim)} .kv b{color:var(--ink);font-weight:400;font-variant-numeric:tabular-nums}
 .kv b.gold{color:var(--gold)} .kv b.teal{color:var(--teal)}
 
+.win{display:flex;gap:26px;margin:12px 0 6px;flex-wrap:wrap}
+.win div{display:flex;flex-direction:column;gap:1px}
+.win span{color:var(--dim);font-size:10px;letter-spacing:.16em;text-transform:uppercase}
+.win b{color:var(--ink);font-weight:400;font-size:15px;font-variant-numeric:tabular-nums}
+.win i{color:var(--gold);font-style:normal;font-size:11px}
+.hrow.sv .hval{width:auto;min-width:140px}
+.hrow.sv .usd{color:var(--gold)} .hrow.sv .ev{color:var(--faint);font-size:11px}
+
 footer{margin-top:26px;border-top:1px solid var(--line);padding-top:14px;display:flex;color:var(--faint);font-size:11px;letter-spacing:.18em}
 footer span{margin-left:auto}
 @media (prefers-reduced-motion:reduce){.ripple,.grow,.grow-x{animation:none}}
@@ -581,9 +646,18 @@ footer span{margin-left:auto}
     <div class="kv">
       <div><span>tokens saved</span><b class="teal">{{SAVED_TOTAL}}</b></div>
       <div><span>≈ saved</span><b class="gold">{{SAVED_USD}}</b></div>
+      <div><span>source tokens avoided</span><b class="teal">{{SAVED_RATIO}}</b></div>
       <div><span>source tokens seen</span><b>{{SAVED_BEFORE}}</b></div>
       <div><span>savings events</span><b>{{SAVED_EVENTS}}</b></div>
     </div>
+    <div class="win">{{SAVED_WINDOWS}}</div>
+    <svg width="100%" height="96" viewBox="0 0 308 96" preserveAspectRatio="none">
+      <line x1="0" y1="76.5" x2="308" y2="76.5" stroke="var(--line)" stroke-width="1"/>
+      {{SAVINGS_BARS}}
+      <text x="0" y="92" fill="var(--faint)" font-size="9" font-family="inherit">{{DAY_FIRST}}</text>
+      <text x="308" y="92" text-anchor="end" fill="var(--faint)" font-size="9" font-family="inherit">{{DAY_LAST}}</text>
+    </svg>
+    <div class="key"><span><i style="background:var(--teal)"></i>tokens saved / day — 14 days</span></div>
     {{SAVINGS_ROWS}}
   </div>
 
