@@ -3,6 +3,25 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [0.12.0] — 2026-06-26
+### Fixed
+- **No more `SQLITE_BUSY` under concurrent sessions** — multiple Claude Code
+  sessions sharing the global store hit intermittent "database is locked"
+  failures, including read-only commands dying at open. Three fixes, all within
+  SQLite's own WAL + `BEGIN IMMEDIATE` + `busy_timeout` (no write-buffer daemon,
+  which would sacrifice read-after-write consistency and durability):
+  - `busy_timeout` was the 4th statement in the pragma batch, so
+    `PRAGMA journal_mode = WAL` — which takes a momentary exclusive lock at open
+    — ran first at the default 0ms timeout and failed instantly under
+    contention. It's now set via the rusqlite API immediately after `open`,
+    before any pragma, and raised to 10s.
+  - `embed_pending` held the single writer lock for its entire run, including
+    the CPU-bound model inference. It now commits in batches and runs inference
+    *outside* the transaction, so a large embed never starves other writers.
+  - Long-lived daemons' read marks blocked passive WAL autocheckpoints, letting
+    the `-wal` file grow without bound (100 MB+). `mimir mcp`, `mimir serve`, and
+    `mimir proxy` now run a periodic `wal_checkpoint(TRUNCATE)` on an idle timer.
+
 ## [0.11.0] — 2026-06-22
 ### Added
 - **C# and SQL in the code graph** — tree-sitter symbol extraction now covers
