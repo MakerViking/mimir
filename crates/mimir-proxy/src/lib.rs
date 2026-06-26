@@ -68,6 +68,33 @@ pub async fn serve(cfg: ProxyConfig) -> Result<()> {
     let bind = cfg.bind;
     let upstream = cfg.upstream.clone();
     let dry = cfg.dry_run;
+
+    // Reclaim the WAL on an idle timer. The proxy is long-lived and its
+    // per-request savings writes leave a -wal that PASSIVE autocheckpoints may
+    // never fully reset under a steady reader. A periodic TRUNCATE checkpoint
+    // keeps it bounded; best-effort and non-fatal. Unlike the sync daemons this
+    // reuses the shared savings connection (autocommit between requests, so no
+    // read mark blocks it), and runs the blocking checkpoint on spawn_blocking
+    // so a large TRUNCATE never stalls a runtime worker.
+    if let Some(db) = db.clone() {
+        tokio::spawn(async move {
+            let period = std::time::Duration::from_secs(120);
+            let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            loop {
+                tick.tick().await;
+                let db = db.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = db.lock() {
+                        if let Err(e) = mimir_core::db::checkpoint_truncate(&conn) {
+                            tracing::warn!("proxy: wal checkpoint failed ({e})");
+                        }
+                    }
+                })
+                .await;
+            }
+        });
+    }
+
     let state = Arc::new(AppState { cfg, client, db });
     let app = Router::new().fallback(any(handle)).with_state(state);
 

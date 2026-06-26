@@ -23,6 +23,10 @@ pub fn serve(bind: &str) -> Result<()> {
         "clients: set MIMIR_SYNC_TOKEN, then [sync] mode=\"server\", endpoint=\"http://{bind}\""
     );
 
+    // Long-lived writing daemon: reclaim the WAL on an idle timer so its read
+    // marks don't starve PASSIVE autocheckpoints (same profile as `mimir mcp`).
+    mimir_core::db::spawn_checkpoint_timer(mimir.paths.db_file.clone());
+
     for req in server.incoming_requests() {
         handle(&mut mimir, req, &token);
     }

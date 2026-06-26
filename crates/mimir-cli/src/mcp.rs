@@ -702,6 +702,10 @@ pub fn run() -> Result<()> {
         });
     }
 
+    // Reclaim the WAL on an idle timer: `mimir mcp` is long-lived, so its read
+    // marks can starve PASSIVE autocheckpoints and let the -wal grow unbounded.
+    mimir_core::db::spawn_checkpoint_timer(engine.paths.db_file.clone());
+
     // Optional background sync (own connection, non-fatal, WAL-safe). Logs via
     // tracing, never stdout — stdout is the MCP protocol channel. Gated on the
     // [sync] config so there is zero cost when sync is off.

@@ -218,6 +218,13 @@ pub fn from_blob(blob: &[u8]) -> Vec<f32> {
 /// Embed every node whose content is new or changed for this model.
 /// Unchanged content never reaches the model: embeddings are keyed by
 /// content hash, and identical text elsewhere in the store is copied.
+///
+/// Work is committed in batches so the single SQLite writer lock is yielded
+/// between chunks instead of held for the whole run, and — crucially — the
+/// CPU-bound model inference happens OUTSIDE any transaction, so a big embed
+/// never starves concurrent sessions. Each batch is independent: embeddings
+/// carry no cross-row invariant, so a partial run just leaves the rest pending
+/// for next time.
 pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<usize> {
     struct Pending {
         id: i64,
@@ -253,35 +260,50 @@ pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<usize
         return Ok(0);
     }
 
-    // IMMEDIATE: take the writer lock up front so a concurrent writer waits
-    // (busy_timeout) instead of erroring on a DEFERRED read→write upgrade.
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let mut to_embed: Vec<&Pending> = Vec::new();
-    for p in &pending {
-        // Same content already embedded under another node? Copy it.
-        let existing: Option<(i64, Vec<u8>)> = tx
-            .query_row(
-                "SELECT dim, vec FROM embedding
-                 WHERE model = ?1 AND content_hash = ?2 AND node_id <> ?3 LIMIT 1",
-                params![embedder.name, p.hash, p.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        match existing {
-            Some((dim, vec)) => {
-                upsert(&tx, p.id, &embedder.name, dim as usize, &vec, &p.hash)?;
+    // Nodes per write transaction. Inference is out of the lock, so the tx only
+    // holds for the upserts; this bounds the hold (and memory) on a bulk import.
+    const TX_BATCH: usize = 256;
+    for batch in pending.chunks(TX_BATCH) {
+        // Phase 1 (no write lock): decide copy-vs-embed. Reading the embedding
+        // table for an identical-content vector is a plain autocommit read.
+        let mut copies: Vec<(&Pending, i64, Vec<u8>)> = Vec::new();
+        let mut to_embed: Vec<&Pending> = Vec::new();
+        for p in batch {
+            let existing: Option<(i64, Vec<u8>)> = conn
+                .query_row(
+                    "SELECT dim, vec FROM embedding
+                     WHERE model = ?1 AND content_hash = ?2 AND node_id <> ?3 LIMIT 1",
+                    params![embedder.name, p.hash, p.id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            match existing {
+                Some((dim, vec)) => copies.push((p, dim, vec)),
+                None => to_embed.push(p),
             }
-            None => to_embed.push(p),
         }
-    }
-    if !to_embed.is_empty() {
-        let texts: Vec<String> = to_embed.iter().map(|p| p.text.clone()).collect();
-        let vectors = embedder.embed(texts)?;
+
+        // Phase 2 (no write lock): model inference for the misses.
+        let vectors = if to_embed.is_empty() {
+            Vec::new()
+        } else {
+            embedder.embed(to_embed.iter().map(|p| p.text.clone()).collect())?
+        };
+
+        // Phase 3: take the writer lock just long enough to persist this batch.
+        // IMMEDIATE so a concurrent writer waits (busy_timeout) instead of
+        // erroring on a DEFERRED read→write upgrade. new_unchecked because we
+        // only hold &Connection (the caller keeps the embedder borrow).
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        for (p, dim, vec) in &copies {
+            upsert(&tx, p.id, &embedder.name, *dim as usize, vec, &p.hash)?;
+        }
         for (p, vec) in to_embed.iter().zip(&vectors) {
             upsert(&tx, p.id, &embedder.name, vec.len(), &to_blob(vec), &p.hash)?;
         }
+        tx.commit()?;
     }
-    tx.commit()?;
     Ok(pending.len())
 }
 
