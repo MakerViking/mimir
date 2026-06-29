@@ -605,7 +605,8 @@ fn server_cwd() -> Option<std::path::PathBuf> {
 }
 
 /// Entry point for `mimir mcp` (blocking; owns the tokio runtime).
-pub fn run() -> Result<()> {
+/// `http = Some(addr)` serves Streamable-HTTP instead of stdio.
+pub fn run(http: Option<String>) -> Result<()> {
     let engine = Mimir::open()?;
     let project_id = match server_cwd() {
         Some(d) => match engine.detect_project(&d) {
@@ -725,12 +726,52 @@ pub fn run() -> Result<()> {
 
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
-        let service = MimirServer::new(engine, project_id)
-            .serve(rmcp::transport::stdio())
-            .await?;
-        service.waiting().await?;
-        Ok(())
+        match http {
+            Some(bind) => serve_http(project_id, &bind).await,
+            None => {
+                let service = MimirServer::new(engine, project_id)
+                    .serve(rmcp::transport::stdio())
+                    .await?;
+                service.waiting().await?;
+                Ok(())
+            }
+        }
     })
+}
+
+/// Serve the same MCP tools over Streamable-HTTP for remote clients reached
+/// through a tunnel / reverse proxy. Each session gets its own engine (its own
+/// SQLite connection; WAL handles the concurrency). This transport carries NO
+/// auth — bind to localhost and front it with TLS + an auth gate.
+async fn serve_http(project_id: Option<i64>, bind: &str) -> Result<()> {
+    let app = mcp_http_router(move || {
+        Ok(MimirServer::new(
+            Mimir::open().map_err(std::io::Error::other)?,
+            project_id,
+        ))
+    });
+    let listener = tokio::net::TcpListener::bind(bind).await?;
+    println!("mimir MCP (streamable-http) listening on http://{bind}/mcp");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Build the axum router that serves the MCP tools over Streamable-HTTP at
+/// `/mcp`. `make_server` runs once per session (its own engine/connection);
+/// split out so a test can mount it on an ephemeral port with a temp store.
+fn mcp_http_router<F>(make_server: F) -> axum::Router
+where
+    F: Fn() -> std::result::Result<MimirServer, std::io::Error> + Send + Sync + 'static,
+{
+    use rmcp::transport::streamable_http_server::{
+        session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
+    };
+    let service = StreamableHttpService::new(
+        make_server,
+        LocalSessionManager::default().into(),
+        StreamableHttpServerConfig::default(),
+    );
+    axum::Router::new().nest_service("/mcp", service)
 }
 
 #[cfg(test)]
@@ -745,6 +786,75 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = Mimir::open_at(Paths::under_root(dir.path())).unwrap();
         (dir, MimirServer::new(engine, None))
+    }
+
+    /// The Streamable-HTTP transport serves the same tools as stdio: drive a
+    /// real MCP initialize + tools/list handshake over an ephemeral port,
+    /// against a temp store so the real user's db is never touched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_transport_serves_mcp_tools() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under_root(dir.path());
+        let router = mcp_http_router(move || {
+            Ok(MimirServer::new(
+                Mimir::open_at(paths.clone()).map_err(std::io::Error::other)?,
+                None,
+            ))
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let url = format!("http://{addr}/mcp");
+
+        // initialize: a stateful Streamable-HTTP server returns a session id.
+        let init_url = url.clone();
+        let (sid, body) = tokio::task::spawn_blocking(move || {
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(10))
+                .build();
+            let resp = agent
+                .post(&init_url)
+                .set("Content-Type", "application/json")
+                .set("Accept", "application/json, text/event-stream")
+                .send_string(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+                )
+                .expect("initialize ok");
+            let sid = resp.header("mcp-session-id").unwrap_or_default().to_string();
+            (sid, resp.into_string().unwrap_or_default())
+        })
+        .await
+        .unwrap();
+        assert!(body.contains("protocolVersion"), "initialize: {body}");
+        assert!(!sid.is_empty(), "stateful mode returns a session id");
+
+        // tools/list over the same session exposes the real tool set.
+        let tools = tokio::task::spawn_blocking(move || {
+            let agent = ureq::AgentBuilder::new()
+                .timeout_read(Duration::from_secs(10))
+                .build();
+            let send = |b: &str| -> String {
+                agent
+                    .post(&url)
+                    .set("Content-Type", "application/json")
+                    .set("Accept", "application/json, text/event-stream")
+                    .set("Mcp-Session-Id", &sid)
+                    .send_string(b)
+                    .map(|r| r.into_string().unwrap_or_default())
+                    .unwrap_or_default()
+            };
+            let _ = send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+            send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#)
+        })
+        .await
+        .unwrap();
+        assert!(
+            tools.contains("recall") && tools.contains("remember"),
+            "tools/list: {tools}"
+        );
     }
 
     fn remember_args(text: &str, ty: &str) -> RememberArgs {
