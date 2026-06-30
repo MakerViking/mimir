@@ -470,6 +470,22 @@ pub fn status(json: bool) -> Result<()> {
         mimir.paths.db_file.display(),
         db_size / 1024
     );
+    let sc = &mimir.config.sync;
+    if sc.enabled() {
+        let push = mimir_core::replicate::get_watermark(&mimir.conn, "last_push").unwrap_or(0);
+        let pull = mimir_core::replicate::get_watermark(&mimir.conn, "last_pull").unwrap_or(0);
+        let cadence = if sc.auto {
+            format!("auto every {} min", sc.interval_mins)
+        } else {
+            "manual".into()
+        };
+        println!(
+            "sync    {} {} ({cadence}); local watermarks push={push} pull={pull}",
+            sc.mode, sc.endpoint
+        );
+    } else {
+        println!("sync    off (local store only)");
+    }
     Ok(())
 }
 
@@ -607,6 +623,7 @@ pub fn recall(
     rerank: bool,
     linked: bool,
     min_score: Option<f64>,
+    include_superseded: bool,
 ) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let query = SearchQuery {
@@ -615,6 +632,8 @@ pub fn recall(
         since: since.map(|s| parse_since(&s)).transpose()?,
         limit: limit.unwrap_or(mimir.config.output.default_limit),
         strength_alpha: mimir.config.scoring.strength_alpha,
+        recency_alpha: mimir.config.scoring.recency_alpha,
+        include_superseded,
         text,
     };
     let mut hits = mimir.search_with(&query, rerank)?;
@@ -847,6 +866,22 @@ pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
         "{} —{rel}→ {}",
         short_uid(src.kind, &src.uid),
         short_uid(dst.kind, &dst.uid)
+    );
+    Ok(())
+}
+
+/// Mark OLD as superseded by NEW: OLD stops surfacing in recall (kept as
+/// history) and a `supersedes` edge is recorded.
+pub fn supersede(old: &str, by: &str) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let old = resolve_any(&mimir, old)?;
+    let new = resolve_any(&mimir, by)?;
+    store::set_superseded(&mimir.conn, old.id, new.id)?;
+    store::link(&mimir.conn, new.id, old.id, Rel::Supersedes, 1.0)?;
+    println!(
+        "{} superseded by {}",
+        short_uid(old.kind, &old.uid),
+        short_uid(new.kind, &new.uid)
     );
     Ok(())
 }

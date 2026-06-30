@@ -47,6 +47,23 @@ pub fn effective_strength(node: &Node, now: i64) -> f64 {
     node.strength * 2f64.powf(-age_days / half_life)
 }
 
+/// Time-recency factor in (0, 1]: `2^(-age/half_life)` from CREATION (newer
+/// information wins), using the same type-aware half-lives as decay. Returns
+/// 1.0 for pinned or never-decaying kinds (docs, code, person, summary).
+/// Independent of learned strength; used as an opt-in ranking boost
+/// (scoring.recency_alpha) so a fresh "it's done" memory can outrank a stale
+/// "in progress" one even on a slightly weaker text match.
+pub fn recency_factor(node: &Node, now: i64) -> f64 {
+    if node.pinned {
+        return 1.0;
+    }
+    let Some(half_life) = half_life_days(node.kind, node.subkind.as_deref()) else {
+        return 1.0;
+    };
+    let age_days = (now - node.created_at).max(0) as f64 / 86_400.0;
+    2f64.powf(-age_days / half_life)
+}
+
 /// Has this node already received an event of this type today?
 fn capped_today(conn: &Connection, node_id: i64, event: &str) -> Result<bool> {
     let now = now_unix();

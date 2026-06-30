@@ -31,6 +31,10 @@ pub struct SearchQuery {
     pub limit: usize,
     /// Weight of learned strength in the final score (config scoring.strength_alpha).
     pub strength_alpha: f64,
+    /// Weight of the recency boost (config scoring.recency_alpha); 0.0 = off.
+    pub recency_alpha: f64,
+    /// Include superseded nodes in results (default false hides them).
+    pub include_superseded: bool,
 }
 
 #[derive(Debug)]
@@ -79,13 +83,23 @@ pub fn search_hybrid(
     let mut hits: Vec<Hit> = rrf
         .into_iter()
         .filter_map(|(id, base)| match store::get_node(conn, id) {
-            // A stale vector cache may still hold soft-deleted nodes;
-            // they (and superseded memories) must never surface.
-            Ok(node) if node.deleted_at.is_some() || node.superseded_by.is_some() => None,
+            // A stale vector cache may still hold soft-deleted nodes; they (and,
+            // unless explicitly asked for, superseded memories) must never surface.
+            Ok(node)
+                if node.deleted_at.is_some()
+                    || (node.superseded_by.is_some() && !query.include_superseded) =>
+            {
+                None
+            }
             Ok(node) => {
                 // Decayed strength is a tiebreaker multiplier, never a burier.
                 let effective = crate::learn::effective_strength(&node, now);
-                let score = base * (1.0 + query.strength_alpha * (1.0 + effective).ln());
+                // Optional recency boost (config scoring.recency_alpha, default 0):
+                // capped multiplicative, so it nudges near-ties without burying.
+                let recency = crate::learn::recency_factor(&node, now);
+                let score = base
+                    * (1.0 + query.strength_alpha * (1.0 + effective).ln())
+                    * (1.0 + query.recency_alpha * recency);
                 Some(Ok(Hit { node, score }))
             }
             Err(e) => Some(Err(e)),
@@ -130,7 +144,41 @@ mod tests {
             since: None,
             limit: 10,
             strength_alpha: 0.15,
+            recency_alpha: 0.0,
+            include_superseded: false,
         }
+    }
+
+    #[test]
+    fn superseded_is_hidden_unless_requested() {
+        let conn = db::open_in_memory().unwrap();
+        let old = add(
+            &conn,
+            Kind::Memory,
+            None,
+            "alpha runbook",
+            "old draft blocked",
+        )
+        .id;
+        let new = add(&conn, Kind::Memory, None, "alpha runbook", "new final done").id;
+        store::set_superseded(&conn, old, new).unwrap();
+
+        // Default recall hides the superseded node, keeps its replacement.
+        let hits = search(&conn, &q("alpha runbook")).unwrap();
+        assert!(
+            hits.iter().all(|h| h.node.id != old),
+            "superseded node leaked into recall"
+        );
+        assert!(hits.iter().any(|h| h.node.id == new), "replacement missing");
+
+        // Opt-in surfaces the superseded node again.
+        let mut with = q("alpha runbook");
+        with.include_superseded = true;
+        let hits = search(&conn, &with).unwrap();
+        assert!(
+            hits.iter().any(|h| h.node.id == old),
+            "include_superseded did not surface the superseded node"
+        );
     }
 
     #[test]
@@ -313,6 +361,8 @@ mod perf_tests {
             since: None,
             limit: 10,
             strength_alpha: 0.15,
+            recency_alpha: 0.0,
+            include_superseded: false,
         };
         let mut cache = None;
         // Cold: builds the 100k×384 matrix.
@@ -387,6 +437,8 @@ mod perf_tests {
                 since: None,
                 limit: 10,
                 strength_alpha: 0.15,
+                recency_alpha: 0.0,
+                include_superseded: false,
             };
             let mut cache = None;
             let t = std::time::Instant::now();

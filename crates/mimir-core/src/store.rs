@@ -178,6 +178,16 @@ pub fn hard_delete(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
+/// Mark `id` as superseded by `by`: it stops surfacing in recall (kept as
+/// history). Bumps updated_at so the change replicates to a sync hub.
+pub fn set_superseded(conn: &Connection, id: i64, by: i64) -> Result<()> {
+    conn.execute(
+        "UPDATE node SET superseded_by = ?2, updated_at = ?3 WHERE id = ?1",
+        params![id, by, now_unix()],
+    )?;
+    Ok(())
+}
+
 /// Idempotent edge insert (UNIQUE(src,dst,rel) upserts weight).
 pub fn link(conn: &Connection, src: i64, dst: i64, rel: Rel, weight: f64) -> Result<()> {
     conn.execute(

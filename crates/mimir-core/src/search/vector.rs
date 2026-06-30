@@ -212,6 +212,8 @@ mod tests {
             since: None,
             limit: 10,
             strength_alpha: 0.0,
+            recency_alpha: 0.0,
+            include_superseded: false,
         }
     }
 
