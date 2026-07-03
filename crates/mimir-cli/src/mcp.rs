@@ -606,7 +606,7 @@ fn server_cwd() -> Option<std::path::PathBuf> {
 
 /// Entry point for `mimir mcp` (blocking; owns the tokio runtime).
 /// `http = Some(addr)` serves Streamable-HTTP instead of stdio.
-pub fn run(http: Option<String>) -> Result<()> {
+pub fn run(http: Option<String>, http_allow_remote: bool) -> Result<()> {
     let engine = Mimir::open()?;
     let project_id = match server_cwd() {
         Some(d) => match engine.detect_project(&d) {
@@ -727,7 +727,7 @@ pub fn run(http: Option<String>) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         match http {
-            Some(bind) => serve_http(project_id, &bind).await,
+            Some(bind) => serve_http(project_id, &bind, http_allow_remote).await,
             None => {
                 let service = MimirServer::new(engine, project_id)
                     .serve(rmcp::transport::stdio())
@@ -742,8 +742,25 @@ pub fn run(http: Option<String>) -> Result<()> {
 /// Serve the same MCP tools over Streamable-HTTP for remote clients reached
 /// through a tunnel / reverse proxy. Each session gets its own engine (its own
 /// SQLite connection; WAL handles the concurrency). This transport carries NO
-/// auth — bind to localhost and front it with TLS + an auth gate.
-async fn serve_http(project_id: Option<i64>, bind: &str) -> Result<()> {
+/// auth — the loopback bind is the security boundary, so non-loopback binds
+/// are refused unless `--http-allow-remote` says the exposure is deliberate.
+async fn serve_http(project_id: Option<i64>, bind: &str, allow_remote: bool) -> Result<()> {
+    if !bind_is_loopback(bind) {
+        if !allow_remote {
+            anyhow::bail!(
+                "refusing to bind MCP to non-loopback address `{bind}`: this transport has no \
+                 auth, so anyone who can reach the port gets full read/write access to the \
+                 store. Bind to 127.0.0.1 and front it with TLS + an auth gate (tunnel / \
+                 reverse proxy), or pass --http-allow-remote if the port is otherwise \
+                 unreachable (e.g. a container port published to 127.0.0.1 only)."
+            );
+        }
+        tracing::warn!(
+            %bind,
+            "serving unauthenticated MCP on a non-loopback address (--http-allow-remote); \
+             make sure an auth gate fronts this port"
+        );
+    }
     let app = mcp_http_router(move || {
         Ok(MimirServer::new(
             Mimir::open().map_err(std::io::Error::other)?,
@@ -754,6 +771,26 @@ async fn serve_http(project_id: Option<i64>, bind: &str) -> Result<()> {
     println!("mimir MCP (streamable-http) listening on http://{bind}/mcp");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// True only when every address `bind` resolves to is loopback. Unresolvable
+/// binds return false — the TcpListener will produce the real error, and the
+/// gate stays fail-closed.
+fn bind_is_loopback(bind: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    match bind.to_socket_addrs() {
+        Ok(addrs) => {
+            let mut any = false;
+            for addr in addrs {
+                if !addr.ip().is_loopback() {
+                    return false;
+                }
+                any = true;
+            }
+            any
+        }
+        Err(_) => false,
+    }
 }
 
 /// Build the axum router that serves the MCP tools over Streamable-HTTP at
@@ -786,6 +823,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = Mimir::open_at(Paths::under_root(dir.path())).unwrap();
         (dir, MimirServer::new(engine, None))
+    }
+
+    /// The gate refuses everything that isn't provably loopback, including
+    /// unresolvable input (fail-closed).
+    #[test]
+    fn loopback_gate() {
+        assert!(bind_is_loopback("127.0.0.1:8077"));
+        assert!(bind_is_loopback("[::1]:8077"));
+        assert!(bind_is_loopback("localhost:8077"));
+        assert!(!bind_is_loopback("0.0.0.0:8077"));
+        assert!(!bind_is_loopback("192.168.1.10:8077"));
+        assert!(!bind_is_loopback("not an address"));
     }
 
     /// The Streamable-HTTP transport serves the same tools as stdio: drive a

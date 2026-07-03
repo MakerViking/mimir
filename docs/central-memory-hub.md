@@ -70,8 +70,14 @@ Browser and mobile AI clients cannot talk to a local stdio MCP server, so serve
 MCP over HTTP:
 
 ```sh
-mimir mcp --http 0.0.0.0:<MCP_PORT>
+mimir mcp --http 127.0.0.1:<MCP_PORT>
 ```
+
+Non-loopback binds are refused unless you add `--http-allow-remote`: the
+transport has no auth of its own, so the loopback bind is the security
+boundary on a bare host. Inside a container the flag is appropriate — bind
+`0.0.0.0` there, but publish the container port to localhost only, as the
+compose example below does.
 
 This exposes a Streamable-HTTP MCP server at `/mcp`. Point it at the **same
 store** as the hub. Running `mimir serve` and `mimir mcp --http` against one
@@ -86,7 +92,7 @@ services:
       - <HUB_DATA_DIR>:/data
     # publish only to localhost; the proxy/tunnel reaches it over the network
     ports: ["127.0.0.1:<MCP_PORT>:<MCP_PORT>"]
-    entrypoint: ["mimir", "mcp", "--http", "0.0.0.0:<MCP_PORT>"]
+    entrypoint: ["mimir", "mcp", "--http", "0.0.0.0:<MCP_PORT>", "--http-allow-remote"]
 ```
 
 ## 4. Exposing it safely
