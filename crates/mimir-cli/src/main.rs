@@ -229,8 +229,22 @@ enum Command {
         #[arg(long)]
         open: bool,
     },
-    /// Run the MCP stdio server (what Claude Code launches).
-    Mcp,
+    /// Run the MCP server. Default: stdio (what Claude Code launches). Pass
+    /// `--http <addr>` to serve Streamable-HTTP for remote clients instead.
+    Mcp {
+        /// Serve MCP over Streamable-HTTP at this address (e.g. 127.0.0.1:8077)
+        /// instead of stdio. Carries no auth itself — bind to localhost and
+        /// front it with TLS + an auth gate (tunnel / reverse proxy).
+        #[arg(long)]
+        http: Option<String>,
+        /// Allow --http to bind a non-loopback address. Without this flag,
+        /// non-loopback binds are refused: the transport has no auth, so
+        /// anyone who can reach the port owns the store. Only pass it when
+        /// the port is unreachable from outside (e.g. a container whose port
+        /// is published to 127.0.0.1 only) or an auth gate fronts it.
+        #[arg(long, requires = "http")]
+        http_allow_remote: bool,
+    },
     /// Run the optional local API proxy (prompt-cache optimization; see docs/proxy.md).
     Proxy {
         /// Address to bind (default from [proxy] config, 127.0.0.1:8788).
@@ -578,7 +592,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Report => report::report(cli.json),
         Command::Savings { oneline } => savings_cmd::savings(cli.json, oneline),
         Command::Tokens { text } => commands::tokens(text),
-        Command::Mcp => mcp::run(),
+        Command::Mcp {
+            http,
+            http_allow_remote,
+        } => mcp::run(http, http_allow_remote),
         Command::Proxy {
             bind,
             dry_run,

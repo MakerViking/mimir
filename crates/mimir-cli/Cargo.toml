@@ -31,6 +31,7 @@ directories.workspace = true
 ignore.workspace = true
 libc = "0.2"
 rmcp.workspace = true
+axum.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
 serde = { workspace = true }
