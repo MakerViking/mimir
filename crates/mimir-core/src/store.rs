@@ -180,7 +180,21 @@ pub fn hard_delete(conn: &Connection, id: i64) -> Result<()> {
 
 /// Mark `id` as superseded by `by`: it stops surfacing in recall (kept as
 /// history). Bumps updated_at so the change replicates to a sync hub.
+/// Refuses self-supersession (there is no un-supersede path, so a
+/// self-reference would hide the node unrecoverably) and pinned nodes
+/// (pinned means never decayed, never superseded — same invariant
+/// consolidation honors).
 pub fn set_superseded(conn: &Connection, id: i64, by: i64) -> Result<()> {
+    if id == by {
+        return Err(Error::Invalid("a node cannot supersede itself".into()));
+    }
+    let pinned: i64 =
+        conn.query_row("SELECT pinned FROM node WHERE id = ?1", [id], |r| r.get(0))?;
+    if pinned != 0 {
+        return Err(Error::Invalid(format!(
+            "node #{id} is pinned; pinned nodes never get superseded (unpin it first)"
+        )));
+    }
     conn.execute(
         "UPDATE node SET superseded_by = ?2, updated_at = ?3 WHERE id = ?1",
         params![id, by, now_unix()],
@@ -483,6 +497,28 @@ mod tests {
         let conn = conn();
         let err = insert_node(&conn, NewNode::default()).unwrap_err();
         assert!(matches!(err, Error::Invalid(_)));
+    }
+
+    #[test]
+    fn supersede_refuses_self_and_pinned() {
+        let conn = conn();
+        let old = memory(&conn, "old", "x");
+        let new = memory(&conn, "new", "y");
+
+        // Self-supersession would hide a node with no un-supersede path.
+        let err = set_superseded(&conn, old.id, old.id).unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)));
+
+        // Pinned nodes never get superseded (same invariant consolidation honors).
+        set_pinned(&conn, old.id, true).unwrap();
+        let err = set_superseded(&conn, old.id, new.id).unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)));
+        assert!(get_node(&conn, old.id).unwrap().superseded_by.is_none());
+
+        // Unpinned, the normal path still works.
+        set_pinned(&conn, old.id, false).unwrap();
+        set_superseded(&conn, old.id, new.id).unwrap();
+        assert_eq!(get_node(&conn, old.id).unwrap().superseded_by, Some(new.id));
     }
 
     #[test]

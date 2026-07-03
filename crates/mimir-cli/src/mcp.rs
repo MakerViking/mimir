@@ -145,11 +145,6 @@ pub struct PeekArgs {
 pub struct ForgetArgs {
     /// Node reference (m:ABCDEF or ULID) to delete.
     pub r#ref: String,
-    /// true = permanent physical delete that does NOT replicate to a sync hub
-    /// (a later pull can resurrect it). Default false = a reversible SOFT delete:
-    /// a tombstone that replicates and stays deleted everywhere. Prefer the default.
-    #[serde(default)]
-    pub hard: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -642,21 +637,16 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Delete a memory by reference. Defaults to a reversible SOFT delete (a replicating tombstone: recall hides it and it stays deleted across synced machines). Pass hard=true only for a permanent physical delete that does NOT replicate (a pull from a sync hub can bring it back). Use this to prune stale or wrong memories from any surface."
+        description = "Delete a memory by reference. Always a reversible SOFT delete (a replicating tombstone: recall hides it and it stays deleted across synced machines). Permanent physical deletion is deliberately not exposed over MCP - a human can run `mimir forget --hard` on the CLI. Use this to prune stale or wrong memories."
     )]
     async fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> String {
         self.blocking(move |m| {
             let node = store::resolve_ref(&m.conn, &args.r#ref).map_err(engine_err)?;
-            if args.hard {
-                store::hard_delete(&m.conn, node.id).map_err(engine_err)?;
-            } else {
-                store::soft_delete(&m.conn, node.id).map_err(engine_err)?;
-            }
+            store::soft_delete(&m.conn, node.id).map_err(engine_err)?;
             Ok(format!(
-                "forgot {} {}{}",
+                "forgot {} {}",
                 short_uid(node.kind, &node.uid),
-                node.title.as_deref().unwrap_or(""),
-                if args.hard { " (permanently)" } else { "" }
+                node.title.as_deref().unwrap_or("")
             ))
         })
         .await
