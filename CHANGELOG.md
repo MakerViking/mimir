@@ -3,7 +3,7 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
-## [Unreleased]
+## [0.13.0] — 2026-07-03
 ### Added
 - **Remote MCP: `mimir mcp --http <addr>`** serves the same tool router over
   Streamable-HTTP for networked clients (claude.ai web/mobile, agents on
