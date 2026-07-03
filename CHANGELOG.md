@@ -3,6 +3,23 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [Unreleased]
+### Added
+- **Remote MCP: `mimir mcp --http <addr>`** serves the same tool router over
+  Streamable-HTTP for networked clients (claude.ai web/mobile, agents on
+  other machines) — stdio stays the default and is untouched. The transport
+  carries no auth of its own, so non-loopback binds are refused unless
+  `--http-allow-remote` states the exposure is deliberate; front it with TLS
+  + an auth gate (see [docs/central-memory-hub.md](docs/central-memory-hub.md)).
+  Contributed by [@nworks3d](https://github.com/nworks3d) (#8, #9) — thanks!
+- **Memory hygiene over MCP: `forget`, `consolidate`, `supersede`** — agents
+  can now prune (soft delete only; permanent deletion stays a human CLI
+  action), dry-run/apply consolidation, and retire a stale memory in favor of
+  its replacement from any MCP surface. Plus a CLI `mimir supersede <old>
+  --by <new>` verb, `recall --include-superseded`, a sync source-identity
+  line in `status`, and an opt-in `scoring.recency_alpha` boost (default off).
+  Contributed by [@nworks3d](https://github.com/nworks3d) (#10) — thanks!
+
 ## [0.12.0] — 2026-06-26
 ### Fixed
 - **No more `SQLITE_BUSY` under concurrent sessions** — multiple Claude Code

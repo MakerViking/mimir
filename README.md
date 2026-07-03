@@ -200,7 +200,10 @@ recall a handful of things you actually remember storing — and only then
 unplug the old system's MCP server. (And `mimir export` keeps the exit
 door open in the other direction: everything, always yours.)
 
-MCP tools: `recall`, `remember`, `get`, `link`, `graph`, `mark`, `status`.
+MCP tools: `recall`, `remember`, `get`, `link`, `graph`, `mark`, `status`,
+`outline`, `peek`, and the hygiene set `forget` / `consolidate` / `supersede`
+(soft-delete and dry-run by default — permanent deletion stays a human CLI
+action).
 
 ### Works with any MCP client
 
@@ -212,6 +215,12 @@ configured via JSON, the entry is simply:
 ```json
 { "mcpServers": { "mimir": { "command": "mimir", "args": ["mcp"] } } }
 ```
+
+Clients that can't launch a local process (claude.ai web/mobile, agents on
+another machine) can reach a store over the network instead:
+`mimir mcp --http 127.0.0.1:8077` serves the same tools via Streamable-HTTP —
+bind to localhost and front it with TLS + an auth gate; see
+[docs/central-memory-hub.md](docs/central-memory-hub.md).
 
 The project is detected from the directory the client launches the server
 in (override with the `MIMIR_PROJECT` env var), walking up from there in
@@ -268,8 +277,10 @@ dashboard panel and a `/m-savings` command.
 
 Want your memories on more than one machine? Mimir has an **opt-in** sync layer
 — off by default, with zero added cost and the zero-telemetry promise intact
-unless you turn it on. It shares your **global memories** (local-SQLite stays
-authoritative; merges are last-write-wins), via whichever path suits you:
+unless you turn it on. It shares your **global memories** plus any projects
+you opt in (`mimir project init --sync` gives a project a portable identity;
+local-SQLite stays authoritative; merges are last-write-wins), via whichever
+path suits you:
 
 - **File** — point it at a folder Syncthing/Dropbox/iCloud/git already
   replicates. No server, no token: `[sync] mode = "file", dir = "~/Synced/mimir"`.
@@ -316,17 +327,31 @@ exact is the point.
 
 ## Roadmap
 
-v0.4 ships the complete original blueprint: memories, docs, code graph,
+v0.4 shipped the complete original blueprint: memories, docs, code graph,
 hybrid + reranked search, self-learning, importers, prebuilt binaries,
 and the crates.io release ([mimir-mem](https://crates.io/crates/mimir-mem)).
-Next: more languages, and whatever using it daily teaches us.
+Daily use has driven everything since: the token-savings layer (outline/peek,
+command filters, the optional proxy), opt-in sync with project scoping, C#
+and SQL in the code graph, remote MCP over HTTP, agent-side memory hygiene,
+and concurrency hardening for many simultaneous sessions. Next: more
+languages, and whatever using it daily teaches us — see
+[CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ## Contributing & security
 
 Bug reports, language adapters, and docs are welcome — see
 [CONTRIBUTING.md](CONTRIBUTING.md). Release history is in
-[CHANGELOG.md](CHANGELOG.md). For security issues, please follow
+[CHANGELOG.md](CHANGELOG.md). Thanks to
+[@nworks3d](https://github.com/nworks3d) for the remote MCP transport and
+the memory-hygiene tools. For security issues, please follow
 [SECURITY.md](SECURITY.md) (private disclosure) rather than a public issue.
+
+## Support
+
+Mimir is free and stays free. If it earns a place in your daily loop, you
+can support development on [Patreon (MuninWorks)](https://www.patreon.com/MuninWorks)
+— patronage covers the servers, domains, and AI tooling behind this and my
+other projects.
 
 ## License
 
