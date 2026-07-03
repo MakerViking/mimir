@@ -427,6 +427,8 @@ mod tests {
                 since: None,
                 limit: 5,
                 strength_alpha: 0.0,
+                recency_alpha: 0.0,
+                include_superseded: false,
             },
         )
         .unwrap();
@@ -463,6 +465,8 @@ mod tests {
                 since: None,
                 limit: 5,
                 strength_alpha: 0.0,
+                recency_alpha: 0.0,
+                include_superseded: false,
             },
         )
         .unwrap();
@@ -477,6 +481,8 @@ mod tests {
                 since: None,
                 limit: 5,
                 strength_alpha: 0.0,
+                recency_alpha: 0.0,
+                include_superseded: false,
             },
         )
         .unwrap();

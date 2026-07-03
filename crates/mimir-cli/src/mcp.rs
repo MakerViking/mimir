@@ -58,6 +58,9 @@ pub struct RecallArgs {
     /// (slower, better ordering; needs the reranker model downloaded).
     #[serde(default)]
     pub rerank: bool,
+    /// true = also include superseded memories (default false hides them).
+    #[serde(default)]
+    pub include_superseded: bool,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -138,6 +141,34 @@ pub struct PeekArgs {
     pub symbol: String,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ForgetArgs {
+    /// Node reference (m:ABCDEF or ULID) to delete.
+    pub r#ref: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct ConsolidateArgs {
+    /// true (default) = report only, change nothing. false = run the passes for
+    /// real (dedup -> supersede, distill, decay-archive). Contradictions are only
+    /// ever reported for human review, never auto-resolved. Take a backup before
+    /// a real run.
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+pub struct SupersedeArgs {
+    /// The OLD node reference to retire (it stops surfacing in recall).
+    pub old: String,
+    /// The NEW node reference that replaces it.
+    pub by: String,
+}
+
 /// Filesystem root for the detected project (None outside any project).
 fn project_root(m: &Mimir, project_id: Option<i64>) -> Option<std::path::PathBuf> {
     let id = project_id?;
@@ -197,6 +228,8 @@ impl MimirServer {
                 since: None,
                 limit: args.limit.unwrap_or(m.config.output.default_limit),
                 strength_alpha: m.config.scoring.strength_alpha,
+                recency_alpha: m.config.scoring.recency_alpha,
+                include_superseded: args.include_superseded,
             };
             let hits = m.search_with(&query, args.rerank).map_err(engine_err)?;
             if hits.is_empty() {
@@ -580,10 +613,103 @@ impl MimirServer {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
+            let sync = if m.config.sync.enabled() {
+                let push = mimir_core::replicate::get_watermark(&m.conn, "last_push").unwrap_or(0);
+                let pull = mimir_core::replicate::get_watermark(&m.conn, "last_pull").unwrap_or(0);
+                let cadence = if m.config.sync.auto {
+                    format!("auto every {} min", m.config.sync.interval_mins)
+                } else {
+                    "manual".into()
+                };
+                format!(
+                    "\nsync    {} {} ({cadence}); local watermarks push={push} pull={pull}",
+                    m.config.sync.mode, m.config.sync.endpoint
+                )
+            } else {
+                "\nsync    off (local store only)".into()
+            };
             Ok(format!(
-                "project {project}\nstore   {summary}\ndb      {} KB",
+                "project {project}\nstore   {summary}\ndb      {} KB{sync}",
                 db_size / 1024
             ))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Delete a memory by reference. Always a reversible SOFT delete (a replicating tombstone: recall hides it and it stays deleted across synced machines). Permanent physical deletion is deliberately not exposed over MCP - a human can run `mimir forget --hard` on the CLI. Use this to prune stale or wrong memories."
+    )]
+    async fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> String {
+        self.blocking(move |m| {
+            let node = store::resolve_ref(&m.conn, &args.r#ref).map_err(engine_err)?;
+            store::soft_delete(&m.conn, node.id).map_err(engine_err)?;
+            Ok(format!(
+                "forgot {} {}",
+                short_uid(node.kind, &node.uid),
+                node.title.as_deref().unwrap_or("")
+            ))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Mark OLD as superseded by NEW: OLD stops surfacing in recall (kept as history) and a `supersedes` edge is recorded. The clean way to replace a stale memory with its corrected version - prefer this over deleting when the new memory replaces the old."
+    )]
+    async fn supersede(&self, Parameters(args): Parameters<SupersedeArgs>) -> String {
+        self.blocking(move |m| {
+            let old = store::resolve_ref(&m.conn, &args.old).map_err(engine_err)?;
+            let new = store::resolve_ref(&m.conn, &args.by).map_err(engine_err)?;
+            store::set_superseded(&m.conn, old.id, new.id).map_err(engine_err)?;
+            store::link(&m.conn, new.id, old.id, Rel::Supersedes, 1.0).map_err(engine_err)?;
+            Ok(format!(
+                "{} superseded by {}",
+                short_uid(old.kind, &old.uid),
+                short_uid(new.kind, &new.uid)
+            ))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Run the consolidation passes (dedup -> supersede near-duplicates, distill clusters, archive decayed memories; contradictions are only reported for human review, never auto-resolved). Defaults to dry_run=true (report only). Pass dry_run=false to apply - take a backup first."
+    )]
+    async fn consolidate(&self, Parameters(args): Parameters<ConsolidateArgs>) -> String {
+        self.blocking(move |m| {
+            let report = mimir_core::consolidate::consolidate(
+                &m.conn,
+                &m.config.embedding.model,
+                args.dry_run,
+            )
+            .map_err(engine_err)?;
+            let prefix = if args.dry_run { "would " } else { "" };
+            if report.is_empty() {
+                return Ok("nothing to consolidate".into());
+            }
+            let mut out = Vec::new();
+            if report.superseded > 0 {
+                out.push(format!(
+                    "{prefix}supersede {} near-duplicate(s)",
+                    report.superseded
+                ));
+            }
+            if report.distilled > 0 {
+                out.push(format!(
+                    "{prefix}distill {} cluster(s) into summaries",
+                    report.distilled
+                ));
+            }
+            if report.archived > 0 {
+                out.push(format!(
+                    "{prefix}archive {} decayed memorie(s)",
+                    report.archived
+                ));
+            }
+            for (a, b) in &report.contradictions {
+                out.push(format!(
+                    "possible contradiction (review by hand):\n  {a}\n  {b}"
+                ));
+            }
+            Ok(out.join("\n"))
         })
         .await
     }
@@ -935,6 +1061,7 @@ mod tests {
                 limit: None,
                 all_projects: true,
                 rerank: false,
+                include_superseded: false,
             }))
             .await;
         assert!(hits.contains("SCRAM"), "recall: {hits}");

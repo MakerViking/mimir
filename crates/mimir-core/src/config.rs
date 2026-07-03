@@ -203,6 +203,10 @@ pub struct RerankConfig {
 pub struct ScoringConfig {
     /// Multiplier weight for learned strength in final ranking.
     pub strength_alpha: f64,
+    /// Opt-in recency boost (default 0.0 = off). When > 0, fresher memories get
+    /// a small multiplicative nudge, capped so it never buries a stronger match.
+    /// Time-sensitive types (decision/note) feel it most via their half-lives.
+    pub recency_alpha: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +241,7 @@ impl Default for ScoringConfig {
     fn default() -> Self {
         ScoringConfig {
             strength_alpha: 0.15,
+            recency_alpha: 0.0,
         }
     }
 }

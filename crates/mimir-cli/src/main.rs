@@ -118,6 +118,9 @@ enum Command {
         /// Show nodes linked to each hit (memories on code, code on memories).
         #[arg(long)]
         linked: bool,
+        /// Include superseded memories (default hides them).
+        #[arg(long)]
+        include_superseded: bool,
     },
     /// Show full records by reference (logs the access).
     Get {
@@ -144,6 +147,14 @@ enum Command {
         reference: String,
         #[arg(long)]
         hard: bool,
+    },
+    /// Mark OLD as superseded by NEW (OLD stops surfacing in recall, kept as history).
+    Supersede {
+        /// The old node reference to retire.
+        old: String,
+        /// The new node reference that replaces it.
+        #[arg(long)]
+        by: String,
     },
     /// Update a memory's text, title, type, or tags.
     Edit {
@@ -504,6 +515,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             full,
             rerank,
             linked,
+            include_superseded,
         } => commands::recall(
             cli.json,
             query.join(" "),
@@ -516,6 +528,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             rerank,
             linked,
             min_score,
+            include_superseded,
         ),
         Command::Get { refs } => commands::get(cli.json, refs),
         Command::List {
@@ -526,6 +539,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             limit,
         } => commands::list(cli.json, mtype, tag, global, all, limit),
         Command::Forget { reference, hard } => commands::forget(&reference, hard),
+        Command::Supersede { old, by } => commands::supersede(&old, &by),
         Command::Edit {
             reference,
             text,

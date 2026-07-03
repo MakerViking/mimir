@@ -88,6 +88,8 @@ fn find_duplicate(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<N
         since: None,
         limit: 5,
         strength_alpha: 0.0,
+        recency_alpha: 0.0,
+        include_superseded: false,
     };
     for hit in search::search(conn, &query)? {
         // Title-only memories (some imports) have no body — compare against
