@@ -4,6 +4,25 @@ All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
+### Changed
+- **Ranking now favours fresh and preventer-type memories.** Recency is on
+  by default (`scoring.recency_alpha` 0.0 → 0.4), so a current fact outranks
+  a stale one on an equal match, and gotcha/decision memories get a modest
+  priority nudge (`scoring.type_prior_alpha` 0.12) so a hard-won preventer
+  isn't buried under an incidental note. Both are tunable in `config.toml`;
+  RRF fusion `k` is unchanged. On the (reproducible) retrieval eval this
+  lifts real-model drift-preventer recall 0.71 → 0.86 with no regression to
+  the previously-correct set.
+
+### Fixed
+- **Warm recall latency ~254 ms → single-digit ms.** The cost was a full
+  in-memory vector-matrix rebuild on every recall that followed any
+  `remember`/embed (the cache was dropped wholesale, and same-connection
+  writes don't bump SQLite's `data_version`). The cache now patches only the
+  changed rows in place (~258 ms → ~6 ms on a 97k-node store); the fused
+  `get_node` fan-out is also batched into one query. Result ordering is
+  unchanged (parity-tested).
+
 ### Added
 - **Opt-in per-prompt auto-recall: `mimir init --hooks --auto-recall`**
   installs a UserPromptSubmit hook that injects at most one relevant memory
@@ -37,6 +56,11 @@ the `mimir-mem` crate, and the on-disk schema move together.
   `mimir-graph` re-exports the same items, so this is a no-op for existing
   callers. Workspace is now five crates: `mimir-core`, `mimir-graph`,
   `mimir-syntax`, `mimir-proxy`, `mimir-cli`.
+- **Reproducible retrieval-eval harness** (`crates/mimir-core/src/eval`,
+  dev-only `eval` cargo feature): a seeded corpus + labelled question set
+  with a tuning/holdout split scoring precision@k / recall / MRR in both a
+  hermetic synthetic-vector mode and a real-model mode, so ranking changes
+  are measured, not asserted. Not shipped on any user surface.
 
 
 ## [0.13.0] — 2026-07-03
