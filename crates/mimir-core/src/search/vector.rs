@@ -98,6 +98,83 @@ impl MatrixCache {
         });
         Ok(())
     }
+
+    /// Patch specific rows into an already-loaded cache instead of a full
+    /// reload. `embed_pending` (e.g. one `remember`) touches a handful of
+    /// nodes; without this, the resident MCP server's cache would otherwise
+    /// pay a full corpus reload (hundreds of ms at real size — the exact
+    /// same query `ensure` runs from scratch) on the very next recall,
+    /// since same-connection writes don't bump `data_version` and so can't
+    /// be caught by `ensure`'s normal invalidation check.
+    ///
+    /// No-op (never an error) when there's no cache to patch or its model
+    /// doesn't match `model` — the next `ensure` call does a correct full
+    /// rebuild in that case, same as before this existed.
+    pub fn upsert(
+        conn: &Connection,
+        model: &str,
+        ids: &[i64],
+        cache: &mut Option<MatrixCache>,
+    ) -> Result<()> {
+        let Some(c) = cache.as_mut() else {
+            return Ok(());
+        };
+        if c.model != model || ids.is_empty() {
+            return Ok(());
+        }
+        let id_list = ids
+            .iter()
+            .map(i64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT e.node_id, e.dim, e.vec, n.project_id, n.kind, n.created_at
+             FROM embedding e JOIN node n ON n.id = e.node_id
+             WHERE e.model = ?1 AND n.deleted_at IS NULL AND e.node_id IN ({id_list})"
+        ))?;
+        let mut rows = stmt.query([model])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let row_dim: i64 = row.get(1)?;
+            let blob: Vec<u8> = row.get(2)?;
+            let vec = crate::embed::from_blob(&blob);
+            if c.dim == 0 {
+                c.dim = row_dim as usize;
+            }
+            if row_dim as usize != c.dim || vec.len() != c.dim {
+                tracing::warn!(node = id, "embedding dim mismatch on cache patch; skipping");
+                continue;
+            }
+            let project_id: Option<i64> = row.get(3)?;
+            let kind: String = row.get(4)?;
+            let created: i64 = row.get(5)?;
+            let kind_idx = match c.kind_names.iter().position(|k| *k == kind) {
+                Some(i) => i,
+                None => {
+                    c.kind_names.push(kind);
+                    c.kind_names.len() - 1
+                }
+            };
+            // Linear scan: `ids` is small (single-digit in the common
+            // `remember`-one-node case), so this beats building a hash index.
+            match c.node_ids.iter().position(|&x| x == id) {
+                Some(i) => {
+                    c.data[i * c.dim..(i + 1) * c.dim].copy_from_slice(&vec);
+                    c.project_ids[i] = project_id;
+                    c.kind_of[i] = kind_idx as u8;
+                    c.created_at[i] = created;
+                }
+                None => {
+                    c.node_ids.push(id);
+                    c.data.extend_from_slice(&vec);
+                    c.project_ids.push(project_id);
+                    c.kind_of.push(kind_idx as u8);
+                    c.created_at.push(created);
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Ranked node ids (best first) by dot product against `query_vec`,
@@ -213,6 +290,8 @@ mod tests {
             limit: 10,
             strength_alpha: 0.0,
             recency_alpha: 0.0,
+            type_prior_alpha: 0.0,
+            code_damp: 1.0,
             include_superseded: false,
         }
     }
@@ -315,5 +394,50 @@ mod tests {
         assert!(leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &q(), 10)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn upsert_patches_new_and_changed_rows_matching_a_full_rebuild() {
+        let conn = db::open_in_memory().unwrap();
+        let a = add_with_vec(&conn, "a", &[1.0, 0.0]);
+        let mut cache = None;
+        MatrixCache::ensure(&conn, MODEL, &mut cache).unwrap();
+
+        // New node, added via a same-connection write `ensure` alone would
+        // miss (see `same_connection_writes_need_explicit_invalidation`).
+        let b = add_with_vec(&conn, "b", &[0.0, 1.0]);
+        // Existing node, content changed in place (same node_id) — now a
+        // partial match instead of its original orthogonal-to-query vector.
+        conn.execute(
+            "UPDATE embedding SET vec = ?2 WHERE node_id = ?1",
+            rusqlite::params![a, to_blob(&[0.6, 0.8])],
+        )
+        .unwrap();
+
+        MatrixCache::upsert(&conn, MODEL, &[a, b], &mut cache).unwrap();
+        let patched = leg(&conn, &mut cache, MODEL, &[0.0, 1.0], &q(), 10).unwrap();
+
+        // A fresh full rebuild from the same (now-committed) state must agree,
+        // including tie-break order.
+        let mut rebuilt = None;
+        let full = leg(&conn, &mut rebuilt, MODEL, &[0.0, 1.0], &q(), 10).unwrap();
+        assert_eq!(patched, full, "patched cache diverged from a full rebuild");
+        assert_eq!(patched, vec![b, a], "b (dot=1.0) outranks patched a (dot=0.8)");
+    }
+
+
+    #[test]
+    fn upsert_is_noop_without_a_cache_or_on_model_mismatch() {
+        let conn = db::open_in_memory().unwrap();
+        let a = add_with_vec(&conn, "a", &[1.0, 0.0]);
+        let mut cache = None;
+        // No cache yet: no-op, doesn't fabricate one.
+        MatrixCache::upsert(&conn, MODEL, &[a], &mut cache).unwrap();
+        assert!(cache.is_none());
+
+        MatrixCache::ensure(&conn, MODEL, &mut cache).unwrap();
+        // Wrong model: no-op, leaves the existing cache alone.
+        MatrixCache::upsert(&conn, "other-model", &[a], &mut cache).unwrap();
+        assert_eq!(cache.as_ref().unwrap().model, MODEL);
     }
 }

@@ -88,6 +88,26 @@ pub fn get_node(conn: &Connection, id: i64) -> Result<Node> {
     .ok_or_else(|| Error::NotFound(format!("node #{id}")))
 }
 
+/// Batch fetch, one round-trip instead of one query per id — the fused
+/// hybrid-search candidate list can be up to 200 ids (two 100-cap legs).
+/// Order is unspecified (SQLite's `IN` doesn't preserve list order); callers
+/// that need a particular order must sort themselves. Ids with no matching
+/// live row (e.g. deleted between fusion and fetch) are simply absent, not
+/// an error.
+pub fn get_nodes(conn: &Connection, ids: &[i64]) -> Result<Vec<Node>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let id_list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} FROM node WHERE id IN ({id_list})"
+    ))?;
+    let nodes = stmt
+        .query_map([], row_to_node)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(nodes)
+}
+
 pub fn get_node_by_uid(conn: &Connection, uid: &str) -> Result<Node> {
     conn.query_row(
         &format!("SELECT {NODE_COLS} FROM node WHERE uid = ?1"),
@@ -490,6 +510,39 @@ mod tests {
         assert_eq!(by_id.uid, node.uid);
         let by_uid = get_node_by_uid(&conn, &node.uid).unwrap();
         assert_eq!(by_uid.id, node.id);
+    }
+
+    #[test]
+    fn get_nodes_batches_and_matches_individual_lookups() {
+        let conn = conn();
+        let a = memory(&conn, "alpha", "x");
+        let b = memory(&conn, "beta", "y");
+        let c = memory(&conn, "gamma", "z");
+        soft_delete(&conn, c.id).unwrap(); // still fetchable by id, just flagged
+
+        let batch = get_nodes(&conn, &[a.id, b.id, c.id, 999_999]).unwrap();
+        // Same set as calling get_node per id (999_999 simply absent, no error).
+        let mut want = vec![
+            get_node(&conn, a.id).unwrap(),
+            get_node(&conn, b.id).unwrap(),
+            get_node(&conn, c.id).unwrap(),
+        ];
+        let mut got = batch;
+        let by_id = |n: &Node| n.id;
+        want.sort_by_key(by_id);
+        got.sort_by_key(by_id);
+        assert_eq!(want.len(), got.len());
+        for (w, g) in want.iter().zip(&got) {
+            assert_eq!(w.id, g.id);
+            assert_eq!(w.title, g.title);
+            assert_eq!(w.deleted_at.is_some(), g.deleted_at.is_some());
+        }
+    }
+
+    #[test]
+    fn get_nodes_empty_ids_is_empty() {
+        let conn = conn();
+        assert!(get_nodes(&conn, &[]).unwrap().is_empty());
     }
 
     #[test]

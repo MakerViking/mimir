@@ -63,7 +63,7 @@ fn execution_providers(device: &str) -> Vec<ort::ep::ExecutionProviderDispatch> 
 pub const EMBED_BATCH: usize = 64;
 
 /// Kinds whose body participates in semantic recall.
-const EMBEDDABLE_KINDS: &str = "'memory', 'chunk', 'annotation', 'symbol'";
+const EMBEDDABLE_KINDS: &str = "'memory', 'chunk', 'annotation', 'symbol', 'codechunk'";
 
 pub fn model_from_name(name: &str) -> Result<EmbeddingModel> {
     Ok(match name {
@@ -225,7 +225,10 @@ pub fn from_blob(blob: &[u8]) -> Vec<f32> {
 /// never starves concurrent sessions. Each batch is independent: embeddings
 /// carry no cross-row invariant, so a partial run just leaves the rest pending
 /// for next time.
-pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<usize> {
+///
+/// Returns the ids of every node embedded (fresh inference or dedup copy),
+/// so callers can patch a live vector-matrix cache instead of dropping it.
+pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<Vec<i64>> {
     struct Pending {
         id: i64,
         text: String,
@@ -257,8 +260,9 @@ pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<usize
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
     if pending.is_empty() {
-        return Ok(0);
+        return Ok(Vec::new());
     }
+    let ids: Vec<i64> = pending.iter().map(|p| p.id).collect();
 
     // Nodes per write transaction. Inference is out of the lock, so the tx only
     // holds for the upserts; this bounds the hold (and memory) on a bulk import.
@@ -304,7 +308,7 @@ pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<usize
         }
         tx.commit()?;
     }
-    Ok(pending.len())
+    Ok(ids)
 }
 
 fn upsert(

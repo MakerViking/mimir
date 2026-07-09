@@ -8,6 +8,8 @@ pub mod config;
 pub mod consolidate;
 pub mod db;
 pub mod embed;
+#[cfg(any(test, feature = "eval"))]
+pub mod eval;
 pub mod error;
 pub mod format;
 pub mod import;
@@ -133,10 +135,34 @@ impl Mimir {
         self.search_with(query, false)
     }
 
+    /// Like [`Mimir::search`], but also returns the raw per-leg ranked id
+    /// lists (`legs[0]` = FTS, `legs[1]` = vector iff a model is loaded) —
+    /// used by callers that need to check lexical/semantic agreement on a
+    /// hit before trusting it (e.g. the auto-recall relevance floor). No
+    /// reranking: the floor check needs the legs' own top-K as computed
+    /// before any cross-encoder rescoring.
+    pub fn search_with_legs(&mut self, query: &SearchQuery) -> Result<(Vec<Hit>, Vec<Vec<i64>>)> {
+        let query_vec = self.query_embedding(&query.text);
+        match query_vec {
+            Some(v) => {
+                let model = self.config.embedding.model.clone();
+                search::search_hybrid_with_legs(
+                    &self.conn,
+                    query,
+                    Some((&model, &v)),
+                    &mut self.matrix,
+                )
+            }
+            None => search::search_hybrid_with_legs(&self.conn, query, None, &mut self.matrix),
+        }
+    }
+
     /// Embed a query, memoized per process. None = no model / embed failed
     /// (search degrades to BM25-only).
     fn query_embedding(&mut self, text: &str) -> Option<Vec<f32>> {
+        let started = std::time::Instant::now();
         if let Some(v) = self.query_cache.get(text) {
+            tracing::debug!(elapsed = ?started.elapsed(), "query_embedding: cache hit");
             return Some(v.clone());
         }
         let vec = self.ensure_embedder(false).and_then(|e| {
@@ -151,6 +177,7 @@ impl Mimir {
                     }
                 })
         })?;
+        tracing::debug!(elapsed = ?started.elapsed(), chars = text.len(), "query_embedding: cache miss (model call)");
         if self.query_cache.len() >= QUERY_CACHE_CAP {
             self.query_cache.clear();
         }
@@ -216,24 +243,37 @@ impl Mimir {
     }
 
     /// Embed all new/changed content. No-op (0) when no model is present.
-    /// Drops the vector matrix cache when anything changed (same-connection
-    /// writes are invisible to data_version).
+    /// Patches the vector matrix cache in place for a small batch (the
+    /// common `remember`-one-node case) instead of dropping it — same-
+    /// connection writes are invisible to `data_version`, so a dropped
+    /// cache would otherwise pay a full corpus reload on the next recall.
+    /// A large batch (bulk import/reindex) still drops it: patching would
+    /// cost about as much as a rebuild, for no benefit.
     pub fn embed_pending(&mut self) -> Result<usize> {
         self.ensure_embedder(false);
         let Mimir {
             conn,
             embedder,
             matrix,
+            config,
             ..
         } = self;
-        let n = match embedder.as_mut() {
+        let ids = match embedder.as_mut() {
             Some(e) => embed::embed_pending(conn, e)?,
-            None => 0,
+            None => Vec::new(),
         };
-        if n > 0 {
-            *matrix = None;
+        // Above this, a linear-scan patch (see MatrixCache::upsert) approaches
+        // the cost of just rebuilding; bulk operations aren't latency-sensitive
+        // the way interactive recall is, so fall back to the old behavior.
+        const PATCH_THRESHOLD: usize = 200;
+        if !ids.is_empty() {
+            if ids.len() <= PATCH_THRESHOLD {
+                MatrixCache::upsert(conn, &config.embedding.model, &ids, matrix)?;
+            } else {
+                *matrix = None;
+            }
         }
-        Ok(n)
+        Ok(ids.len())
     }
 
     /// Resolve (and lazily register) the project for a working directory, plus
