@@ -5,10 +5,10 @@ use mimir_core::config::{Config, Paths};
 use mimir_core::format::agent_line;
 use mimir_core::memory::{self, Remember, RememberOutcome};
 use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope};
-use mimir_core::search::SearchQuery;
+use mimir_core::search::{fts, SearchQuery};
 use mimir_core::{db, store, Mimir};
 
-pub fn init(no_model: bool, hooks: bool) -> Result<()> {
+pub fn init(no_model: bool, hooks: bool, auto_recall: bool) -> Result<()> {
     let paths = Paths::resolve()?;
     let config = Config::load(&paths.config_file)?;
     config.save(&paths.config_file)?;
@@ -35,7 +35,7 @@ pub fn init(no_model: bool, hooks: bool) -> Result<()> {
     }
     install_agent_commands(&config);
     if hooks {
-        if let Err(err) = install_hooks() {
+        if let Err(err) = install_hooks(auto_recall) {
             eprintln!("hooks   install failed: {err}");
         }
     }
@@ -46,6 +46,10 @@ pub fn init(no_model: bool, hooks: bool) -> Result<()> {
         println!();
         println!("Token-saving hooks (filter command output + inject project rules) are opt-in:");
         println!("  mimir init --hooks");
+    } else if !auto_recall {
+        println!();
+        println!("Per-prompt auto-recall (inject a relevant memory into every prompt) is opt-in:");
+        println!("  mimir init --hooks --auto-recall");
     }
     Ok(())
 }
@@ -74,10 +78,33 @@ jq -n --argjson updated "$UPDATED" '{
 }'
 "#;
 
+/// The opt-in UserPromptSubmit hook script: delegates all relevance-floor
+/// logic to `mimir recall-inject`, so it lives in the Rust binary (single
+/// source of truth), not this file. Unlike `MIMIR_REWRITE_SH`, plain stdout
+/// (not a `hookSpecificOutput` JSON envelope) is how Claude Code injects
+/// UserPromptSubmit context — same mechanism as the SessionStart rules hook.
+const MIMIR_RECALL_SH: &str = r#"#!/usr/bin/env bash
+# mimir-hook-version: 1
+# Mimir UserPromptSubmit hook — prints at most one relevant memory (or
+# nothing) as extra context for this turn. All logic, including the
+# relevance floor, lives in `mimir recall-inject`. Requires: mimir, jq.
+command -v jq >/dev/null 2>&1 || exit 0
+command -v mimir >/dev/null 2>&1 || exit 0
+INPUT=$(cat)
+PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // empty')
+[ -z "$PROMPT" ] && exit 0
+mimir recall-inject "$PROMPT" 2>/dev/null
+exit 0
+"#;
+
 /// Install the opt-in Claude Code hooks: a PreToolUse(Bash) rewrite hook and a
-/// SessionStart hook that injects the project rules pack. Idempotent, backs up
-/// settings.json, and never clobbers existing hooks.
-fn install_hooks() -> Result<()> {
+/// SessionStart hook that injects the project rules pack, plus (when
+/// `auto_recall`) a UserPromptSubmit hook that injects at most one relevant
+/// memory per prompt. Idempotent, backs up settings.json, and never clobbers
+/// existing hooks. `auto_recall=false` leaves `hooks.UserPromptSubmit`
+/// untouched — behavior is otherwise identical to before this flag existed
+/// (see `merge_hook_settings`'s unit tests).
+fn install_hooks(auto_recall: bool) -> Result<()> {
     if std::env::var_os("MIMIR_HOME").is_some() {
         return Ok(()); // isolated instances never touch the user's agent config
     }
@@ -88,9 +115,10 @@ fn install_hooks() -> Result<()> {
         return Ok(());
     }
 
-    // 1. Write the PreToolUse delegate script (executable).
     let hooks_dir = claude.join("hooks");
     std::fs::create_dir_all(&hooks_dir)?;
+
+    // 1. Write the PreToolUse delegate script (executable).
     let script = hooks_dir.join("mimir-rewrite.sh");
     std::fs::write(&script, MIMIR_REWRITE_SH)?;
     #[cfg(unix)]
@@ -100,9 +128,23 @@ fn install_hooks() -> Result<()> {
     }
     let script_str = script.to_string_lossy().into_owned();
 
-    // 2. Merge into settings.json (back it up first).
+    // 2. Auto-recall delegate script — only written when opted in.
+    let recall_script_str = if auto_recall {
+        let recall_script = hooks_dir.join("mimir-recall.sh");
+        std::fs::write(&recall_script, MIMIR_RECALL_SH)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recall_script, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Some(recall_script.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
+    // 3. Merge into settings.json (back it up first).
     let settings_path = claude.join("settings.json");
-    let mut root: serde_json::Value = match std::fs::read_to_string(&settings_path) {
+    let root: serde_json::Value = match std::fs::read_to_string(&settings_path) {
         Ok(text) => {
             std::fs::write(claude.join("settings.json.mimir-bak"), &text)?;
             serde_json::from_str(&text).context("settings.json is not valid JSON")?
@@ -110,6 +152,28 @@ fn install_hooks() -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(e) => return Err(e.into()),
     };
+    let (root, messages) = merge_hook_settings(root, &script_str, recall_script_str.as_deref())?;
+
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+    println!("hooks   {}", messages.join("; "));
+    println!(
+        "hooks   backup at {}",
+        claude.join("settings.json.mimir-bak").display()
+    );
+    Ok(())
+}
+
+/// Pure settings.json merge, split out of `install_hooks` so the merge
+/// logic (idempotency, which keys get touched) is unit-testable without a
+/// real `~/.claude` — `install_hooks` early-returns under `MIMIR_HOME`, so
+/// this is the only way to test it at all. `recall_script = None` must
+/// leave `hooks.UserPromptSubmit` completely untouched: that's what makes
+/// `auto_recall=false` byte-identical to pre-auto-recall behavior.
+fn merge_hook_settings(
+    mut root: serde_json::Value,
+    rewrite_script: &str,
+    recall_script: Option<&str>,
+) -> Result<(serde_json::Value, Vec<String>)> {
     if !root.is_object() {
         bail!("settings.json is not a JSON object");
     }
@@ -159,19 +223,32 @@ fn install_hooks() -> Result<()> {
     } else {
         pre_arr.push(serde_json::json!({
             "matcher": "Bash",
-            "hooks": [{ "type": "command", "command": script_str }]
+            "hooks": [{ "type": "command", "command": rewrite_script }]
         }));
         messages.push("PreToolUse (command filter) added".into());
     }
 
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
-    println!("hooks   {}", messages.join("; "));
-    println!(
-        "hooks   backup at {}",
-        claude.join("settings.json.mimir-bak").display()
-    );
-    Ok(())
+    // UserPromptSubmit: opt-in auto-recall. Only touched when asked for.
+    if let Some(recall_script) = recall_script {
+        let prompt = hooks
+            .entry("UserPromptSubmit")
+            .or_insert_with(|| serde_json::json!([]));
+        let prompt_arr = prompt
+            .as_array_mut()
+            .context("hooks.UserPromptSubmit is not an array")?;
+        if entries_mention(prompt_arr, "mimir-recall") {
+            messages.push("UserPromptSubmit already installed".into());
+        } else {
+            prompt_arr.push(serde_json::json!({
+                "hooks": [{ "type": "command", "command": recall_script }]
+            }));
+            messages.push("UserPromptSubmit (auto-recall) added".into());
+        }
+    }
+
+    Ok((root, messages))
 }
+
 
 /// True if any hook entry (or its nested hooks) has a command containing `needle`.
 fn entries_mention(entries: &[serde_json::Value], needle: &str) -> bool {
@@ -633,6 +710,8 @@ pub fn recall(
         limit: limit.unwrap_or(mimir.config.output.default_limit),
         strength_alpha: mimir.config.scoring.strength_alpha,
         recency_alpha: mimir.config.scoring.recency_alpha,
+        type_prior_alpha: mimir.config.scoring.type_prior_alpha,
+        code_damp: mimir.config.scoring.code_damp,
         include_superseded,
         text,
     };
@@ -699,6 +778,145 @@ pub fn recall(
         }
     }
     Ok(())
+}
+
+/// Token budget for injected auto-recall text (~200 tokens — team target,
+/// comparable to THOR's ~212). Injecting a wrong memory is worse than
+/// injecting nothing, so this trims whole hits, never mid-sentence.
+const RECALL_INJECT_TOKEN_BUDGET: usize = 200;
+
+/// Minimum number of non-stopword prompt tokens that must also appear in
+/// the candidate's title+body. Always enforced — the cheapest,
+/// always-available half of the relevance floor (works with or without an
+/// embedding model).
+const RECALL_INJECT_MIN_OVERLAP: usize = 2;
+
+/// How deep into the vector leg's own ranking (not the fused rank) a hit
+/// must appear to count as "semantically agreed" for rule 3 below.
+const RECALL_INJECT_LEG_TOP_K: usize = 10;
+
+/// Print at most one relevant memory for `prompt`, or nothing if none
+/// clears the relevance floor. Backs the opt-in UserPromptSubmit hook
+/// (`mimir init --hooks --auto-recall`) — runs on every single prompt, so
+/// it must be fast, side-effect-light, and silent by default: RRF's fused
+/// score isn't a calibrated probability, so it can't be thresholded
+/// directly, and a wrong injected memory actively misleads the agent,
+/// which is worse than saying nothing.
+///
+/// Relevance floor (erring toward silence):
+///   1. Candidate pool is `Kind::Memory` with subkind gotcha/decision only
+///      — the two "preventer" types (see `learn::type_prior`), the
+///      highest-value, lowest-risk thing to surface unprompted. Plain
+///      notes/ideas are informative but not worth the false-positive risk
+///      of auto-injecting into every turn.
+///   2. At least `RECALL_INJECT_MIN_OVERLAP` non-stopword prompt tokens
+///      must also appear in the hit's title+body.
+///   3. When a vector leg was actually computed (an embedding model is
+///      loaded), the hit must ALSO appear in that leg's own top
+///      `RECALL_INJECT_LEG_TOP_K` — lexical+semantic agreement, not just a
+///      lucky BM25 match. Skipped (not required) with no model: degrades
+///      cleanly to rules 1+2 alone rather than refusing to ever fire.
+pub fn recall_inject(prompt: String) -> Result<()> {
+    let prompt = prompt.trim();
+    if prompt.is_empty() {
+        return Ok(());
+    }
+    let mut mimir = Mimir::open()?;
+    let query = SearchQuery {
+        text: prompt.to_string(),
+        scope: read_scope(&mimir, false, false)?,
+        kinds: vec![Kind::Memory],
+        since: None,
+        limit: 5,
+        strength_alpha: mimir.config.scoring.strength_alpha,
+        recency_alpha: mimir.config.scoring.recency_alpha,
+        type_prior_alpha: mimir.config.scoring.type_prior_alpha,
+        code_damp: mimir.config.scoring.code_damp,
+        include_superseded: false,
+    };
+    let (hits, legs) = mimir.search_with_legs(&query)?;
+    let Some(top) = hits.first() else {
+        return Ok(());
+    };
+
+    // Rule 1: preventer types only.
+    let is_preventer = matches!(
+        top.node.subkind.as_deref(),
+        Some("gotcha") | Some("decision")
+    );
+    if !is_preventer {
+        return Ok(());
+    }
+
+    // Rule 2: minimum term overlap (case/punctuation-insensitive, via the
+    // same tokenizer the near-duplicate detector uses).
+    let prompt_tokens: std::collections::HashSet<String> = memory::tokens(prompt)
+        .into_iter()
+        .filter(|t| !fts::is_stopword(t))
+        .collect();
+    let hay = format!(
+        "{} {}",
+        top.node.title.as_deref().unwrap_or(""),
+        top.node.body.as_deref().unwrap_or("")
+    );
+    let hay_tokens: std::collections::HashSet<String> = memory::tokens(&hay).into_iter().collect();
+    let overlap = prompt_tokens.intersection(&hay_tokens).count();
+    if overlap < RECALL_INJECT_MIN_OVERLAP {
+        return Ok(());
+    }
+
+    // Rule 3: dual-leg agreement, only when a vector leg exists (legs[0] is
+    // always FTS, legs[1] is vector iff a model embedded this query).
+    if let Some(vector_leg) = legs.get(1) {
+        let agrees = vector_leg
+            .iter()
+            .take(RECALL_INJECT_LEG_TOP_K)
+            .any(|id| *id == top.node.id);
+        if !agrees {
+            return Ok(());
+        }
+    }
+
+    // Floor cleared — format compactly within the token budget and print.
+    // Reuse the same one-line agent format as `recall` (id, type, date,
+    // title, non-redundant body snippet) instead of a bespoke format: it
+    // already skips the part of the body the title covers.
+    let projects = store::project_titles(&mimir.conn)?;
+    let text = truncate_to_token_budget(
+        &format!(
+            "Relevant memory: {}",
+            line(&top.node, &projects, mimir.config.output.snippet_chars)
+        ),
+        RECALL_INJECT_TOKEN_BUDGET,
+    );
+    println!("{text}");
+
+    // Log the impression like a normal recall, so it feeds future ranking
+    // (learn::record_shown / strength decay) same as an explicit recall.
+    let query_hash = blake3::hash(query.text.as_bytes());
+    store::record_shown(
+        &mimir.conn,
+        query_hash.as_bytes(),
+        &[(top.node.id, 0i64, top.score)],
+    )?;
+    Ok(())
+}
+
+/// Trim `text` to at most `budget` tokens (Mimir's bundled tokenizer),
+/// preferring a whole-hit cut over a mid-sentence one isn't practical here
+/// (the caller already passes one compact hit), so this just truncates the
+/// tail. Coarse char-based cut first (avoids re-tokenizing a long string
+/// character-by-character), then a short bounded fine pass.
+fn truncate_to_token_budget(text: &str, budget: usize) -> String {
+    if mimir_core::tokens::count(text) <= budget {
+        return text.to_string();
+    }
+    let approx_chars = budget * 4; // tiktoken o200k_base averages ~4 chars/token for English
+    let mut cut: String = text.chars().take(approx_chars).collect();
+    while mimir_core::tokens::count(&cut) > budget && !cut.is_empty() {
+        cut.pop();
+    }
+    format!("{cut}…")
 }
 
 pub fn get(json: bool, refs: Vec<String>) -> Result<()> {
@@ -1013,6 +1231,18 @@ fn mentions_symbol(text: &str, name: &str) -> bool {
 // ---------- docs & index ----------
 
 pub fn docs_add(path: &str, name: Option<String>, global: bool) -> Result<()> {
+    add_collection_cmd(path, name, global, "docs")
+}
+
+/// Register + index a source-code collection: chunks function/method bodies
+/// (not just signatures) on tree-sitter symbol boundaries for recall —
+/// mirrors `docs add`, indexing source instead of markdown. Idea credit:
+/// nworks3d's THOR fork of Mimir (see CHANGELOG.md).
+pub fn code_add(path: &str, name: Option<String>, global: bool) -> Result<()> {
+    add_collection_cmd(path, name, global, "code")
+}
+
+fn add_collection_cmd(path: &str, name: Option<String>, global: bool, kind: &str) -> Result<()> {
     let mimir = Mimir::open()?;
     let root = std::path::Path::new(path);
     let canonical = std::fs::canonicalize(root).with_context(|| format!("no such dir: {path}"))?;
@@ -1032,6 +1262,7 @@ pub fn docs_add(path: &str, name: Option<String>, global: bool) -> Result<()> {
         &canonical,
         &name,
         project.as_ref().map(|p| p.id),
+        kind,
     )?;
     println!(
         "{} {} {}",
@@ -1059,8 +1290,13 @@ pub fn docs_list(json: bool) -> Result<()> {
             v["chunks"] = serde_json::json!(chunks);
             println!("{v}");
         } else {
+            let kind = coll
+                .meta
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("docs");
             println!(
-                "{} {} {} ({files} files, {chunks} chunks)",
+                "{} [{kind}] {} {} ({files} files, {chunks} chunks)",
                 short_uid(coll.kind, &coll.uid),
                 coll.title.as_deref().unwrap_or("?"),
                 coll.path.as_deref().unwrap_or("?"),
@@ -1160,7 +1396,7 @@ pub fn import_qmd(file: Option<String>) -> Result<()> {
             eprintln!("skipping {name}: {root} is not a directory");
             continue;
         }
-        let coll = mimir_core::index::add_collection(&mimir.conn, root_path, name, None)?;
+        let coll = mimir_core::index::add_collection(&mimir.conn, root_path, name, None, "docs")?;
         println!(
             "registered {} {} {}",
             short_uid(coll.kind, &coll.uid),
@@ -1228,10 +1464,17 @@ fn read_scope(mimir: &Mimir, global: bool, all: bool) -> Result<Scope> {
 
 fn parse_kind_filter(kind: &str) -> Result<Vec<Kind>> {
     Ok(match kind {
+        // No kind filter — deliberately includes CodeChunk. The point of
+        // indexing function bodies (not just signatures) is that a plain
+        // `recall` finds them without the caller knowing to ask for
+        // `--kind code`; ScoringConfig::code_damp keeps code from drowning
+        // out memories given its much larger corpus share.
         "all" => vec![],
         "memory" => vec![Kind::Memory],
         "doc" => vec![Kind::File, Kind::Chunk, Kind::Annotation],
-        "code" => vec![Kind::Symbol],
+        // Symbol = signature/doc only; CodeChunk = actual body/content text
+        // (see chunker::chunk_source). Both belong under `code`.
+        "code" => vec![Kind::Symbol, Kind::CodeChunk],
         other => bail!("unknown --kind '{other}' (use all|memory|doc|code)"),
     })
 }
@@ -1338,3 +1581,56 @@ mod scan_tests {
         assert!(!mentions_symbol("Pending tasks for tomorrow", "Pending"));
     }
 }
+
+#[cfg(test)]
+mod hooks_tests {
+    use super::merge_hook_settings;
+
+    /// `auto_recall=false` (recall_script = None) must be byte-identical to
+    /// pre-auto-recall behavior: no `UserPromptSubmit` key appears at all.
+    #[test]
+    fn no_recall_script_leaves_user_prompt_submit_untouched() {
+        let (root, messages) =
+            merge_hook_settings(serde_json::json!({}), "/path/mimir-rewrite.sh", None).unwrap();
+        assert!(
+            root["hooks"].get("UserPromptSubmit").is_none(),
+            "auto_recall=false must not add hooks.UserPromptSubmit, got: {root}"
+        );
+        // The pre-existing hooks still get installed as before.
+        assert!(root["hooks"]["SessionStart"].is_array());
+        assert!(root["hooks"]["PreToolUse"].is_array());
+        assert!(messages.iter().any(|m| m.contains("SessionStart")));
+        assert!(messages.iter().any(|m| m.contains("PreToolUse")));
+        assert!(!messages.iter().any(|m| m.contains("UserPromptSubmit")));
+    }
+
+    /// `auto_recall=true` adds exactly one `UserPromptSubmit` entry
+    /// pointing at the recall script, and re-running is a no-op (idempotent).
+    #[test]
+    fn recall_script_adds_one_entry_idempotently() {
+        let (root, messages) = merge_hook_settings(
+            serde_json::json!({}),
+            "/path/mimir-rewrite.sh",
+            Some("/path/mimir-recall.sh"),
+        )
+        .unwrap();
+        let entries = root["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(messages.iter().any(|m| m.contains("UserPromptSubmit")));
+
+        // Re-run against the already-merged settings: still exactly one entry,
+        // and the message says "already installed" instead of "added".
+        let (root2, messages2) = merge_hook_settings(
+            root,
+            "/path/mimir-rewrite.sh",
+            Some("/path/mimir-recall.sh"),
+        )
+        .unwrap();
+        let entries2 = root2["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(entries2.len(), 1, "re-running must not duplicate the entry");
+        assert!(messages2
+            .iter()
+            .any(|m| m.contains("UserPromptSubmit already installed")));
+    }
+}
+

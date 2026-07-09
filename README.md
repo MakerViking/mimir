@@ -269,6 +269,12 @@ dashboard panel and a `/m-savings` command.
   **volume-capped non-lossily** (head + tail + every signal line; the bulky
   middle elided behind a visible marker). `mimir init --hooks` wires this in as
   a PreToolUse hook so it happens automatically.
+- **`mimir init --hooks --auto-recall`** (opt-in, off by default) — injects at
+  most one relevant gotcha/decision memory into each prompt's context via a
+  UserPromptSubmit hook, on top of the static SessionStart rules pack. Errs
+  toward silence: a hit must clear a relevance floor (term overlap, plus
+  lexical+semantic agreement when the embedding model is loaded) before it's
+  ever shown, capped at ~200 tokens.
 - **Optional API proxy** (`mimir proxy`, off by default) — adds prompt-cache
   breakpoints and lossless repeated-block dedup to Anthropic API traffic. See
   [docs/proxy.md](docs/proxy.md) and [docs/benchmarks.md](docs/benchmarks.md).

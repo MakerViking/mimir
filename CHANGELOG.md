@@ -3,6 +3,42 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [Unreleased]
+### Added
+- **Opt-in per-prompt auto-recall: `mimir init --hooks --auto-recall`**
+  installs a UserPromptSubmit hook that injects at most one relevant memory
+  into each prompt's context — the counterpart to the existing static
+  SessionStart rules pack. Off by default; `--hooks` alone is unchanged.
+  Errs toward silence: only gotcha/decision memories qualify, and a hit
+  must clear a documented relevance floor (minimum prompt/memory term
+  overlap, plus lexical+semantic leg agreement when the embedding model is
+  loaded) before it's ever shown — a wrong injected memory is worse than
+  none. Compact single-line format, capped at ~200 tokens. THOR has this;
+  Mimir didn't — closing the gap. New CLI plumbing: `mimir recall-inject
+  <prompt>` (not exposed on the MCP tool surface).
+- **Code content in recall: `mimir code add <dir>`** indexes source files
+  chunked on tree-sitter symbol boundaries — function/method *bodies* (not
+  just signatures) are now searchable, as `Kind::CodeChunk` nodes alongside
+  the existing signature-only `Symbol` nodes. Chunks land in the default
+  `recall` pool (and under `--kind code`); a tunable `scoring.code_damp`
+  (default 0.85) keeps code from drowning out memories given its much
+  larger corpus share. Idea credit: [@nworks3d](https://github.com/nworks3d)'s
+  THOR fork of Mimir — thanks!
+
+### Internal
+- `search_hybrid` gains a sibling `search_hybrid_with_legs` (and
+  `Mimir::search_with_legs`) that also returns the raw per-leg ranked id
+  lists before RRF fusion — needed by auto-recall's relevance floor, kept
+  as a thin wrapper so the scoring formula stays single-sourced.
+- New workspace crate **`mimir-syntax`**: the tree-sitter parsing layer
+  (symbol/call/import extraction) split out of `mimir-graph` into its own
+  dependency-free crate, so both `mimir-graph` and the new `mimir-core`
+  code-chunker can consume it without a `mimir-core` ↔ `mimir-graph` cycle.
+  `mimir-graph` re-exports the same items, so this is a no-op for existing
+  callers. Workspace is now five crates: `mimir-core`, `mimir-graph`,
+  `mimir-syntax`, `mimir-proxy`, `mimir-cli`.
+
+
 ## [0.13.0] — 2026-07-03
 ### Added
 - **Remote MCP: `mimir mcp --http <addr>`** serves the same tool router over

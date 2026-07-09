@@ -42,11 +42,23 @@ enum Command {
         /// Also install the opt-in Claude Code hooks (command filter + rules).
         #[arg(long)]
         hooks: bool,
+        /// Also install the opt-in per-prompt auto-recall hook (implies
+        /// --hooks): injects a relevant memory into UserPromptSubmit, when
+        /// one clears the relevance floor (see `recall-inject`).
+        #[arg(long)]
+        auto_recall: bool,
     },
     /// Rewrite a shell command to use `mimir run` (used by the PreToolUse hook).
     Rewrite {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         cmd: Vec<String>,
+    },
+    /// Print at most one relevant memory for a prompt, or nothing if none
+    /// clears the relevance floor (used by the UserPromptSubmit hook —
+    /// see `mimir init --auto-recall`). Always exits 0.
+    RecallInject {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        prompt: Vec<String>,
     },
     /// Store overview: counts by kind, scope, database size.
     Status,
@@ -192,6 +204,14 @@ enum Command {
     Docs {
         #[command(subcommand)]
         cmd: DocsCmd,
+    },
+    /// Manage code collections: source chunked by symbol boundary (not
+    /// just signatures) for recall. `docs list`/`remove`/`note` also work
+    /// on code collections — this only adds `add`. Idea credit: nworks3d's
+    /// THOR fork of Mimir (see CHANGELOG.md).
+    Code {
+        #[command(subcommand)]
+        cmd: CodeCmd,
     },
     /// (Re)index docs collections incrementally.
     Index {
@@ -450,6 +470,21 @@ enum DocsCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum CodeCmd {
+    /// Register a folder of source code (any tree-sitter-supported
+    /// language Mimir already parses for the code graph).
+    Add {
+        path: String,
+        /// Display name (default: folder name).
+        #[arg(long)]
+        name: Option<String>,
+        /// Register cross-project (global) even when inside a project.
+        #[arg(short, long)]
+        global: bool,
+    },
+}
+
 fn main() {
     // Behave like a normal Unix tool when piped into head/grep: die on
     // SIGPIPE instead of panicking on a failed stdout write.
@@ -492,8 +527,13 @@ fn main() {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
-        Command::Init { no_model, hooks } => commands::init(no_model, hooks),
+        Command::Init {
+            no_model,
+            hooks,
+            auto_recall,
+        } => commands::init(no_model, hooks || auto_recall, auto_recall),
         Command::Rewrite { cmd } => rewrite_cmd::rewrite(cmd),
+        Command::RecallInject { prompt } => commands::recall_inject(prompt.join(" ")),
         Command::Status => commands::status(cli.json),
         Command::Doctor => commands::doctor(),
         Command::Remember {
@@ -581,6 +621,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             DocsCmd::List => commands::docs_list(cli.json),
             DocsCmd::Remove { name } => commands::docs_remove(&name),
             DocsCmd::Note { target, text } => commands::docs_note(&target, text.join(" ")),
+        },
+        Command::Code { cmd } => match cmd {
+            CodeCmd::Add { path, name, global } => commands::code_add(&path, name, global),
         },
         Command::Index { name } => commands::index(name),
         Command::Embed { fetch, rerank } => commands::embed(fetch, rerank),
