@@ -64,6 +64,19 @@ pub fn recency_factor(node: &Node, now: i64) -> f64 {
     2f64.powf(-age_days / half_life)
 }
 
+/// Fixed per-subkind priority multiplier: gotcha (drift-preventer) and
+/// decision (policy call) memories are worth surfacing over an
+/// equally-matching but non-critical note/idea/insight/summary/person, or a
+/// non-Memory node. Scaled by `scoring.type_prior_alpha` (0.0 = off) at the
+/// fused score site — this table only says which subkinds get a prior, not
+/// how strongly it counts.
+pub fn type_prior(subkind: Option<&str>) -> f64 {
+    match subkind {
+        Some("gotcha") | Some("decision") => 1.25,
+        _ => 1.0,
+    }
+}
+
 /// Has this node already received an event of this type today?
 fn capped_today(conn: &Connection, node_id: i64, event: &str) -> Result<bool> {
     let now = now_unix();

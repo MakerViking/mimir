@@ -33,6 +33,12 @@ pub struct SearchQuery {
     pub strength_alpha: f64,
     /// Weight of the recency boost (config scoring.recency_alpha); 0.0 = off.
     pub recency_alpha: f64,
+    /// Weight of the gotcha/decision type-priority boost (config
+    /// scoring.type_prior_alpha); 0.0 = off.
+    pub type_prior_alpha: f64,
+    /// Sub-1.0 multiplier for `Kind::CodeChunk` hits (config
+    /// scoring.code_damp); 1.0 = off. See `ScoringConfig::code_damp`.
+    pub code_damp: f64,
     /// Include superseded nodes in results (default false hides them).
     pub include_superseded: bool,
 }
@@ -67,10 +73,30 @@ pub fn search_hybrid(
     vector_query: Option<(&str, &[f32])>,
     cache: &mut Option<vector::MatrixCache>,
 ) -> Result<Vec<Hit>> {
+    Ok(search_hybrid_with_legs(conn, query, vector_query, cache)?.0)
+}
+
+/// Same as [`search_hybrid`], but also returns the raw per-leg ranked id
+/// lists (`legs[0]` = FTS, `legs[1]` = vector iff `vector_query` was
+/// supplied) before RRF fusion. Used by callers that need to know *why* a
+/// hit ranked where it did — e.g. the auto-recall relevance floor, which
+/// requires lexical+semantic agreement on the top hit before injecting it
+/// unprompted. `search_hybrid` is a thin wrapper over this so the scoring
+/// formula has one source of truth.
+pub fn search_hybrid_with_legs(
+    conn: &Connection,
+    query: &SearchQuery,
+    vector_query: Option<(&str, &[f32])>,
+    cache: &mut Option<vector::MatrixCache>,
+) -> Result<(Vec<Hit>, Vec<Vec<i64>>)> {
+    let t_fts = std::time::Instant::now();
     let mut legs: Vec<Vec<i64>> = vec![fts::leg(conn, query, LEG_CAP)?];
+    let fts_elapsed = t_fts.elapsed();
+    let t_vec = std::time::Instant::now();
     if let Some((model, qvec)) = vector_query {
         legs.push(vector::leg(conn, cache, model, qvec, query, LEG_CAP)?);
     }
+    let vec_elapsed = t_vec.elapsed();
 
     let mut rrf: HashMap<i64, f64> = HashMap::new();
     for leg in &legs {
@@ -80,31 +106,46 @@ pub fn search_hybrid(
     }
 
     let now = crate::model::now_unix();
-    let mut hits: Vec<Hit> = rrf
+    let fused_count = rrf.len();
+    let t_getnode = std::time::Instant::now();
+    let ids: Vec<i64> = rrf.keys().copied().collect();
+    let mut hits: Vec<Hit> = store::get_nodes(conn, &ids)?
         .into_iter()
-        .filter_map(|(id, base)| match store::get_node(conn, id) {
+        .filter_map(|node| {
             // A stale vector cache may still hold soft-deleted nodes; they (and,
             // unless explicitly asked for, superseded memories) must never surface.
-            Ok(node)
-                if node.deleted_at.is_some()
-                    || (node.superseded_by.is_some() && !query.include_superseded) =>
+            if node.deleted_at.is_some()
+                || (node.superseded_by.is_some() && !query.include_superseded)
             {
-                None
+                return None;
             }
-            Ok(node) => {
-                // Decayed strength is a tiebreaker multiplier, never a burier.
-                let effective = crate::learn::effective_strength(&node, now);
-                // Optional recency boost (config scoring.recency_alpha, default 0):
-                // capped multiplicative, so it nudges near-ties without burying.
-                let recency = crate::learn::recency_factor(&node, now);
-                let score = base
-                    * (1.0 + query.strength_alpha * (1.0 + effective).ln())
-                    * (1.0 + query.recency_alpha * recency);
-                Some(Ok(Hit { node, score }))
-            }
-            Err(e) => Some(Err(e)),
+            // Decayed strength is a tiebreaker multiplier, never a burier.
+            let effective = crate::learn::effective_strength(&node, now);
+            // Optional recency boost (config scoring.recency_alpha, default 0):
+            // capped multiplicative, so it nudges near-ties without burying.
+            let recency = crate::learn::recency_factor(&node, now);
+            // Optional type-priority boost (config scoring.type_prior_alpha):
+            // gotcha/decision nudged over an equally-matching note/idea.
+            let prior = crate::learn::type_prior(node.subkind.as_deref());
+            let base = rrf[&node.id];
+            // Code content dwarfs memories on a real corpus, so it needs a
+            // damping multiplier to keep it from drowning out memories in
+            // the default `all` pool (see ScoringConfig::code_damp).
+            let code_damp = if node.kind == Kind::CodeChunk {
+                query.code_damp
+            } else {
+                1.0
+            };
+            let score = base
+                * (1.0 + query.strength_alpha * (1.0 + effective).ln())
+                * (1.0 + query.recency_alpha * recency)
+                * (1.0 + query.type_prior_alpha * (prior - 1.0))
+                * code_damp;
+            Some(Hit { node, score })
         })
-        .collect::<Result<_>>()?;
+        .collect();
+    let getnode_elapsed = t_getnode.elapsed();
+    let t_rest = std::time::Instant::now();
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
     // Collapse exact-duplicate content before truncating: the same file indexed
     // under two collection paths surfaces as separate nodes with identical
@@ -119,8 +160,17 @@ pub fn search_hybrid(
         seen.insert(hasher.finish())
     });
     hits.truncate(query.limit);
-    Ok(hits)
+    tracing::debug!(
+        ?fts_elapsed,
+        ?vec_elapsed,
+        ?getnode_elapsed,
+        sort_dedup_elapsed = ?t_rest.elapsed(),
+        fused_count,
+        "search_hybrid: timing split"
+    );
+    Ok((hits, legs))
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -145,6 +195,8 @@ mod tests {
             limit: 10,
             strength_alpha: 0.15,
             recency_alpha: 0.0,
+            type_prior_alpha: 0.0,
+            code_damp: 1.0,
             include_superseded: false,
         }
     }
@@ -362,6 +414,8 @@ mod perf_tests {
             limit: 10,
             strength_alpha: 0.15,
             recency_alpha: 0.0,
+            type_prior_alpha: 0.0,
+            code_damp: 1.0,
             include_superseded: false,
         };
         let mut cache = None;
@@ -438,6 +492,8 @@ mod perf_tests {
                 limit: 10,
                 strength_alpha: 0.15,
                 recency_alpha: 0.0,
+                type_prior_alpha: 0.0,
+                code_damp: 1.0,
                 include_superseded: false,
             };
             let mut cache = None;

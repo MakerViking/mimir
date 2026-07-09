@@ -213,7 +213,9 @@ impl MimirServer {
                 "all" => vec![],
                 "memory" => vec![Kind::Memory],
                 "doc" => vec![Kind::File, Kind::Chunk, Kind::Annotation],
-                "code" => vec![Kind::Symbol],
+                // Symbol = signature/doc only; CodeChunk = actual body/content
+                // text (see chunker::chunk_source). Both belong under `code`.
+                "code" => vec![Kind::Symbol, Kind::CodeChunk],
                 other => return Err(format!("unknown kind '{other}' (all|memory|doc|code)")),
             };
             let scope = if args.all_projects {
@@ -229,6 +231,8 @@ impl MimirServer {
                 limit: args.limit.unwrap_or(m.config.output.default_limit),
                 strength_alpha: m.config.scoring.strength_alpha,
                 recency_alpha: m.config.scoring.recency_alpha,
+                type_prior_alpha: m.config.scoring.type_prior_alpha,
+                code_damp: m.config.scoring.code_damp,
                 include_superseded: args.include_superseded,
             };
             let hits = m.search_with(&query, args.rerank).map_err(engine_err)?;
@@ -790,7 +794,7 @@ pub fn run(http: Option<String>, http_allow_remote: bool) -> Result<()> {
                 if auto.docs {
                     let name = proj.title.clone().unwrap_or_else(|| "project".into());
                     let indexed =
-                        mimir_core::index::add_collection(&m.conn, &root, &name, Some(pid))
+                        mimir_core::index::add_collection(&m.conn, &root, &name, Some(pid), "docs")
                             .and_then(|c| mimir_core::index::index_collection(&mut m.conn, &c));
                     match indexed {
                         Ok(s) => {

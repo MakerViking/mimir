@@ -203,10 +203,37 @@ pub struct RerankConfig {
 pub struct ScoringConfig {
     /// Multiplier weight for learned strength in final ranking.
     pub strength_alpha: f64,
-    /// Opt-in recency boost (default 0.0 = off). When > 0, fresher memories get
-    /// a small multiplicative nudge, capped so it never buries a stronger match.
-    /// Time-sensitive types (decision/note) feel it most via their half-lives.
+    /// Recency boost weight; 0.0 = off. Fresher memories get a small
+    /// multiplicative nudge, capped so it never buries a stronger match.
+    /// Time-sensitive types (decision/note/...) feel it most via their
+    /// half-lives; non-decaying kinds (docs, code, person, summary) are
+    /// unaffected (`recency_factor` returns 1.0 for them). Default 0.4:
+    /// enough to move a stale-vs-current pair (e.g. a superseded-in-practice
+    /// decision that nobody marked superseded) without overpowering a
+    /// clearly better text/vector match.
     pub recency_alpha: f64,
+    /// Type-priority weight; 0.0 = off. Nudges gotcha/decision memories —
+    /// drift-preventers and policy calls — ahead of an equally-matching but
+    /// non-critical note/idea/insight. The per-subkind prior is fixed (see
+    /// `learn::type_prior`); this only scales how strongly it counts.
+    /// Default 0.12: eval-tuned against real embeddings, not synthetic ones —
+    /// the same weight that's safe on hermetic (clustered, well-separated)
+    /// vectors already reorders real, fuzzier score gaps hard enough to bury
+    /// a correct code-structure answer under a topically-adjacent decoy at
+    /// 0.15+. 0.12 sits just under that observed cliff.
+    pub type_prior_alpha: f64,
+    /// Sub-1.0 multiplier applied to `Kind::CodeChunk` hits at the fused
+    /// score. Code content dwarfs memories on a real project (~99% of
+    /// nodes vs ~1%), so undamped it drowns out memories in the default
+    /// `all` search pool even when a memory is the better answer. Default
+    /// 0.85: the `eval::hermetic`/`eval::real_model` fixture corpus has no
+    /// `CodeChunk` cases (yet), so this isn't eval-swept — it's verified by
+    /// a real end-to-end smoke test (index this repo's own `crates/`, query
+    /// a term shared by a memory and a code chunk) where 0.85 flips a tied
+    /// ranking to favor the memory, while `code_damp = 1.0` does not. Both
+    /// eval modes confirm this addition doesn't regress the existing
+    /// (non-code) `core` scenario set.
+    pub code_damp: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -241,7 +268,9 @@ impl Default for ScoringConfig {
     fn default() -> Self {
         ScoringConfig {
             strength_alpha: 0.15,
-            recency_alpha: 0.0,
+            recency_alpha: 0.4,
+            type_prior_alpha: 0.12,
+            code_damp: 0.85,
         }
     }
 }
