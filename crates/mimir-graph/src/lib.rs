@@ -6,8 +6,12 @@
 //! to memories like everything else. Stable identity across re-extraction
 //! lives in meta.stable_id; see store_graph.
 
-pub mod extract;
-pub mod languages;
+// extract/languages live in mimir-syntax (dependency-free from mimir-core,
+// so mimir-core can also use them without a cycle back through this crate);
+// re-exported here so existing `mimir_graph::extract`/`mimir_graph::languages`
+// call sites are unaffected.
+pub use mimir_syntax::{extract, languages};
+
 pub mod queries;
 pub mod store_graph;
 

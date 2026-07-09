@@ -11,8 +11,12 @@ authors = ["Thomas H"]
 
 [workspace.dependencies]
 # Path deps carry versions so the workspace is publishable as-is.
-# Published names: mimir-mem (bin mimir), mimir-mem-core, mimir-graph.
+# Published names: mimir-mem (bin mimir), mimir-mem-core, mimir-graph, mimir-syntax.
+# mimir-syntax holds language-adapter/tree-sitter extraction with no dependency
+# on mimir-core, so mimir-core can use it (for code-chunk indexing) without a
+# cycle back through mimir-graph (which itself depends on mimir-core).
 mimir-core = { path = "crates/mimir-core", package = "mimir-mem-core", version = "0.13.0" }
+mimir-syntax = { path = "crates/mimir-syntax", version = "0.13.0" }
 mimir-graph = { path = "crates/mimir-graph", version = "0.13.0" }
 mimir-proxy = { path = "crates/mimir-proxy", package = "mimir-mem-proxy", version = "0.13.0" }
 

@@ -40,6 +40,9 @@ macro_rules! str_enum {
     };
 }
 
+// CodeChunk: source-code content chunked on tree-sitter symbol boundaries
+// (see index::chunker::chunk_source) — distinct from Symbol (signature +
+// first doc line only) and from Chunk (markdown docs).
 str_enum!(Kind {
     Memory => "memory",
     Collection => "collection",
@@ -50,6 +53,7 @@ str_enum!(Kind {
     Community => "community",
     Tag => "tag",
     Annotation => "annotation",
+    CodeChunk => "codechunk",
 });
 
 str_enum!(MemoryType {
@@ -176,7 +180,7 @@ pub fn short_uid(kind: Kind, uid: &str) -> String {
     let sigil = match kind {
         Kind::Memory => 'm',
         Kind::Chunk | Kind::File | Kind::Annotation => 'd',
-        Kind::Symbol | Kind::Community => 'c',
+        Kind::Symbol | Kind::Community | Kind::CodeChunk => 'c',
         Kind::Project => 'p',
         Kind::Collection => 'l',
         Kind::Tag => 't',

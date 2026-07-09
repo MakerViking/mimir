@@ -1,11 +1,18 @@
-//! Markdown chunker: heading-aware, fence-safe, sized for retrieval.
+//! Markdown and source-code chunkers: heading/symbol-aware, sized for
+//! retrieval.
 //!
-//! Sections split at H1–H3; each chunk carries a breadcrumb title
+//! `chunk_markdown` splits at H1–H3; each chunk carries a breadcrumb title
 //! ("Doc › Section › Sub") and a 1-based line span. Fenced code blocks
 //! are atomic — never split, never carried into overlap.
+//!
+//! `chunk_source` splits on tree-sitter symbol boundaries instead of
+//! headings — indexing function/method bodies (not just their signatures)
+//! for recall is an idea from nworks3d's THOR fork of Mimir; see
+//! CHANGELOG.md.
 
 use std::ops::Range;
 
+use mimir_syntax::{extract::extract, languages::Lang};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
 /// Sizing in words (≈ 0.75 tokens/word, so 280 words ≈ 250–400 tokens).
@@ -113,13 +120,16 @@ pub fn chunk_markdown(doc_title: &str, text: &str) -> Vec<DocChunk> {
 
     let mut chunks = Vec::new();
     for section in &merged {
-        pack_section(section, &mut chunks);
+        pack_section(section, "\n\n", &mut chunks);
     }
     chunks
 }
 
 /// Greedy paragraph packing with bounded overlap between adjacent chunks.
-fn pack_section(section: &Section, out: &mut Vec<DocChunk>) {
+/// `sep` joins consecutive units in a flushed chunk's body — "\n\n" for
+/// markdown paragraphs, "\n" for chunk_source's one-unit-per-line sections
+/// (a blank-line join would visibly corrupt code).
+fn pack_section(section: &Section, sep: &str, out: &mut Vec<DocChunk>) {
     let mut cur: Vec<Para> = Vec::new();
     let mut cur_words = 0usize;
     let mut carried = 0usize; // how many leading paras of `cur` are overlap
@@ -134,7 +144,7 @@ fn pack_section(section: &Section, out: &mut Vec<DocChunk>) {
                 .iter()
                 .map(|p| p.text.as_str())
                 .collect::<Vec<_>>()
-                .join("\n\n"),
+                .join(sep),
             start_line: cur.first().unwrap().start_line,
             end_line: cur.last().unwrap().end_line,
         });
@@ -169,7 +179,7 @@ fn pack_section(section: &Section, out: &mut Vec<DocChunk>) {
             let prev = out.last_mut().unwrap();
             if prev.title == section.crumb {
                 for p in &cur[carried..] {
-                    prev.body.push_str("\n\n");
+                    prev.body.push_str(sep);
                     prev.body.push_str(&p.text);
                     prev.end_line = p.end_line;
                 }
@@ -178,6 +188,112 @@ fn pack_section(section: &Section, out: &mut Vec<DocChunk>) {
         }
         flush(&cur, out, &section.crumb);
     }
+}
+
+/// Chunk source code on tree-sitter symbol boundaries: one section per
+/// symbol, plus line-window sections for whatever isn't inside any symbol
+/// (imports, top-level statements). Oversized symbol bodies are sub-split
+/// by the same word-budget/overlap packer as markdown.
+///
+/// Symbols nest (a class's methods sit inside the class's own line span),
+/// so lines are claimed innermost-first: a symbol only emits sections for
+/// the sub-ranges its own nested symbols haven't already claimed. Without
+/// that, a class chunk would duplicate the full text of every method
+/// already covered by its own chunk.
+pub fn chunk_source(lang: Lang, doc_title: &str, source: &str) -> Vec<DocChunk> {
+    let lines: Vec<&str> = source.lines().collect();
+    if lines.is_empty() {
+        return Vec::new();
+    }
+
+    let mut symbols = extract(lang, source).symbols;
+    // Innermost first: a shorter span is never the container of a longer
+    // one, so this always claims a class's methods before the class itself.
+    symbols.sort_by_key(|s| s.end_line.saturating_sub(s.start_line));
+
+    let mut covered = vec![false; lines.len()];
+    let mut chunks = Vec::new();
+    for sym in &symbols {
+        let start = sym.start_line.max(1);
+        let end = sym.end_line.min(lines.len());
+        if start > end {
+            continue;
+        }
+        let sig_line = sym
+            .signature
+            .lines()
+            .next()
+            .unwrap_or(&sym.signature)
+            .trim();
+        let crumb = format!("{doc_title} › {} ({}) — {sig_line}", sym.qualified, sym.kind);
+        for (run_start, run_end) in uncovered_runs(&covered, start, end) {
+            let paras = line_paras(&lines, run_start, run_end);
+            if !paras.is_empty() {
+                pack_section(
+                    &Section {
+                        crumb: crumb.clone(),
+                        paras,
+                    },
+                    "\n",
+                    &mut chunks,
+                );
+            }
+        }
+        covered[start - 1..end].fill(true);
+    }
+
+    // Remainder: lines no symbol claimed. Each contiguous run gets a
+    // line-range-unique crumb so pack_section's tiny-tail merge (keyed on
+    // crumb equality) never splices two discontiguous runs together.
+    for (run_start, run_end) in uncovered_runs(&covered, 1, lines.len()) {
+        let paras = line_paras(&lines, run_start, run_end);
+        if paras.is_empty() {
+            continue;
+        }
+        let crumb = format!("{doc_title} › (lines {run_start}-{run_end})");
+        pack_section(&Section { crumb, paras }, "\n", &mut chunks);
+    }
+
+    chunks
+}
+
+/// Contiguous 1-based inclusive sub-ranges of `[start, end]` not yet marked
+/// covered.
+fn uncovered_runs(covered: &[bool], start: usize, end: usize) -> Vec<(usize, usize)> {
+    let mut runs = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for l in start..=end {
+        if covered[l - 1] {
+            if let Some(s) = run_start.take() {
+                runs.push((s, l - 1));
+            }
+        } else if run_start.is_none() {
+            run_start = Some(l);
+        }
+    }
+    if let Some(s) = run_start {
+        runs.push((s, end));
+    }
+    runs
+}
+
+/// One `Para` per non-blank line in a 1-based inclusive range.
+fn line_paras(lines: &[&str], start: usize, end: usize) -> Vec<Para> {
+    (start..=end)
+        .filter_map(|l| {
+            let text = lines[l - 1];
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(Para {
+                words: text.split_whitespace().count(),
+                text: text.to_string(),
+                start_line: l,
+                end_line: l,
+                is_fence: false,
+            })
+        })
+        .collect()
 }
 
 struct Heading {
@@ -410,5 +526,52 @@ usage paragraph
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].start_line, 3);
         assert_eq!(chunks[0].end_line, 6);
+    }
+
+    #[test]
+    fn chunk_source_finds_function_body_and_imports() {
+        let src = "use std::fmt;\n\nfn distinctive_needle_marker() {\n    println!(\"hi\");\n}\n";
+        let chunks = chunk_source(Lang::Rust, "crate/lib.rs", src);
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.body.contains("distinctive_needle_marker")),
+            "function body missing from any chunk"
+        );
+        assert!(
+            chunks.iter().any(|c| c.body.contains("use std::fmt;")),
+            "remainder (import) line missing from any chunk"
+        );
+    }
+
+    #[test]
+    fn chunk_source_nested_class_does_not_duplicate_method_body() {
+        // TS: class + method are both symbols with overlapping spans —
+        // the method must claim its own body; the class chunk must not
+        // also contain the full method body verbatim.
+        let src = "\
+class Widget {
+    render() {
+        return marker_only_in_method_body();
+    }
+}
+";
+        let chunks = chunk_source(Lang::TypeScript, "widget.ts", src);
+        let with_marker: Vec<_> = chunks
+            .iter()
+            .filter(|c| c.body.contains("marker_only_in_method_body"))
+            .collect();
+        assert_eq!(
+            with_marker.len(),
+            1,
+            "method body should appear in exactly one chunk, got {}: {:#?}",
+            with_marker.len(),
+            chunks
+        );
+    }
+
+    #[test]
+    fn chunk_source_empty_is_empty() {
+        assert!(chunk_source(Lang::Rust, "empty.rs", "").is_empty());
     }
 }

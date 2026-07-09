@@ -18,11 +18,18 @@ use crate::model::{now_unix, Kind, NewNode, Node};
 use crate::store::{self, row_to_node, NODE_COLS};
 
 /// Register (or return the existing) collection for a docs root.
+///
+/// `kind` is the collection's content type — "docs" (markdown, chunked by
+/// heading) or "code" (source, chunked by tree-sitter symbol; see
+/// `chunker::chunk_source`) — recorded in `meta.kind` and read back by
+/// `index_collection` to pick the walk filter and chunker. An existing
+/// collection's recorded kind is never changed by re-adding it.
 pub fn add_collection(
     conn: &Connection,
     root: &Path,
     name: &str,
     project_id: Option<i64>,
+    kind: &str,
 ) -> Result<Node> {
     if !root.is_dir() {
         return Err(Error::Invalid(format!(
@@ -48,7 +55,19 @@ pub fn add_collection(
     new.title = Some(name.to_string());
     new.path = Some(canonical);
     new.project_id = project_id;
+    new.meta = Some(serde_json::json!({ "kind": kind }));
     store::insert_node(conn, new)
+}
+
+/// A collection's content type, as recorded by `add_collection`. Absent
+/// (pre-existing collections indexed before this field existed) defaults
+/// to "docs" so old collections keep behaving exactly as before.
+fn collection_kind(collection: &Node) -> &str {
+    collection
+        .meta
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("docs")
 }
 
 pub fn list_collections(conn: &Connection) -> Result<Vec<Node>> {
@@ -225,6 +244,7 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
 
     let mut stats = IndexStats::default();
     let mut seen: HashSet<String> = HashSet::new();
+    let is_code = collection_kind(collection) == "code";
 
     for entry in ignore::WalkBuilder::new(root).build() {
         let entry = match entry {
@@ -238,8 +258,16 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
             continue;
         }
         let path = entry.path();
+        // Docs collections: markdown only. Code collections: any file a
+        // tree-sitter adapter can parse (Lang::from_path's extension list).
+        let lang = mimir_syntax::languages::Lang::from_path(&path.to_string_lossy());
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown") {
+        let is_markdown = matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown");
+        if is_code {
+            if lang.is_none() {
+                continue;
+            }
+        } else if !is_markdown {
             continue;
         }
         let rel = path
@@ -307,7 +335,18 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| rel.clone());
-        let chunks = chunker::chunk_markdown(&stem, &content);
+        // is_code guarantees lang.is_some() (the walk filter above skipped
+        // any file it couldn't parse), so unwrap here is safe.
+        let file_lang = if is_code {
+            lang.unwrap().name().to_string()
+        } else {
+            "markdown".into()
+        };
+        let chunks = if is_code {
+            chunker::chunk_source(lang.unwrap(), &stem, &content)
+        } else {
+            chunker::chunk_markdown(&stem, &content)
+        };
 
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let file_id = match &existing {
@@ -331,7 +370,7 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
                         .unwrap_or_else(|| rel.clone()),
                 );
                 new.path = Some(rel.clone());
-                new.lang = Some("markdown".into());
+                new.lang = Some(file_lang.clone());
                 new.collection_id = Some(collection.id);
                 new.project_id = collection.project_id;
                 new.content_hash = Some(hash);
@@ -339,12 +378,13 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
                 store::insert_node(&tx, new)?.id
             }
         };
+        let chunk_kind = if is_code { Kind::CodeChunk } else { Kind::Chunk };
         for chunk in &chunks {
-            let mut new = NewNode::new(Kind::Chunk);
+            let mut new = NewNode::new(chunk_kind);
             new.title = Some(chunk.title.clone());
             new.body = Some(chunk.body.clone());
             new.path = Some(rel.clone());
-            new.lang = Some("markdown".into());
+            new.lang = Some(file_lang.clone());
             new.parent_id = Some(file_id);
             new.collection_id = Some(collection.id);
             new.project_id = collection.project_id;
@@ -404,7 +444,7 @@ mod tests {
         write(dir.path(), "sub/notes.md", "plain notes about turnips\n");
         write(dir.path(), "ignored.txt", "not markdown\n");
         let conn = db::open_in_memory().unwrap();
-        let coll = add_collection(&conn, dir.path(), "docs", None).unwrap();
+        let coll = add_collection(&conn, dir.path(), "docs", None, "docs").unwrap();
         (dir, conn, coll)
     }
 
@@ -428,6 +468,8 @@ mod tests {
                 limit: 5,
                 strength_alpha: 0.0,
                 recency_alpha: 0.0,
+                type_prior_alpha: 0.0,
+                code_damp: 1.0,
                 include_superseded: false,
             },
         )
@@ -466,6 +508,8 @@ mod tests {
                 limit: 5,
                 strength_alpha: 0.0,
                 recency_alpha: 0.0,
+                type_prior_alpha: 0.0,
+                code_damp: 1.0,
                 include_superseded: false,
             },
         )
@@ -482,6 +526,8 @@ mod tests {
                 limit: 5,
                 strength_alpha: 0.0,
                 recency_alpha: 0.0,
+                type_prior_alpha: 0.0,
+                code_damp: 1.0,
                 include_superseded: false,
             },
         )
@@ -519,7 +565,7 @@ mod tests {
         let (_dir, mut conn, coll) = setup();
         index_collection(&mut conn, &coll).unwrap();
         let root = Path::new(coll.path.as_deref().unwrap());
-        let again = add_collection(&conn, root, "docs", None).unwrap();
+        let again = add_collection(&conn, root, "docs", None, "docs").unwrap();
         assert_eq!(again.id, coll.id);
 
         remove_collection(&conn, coll.id).unwrap();

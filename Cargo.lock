@@ -1979,21 +1979,12 @@ dependencies = [
  "blake3",
  "ignore",
  "mimir-mem-core",
+ "mimir-syntax",
  "petgraph",
  "rusqlite",
  "serde_json",
  "tempfile",
  "tracing",
- "tree-sitter",
- "tree-sitter-c",
- "tree-sitter-c-sharp",
- "tree-sitter-go",
- "tree-sitter-java",
- "tree-sitter-python",
- "tree-sitter-ruby",
- "tree-sitter-rust",
- "tree-sitter-sequel-tsql",
- "tree-sitter-typescript",
 ]
 
 [[package]]
@@ -2031,6 +2022,7 @@ dependencies = [
  "directories",
  "fastembed",
  "ignore",
+ "mimir-syntax",
  "once_cell",
  "ort",
  "pulldown-cmark",
@@ -2060,6 +2052,22 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "mimir-syntax"
+version = "0.13.0"
+dependencies = [
+ "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-go",
+ "tree-sitter-java",
+ "tree-sitter-python",
+ "tree-sitter-ruby",
+ "tree-sitter-rust",
+ "tree-sitter-sequel-tsql",
+ "tree-sitter-typescript",
 ]
 
 [[package]]
