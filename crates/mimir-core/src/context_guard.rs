@@ -74,8 +74,8 @@ pub fn should_emit(conn: &Connection, session_id: &str, pct: u8, threshold: u8) 
     if pct < threshold {
         return Ok(false);
     }
-    let last: Option<u8> = get_session_state(conn, session_id, "guard_last_pct")?
-        .and_then(|s| s.parse().ok());
+    let last: Option<u8> =
+        get_session_state(conn, session_id, "guard_last_pct")?.and_then(|s| s.parse().ok());
     let emit = match last {
         None => true,
         Some(last) => pct >= last.saturating_add(10),
@@ -208,7 +208,10 @@ mod tests {
         let handoff = guard_message(50, 45, "handoff").unwrap();
         assert!(handoff.contains("mimir remember"));
         assert!(handoff.contains("session-handoff"));
-        assert!(guard_message(90, 45, "off").is_none(), "unrecognized mode is silent");
+        assert!(
+            guard_message(90, 45, "off").is_none(),
+            "unrecognized mode is silent"
+        );
     }
 
     #[test]
@@ -217,7 +220,10 @@ mod tests {
         let sid = "s1";
         // Below threshold: never emits, never records state.
         assert!(!should_emit(&conn, sid, 40, 45).unwrap());
-        assert_eq!(get_session_state(&conn, sid, "guard_last_pct").unwrap(), None);
+        assert_eq!(
+            get_session_state(&conn, sid, "guard_last_pct").unwrap(),
+            None
+        );
         // First crossing: emits.
         assert!(should_emit(&conn, sid, 45, 45).unwrap());
         // Same band again: silent (no new +10 crossed).
@@ -233,7 +239,10 @@ mod tests {
     fn should_emit_is_independent_per_session() {
         let conn = db::open_in_memory().unwrap();
         assert!(should_emit(&conn, "a", 50, 45).unwrap());
-        assert!(should_emit(&conn, "b", 50, 45).unwrap(), "a fresh session isn't nagged-out by another");
+        assert!(
+            should_emit(&conn, "b", 50, 45).unwrap(),
+            "a fresh session isn't nagged-out by another"
+        );
     }
 
     #[test]
@@ -244,7 +253,10 @@ mod tests {
         set_session_state(&conn, sid, "guard_last_pct", "70").unwrap();
         handle_session_start(&conn, sid, "startup", 0).unwrap();
         assert_eq!(transcript_marker(&conn, sid).unwrap(), 0);
-        assert_eq!(get_session_state(&conn, sid, "guard_last_pct").unwrap(), None);
+        assert_eq!(
+            get_session_state(&conn, sid, "guard_last_pct").unwrap(),
+            None
+        );
     }
 
     #[test]
@@ -254,7 +266,10 @@ mod tests {
         set_session_state(&conn, sid, "guard_last_pct", "70").unwrap();
         handle_session_start(&conn, sid, "clear", 12345).unwrap();
         assert_eq!(transcript_marker(&conn, sid).unwrap(), 12345);
-        assert_eq!(get_session_state(&conn, sid, "guard_last_pct").unwrap(), None);
+        assert_eq!(
+            get_session_state(&conn, sid, "guard_last_pct").unwrap(),
+            None
+        );
 
         handle_session_start(&conn, sid, "compact", 999).unwrap();
         assert_eq!(transcript_marker(&conn, sid).unwrap(), 999);
@@ -268,7 +283,10 @@ mod tests {
         set_session_state(&conn, sid, "guard_last_pct", "55").unwrap();
         handle_session_start(&conn, sid, "resume", 999_999).unwrap();
         assert_eq!(transcript_marker(&conn, sid).unwrap(), 4242);
-        assert_eq!(get_session_state(&conn, sid, "guard_last_pct").unwrap(), Some("55".into()));
+        assert_eq!(
+            get_session_state(&conn, sid, "guard_last_pct").unwrap(),
+            Some("55".into())
+        );
     }
 
     #[test]

@@ -240,9 +240,12 @@ impl Lang {
                 // method regardless of enclosing namespace scope, mirroring
                 // Go's receiver-type prefix for the same reason.
                 "function_definition" => {
-                    let name =
-                        c_declarator_name(node.child_by_field_name("declarator")?, src)?;
-                    let kind = if name.contains("::") { "method" } else { "function" };
+                    let name = c_declarator_name(node.child_by_field_name("declarator")?, src)?;
+                    let kind = if name.contains("::") {
+                        "method"
+                    } else {
+                        "function"
+                    };
                     Some((name, kind))
                 }
                 "class_specifier" => Some((text(node.child_by_field_name("name")?), "class")),
@@ -271,9 +274,7 @@ impl Lang {
                     };
                     Some((name, kind))
                 }
-                "object_declaration" => {
-                    Some((text(node.child_by_field_name("name")?), "object"))
-                }
+                "object_declaration" => Some((text(node.child_by_field_name("name")?), "object")),
                 "function_declaration" => {
                     Some((text(node.child_by_field_name("name")?), "function"))
                 }
@@ -314,9 +315,7 @@ impl Lang {
                 "function_definition" => {
                     Some((text(node.child_by_field_name("name")?), "function"))
                 }
-                "method_declaration" => {
-                    Some((text(node.child_by_field_name("name")?), "method"))
-                }
+                "method_declaration" => Some((text(node.child_by_field_name("name")?), "method")),
                 "class_declaration" => Some((text(node.child_by_field_name("name")?), "class")),
                 "interface_declaration" => {
                     Some((text(node.child_by_field_name("name")?), "interface"))
@@ -762,9 +761,7 @@ impl Lang {
                     .iter()
                     .find(|c| c.kind() == "identifier")
                     .map(|c| text(*c))
-                    .unwrap_or_else(|| {
-                        source.rsplit('.').next().unwrap_or(&source).to_string()
-                    });
+                    .unwrap_or_else(|| source.rsplit('.').next().unwrap_or(&source).to_string());
                 out.push(ImportRef { local, source });
             }
             Lang::Swift => {
@@ -772,7 +769,9 @@ impl Lang {
                     return;
                 }
                 let mut cursor = node.walk();
-                let Some(path) = node.children(&mut cursor).find(|c| c.kind() == "identifier")
+                let Some(path) = node
+                    .children(&mut cursor)
+                    .find(|c| c.kind() == "identifier")
                 else {
                     return;
                 };
@@ -790,12 +789,17 @@ impl Lang {
                         return;
                     };
                     let source = text(path);
-                    let local = node.child_by_field_name("alias").map(text).unwrap_or_else(|| {
-                        source.rsplit('\\').next().unwrap_or(&source).to_string()
-                    });
+                    let local = node
+                        .child_by_field_name("alias")
+                        .map(text)
+                        .unwrap_or_else(|| {
+                            source.rsplit('\\').next().unwrap_or(&source).to_string()
+                        });
                     out.push(ImportRef { local, source });
                 }
-                "require_expression" | "require_once_expression" | "include_expression"
+                "require_expression"
+                | "require_once_expression"
+                | "include_expression"
                 | "include_once_expression" => {
                     let Some(expr) = node.named_child(0) else {
                         return;

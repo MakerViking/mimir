@@ -1120,7 +1120,10 @@ const FIXTURES: &[Fixture] = &[
 /// `fires_when: &[]` field.
 const FIRES_WHEN: &[(&str, &[&str])] = &[(
     "mem_gotcha_confetti_deploy_trigger",
-    &["confetti toggle before demo", "disable easter egg for customers"],
+    &[
+        "confetti toggle before demo",
+        "disable easter egg for customers",
+    ],
 )];
 
 pub type FixtureIds = HashMap<&'static str, i64>;
@@ -1538,11 +1541,16 @@ const INJECT_QUESTIONS: &[InjectQuestion] = &[
         query: "anything I should watch out for before I start working in this repo",
         enrich: &[],
         expects_injection: true,
-        acceptable: &["mem_drift_no_verify", "mem_drift_matrix_cache", "mem_drift_force_push"],
+        acceptable: &[
+            "mem_drift_no_verify",
+            "mem_drift_matrix_cache",
+            "mem_drift_force_push",
+        ],
         topic: "force_push_gotcha",
     },
     InjectQuestion {
-        query: "what should I know about past mistakes in the search or storage code before I touch it",
+        query:
+            "what should I know about past mistakes in the search or storage code before I touch it",
         enrich: &[],
         expects_injection: true,
         acceptable: &["mem_drift_matrix_cache"],

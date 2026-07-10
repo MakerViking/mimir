@@ -10,9 +10,9 @@ pub mod consolidate;
 pub mod context_guard;
 pub mod db;
 pub mod embed;
+pub mod error;
 #[cfg(any(test, feature = "eval"))]
 pub mod eval;
-pub mod error;
 pub mod format;
 pub mod import;
 pub mod index;
@@ -510,7 +510,10 @@ mod tests {
         // Multi-word query clears the token gate, so an empty store is what
         // trips this one.
         assert!(store_too_small_for_rerank(&conn));
-        assert!(!rerank_query_gates_pass(&conn, &q("a real multi word query")));
+        assert!(!rerank_query_gates_pass(
+            &conn,
+            &q("a real multi word query")
+        ));
         // Seed past the threshold and confirm the gate flips.
         for i in 0..(RERANK_MIN_STORE_NODES as usize + 1) {
             let mut n = NewNode::new(Kind::Memory);
@@ -519,6 +522,9 @@ mod tests {
             store::insert_node(&conn, n).unwrap();
         }
         assert!(!store_too_small_for_rerank(&conn));
-        assert!(rerank_query_gates_pass(&conn, &q("a real multi word query")));
+        assert!(rerank_query_gates_pass(
+            &conn,
+            &q("a real multi word query")
+        ));
     }
 }

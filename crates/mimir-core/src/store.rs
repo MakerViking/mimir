@@ -662,7 +662,11 @@ mod tests {
         record_event(&conn, a.id, "opened", None, None, None).unwrap();
 
         let stats = impression_stats(&conn, &[a.id, b.id, 999_999]).unwrap();
-        assert_eq!(stats.len(), 2, "absent id must simply be missing, not an error");
+        assert_eq!(
+            stats.len(),
+            2,
+            "absent id must simply be missing, not an error"
+        );
 
         let sa = stats[&a.id];
         assert_eq!(sa.shown, 2);
@@ -700,7 +704,10 @@ mod tests {
         .unwrap();
 
         let removed = prune_old_events(&conn, now - 180 * 86_400).unwrap();
-        assert_eq!(removed, 1, "only the 200-day-old row clears the 180-day cutoff");
+        assert_eq!(
+            removed, 1,
+            "only the 200-day-old row clears the 180-day cutoff"
+        );
 
         let remaining: i64 = conn
             .query_row("SELECT count(*) FROM recall_event", [], |r| r.get(0))
@@ -721,7 +728,11 @@ mod tests {
     fn set_fires_when_round_trips_through_meta() {
         let conn = conn();
         let n = memory(&conn, "release checklist", "bump version, tag, publish");
-        assert!(get_node(&conn, n.id).unwrap().meta.get("fires_when").is_none());
+        assert!(get_node(&conn, n.id)
+            .unwrap()
+            .meta
+            .get("fires_when")
+            .is_none());
 
         set_fires_when(
             &conn,
@@ -744,7 +755,12 @@ mod tests {
         set_fires_when(&conn, n.id, &["only one now".into()]).unwrap();
         let got = get_node(&conn, n.id).unwrap();
         assert_eq!(
-            got.meta.get("fires_when").unwrap().as_array().unwrap().len(),
+            got.meta
+                .get("fires_when")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .len(),
             1
         );
     }

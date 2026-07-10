@@ -595,9 +595,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             context_guard.as_deref(),
         ),
         Command::Rewrite { cmd } => rewrite_cmd::rewrite(cmd),
-        Command::RecallInject { enrich, session, prompt } => {
-            commands::recall_inject(prompt.join(" "), enrich, session)
-        }
+        Command::RecallInject {
+            enrich,
+            session,
+            prompt,
+        } => commands::recall_inject(prompt.join(" "), enrich, session),
         Command::Status => commands::status(cli.json),
         Command::Doctor => commands::doctor(),
         Command::Remember {

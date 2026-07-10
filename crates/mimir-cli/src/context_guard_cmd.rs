@@ -54,7 +54,12 @@ fn scope_for_cwd(mimir: &Mimir, input: &serde_json::Value) -> Scope {
     input
         .get("cwd")
         .and_then(|v| v.as_str())
-        .and_then(|c| mimir.project_for_cwd(std::path::Path::new(c)).ok().flatten())
+        .and_then(|c| {
+            mimir
+                .project_for_cwd(std::path::Path::new(c))
+                .ok()
+                .flatten()
+        })
         .map(|p| Scope::Project(p.id))
         .unwrap_or(Scope::Global)
 }
@@ -112,7 +117,10 @@ pub fn precompact() -> Result<()> {
     let pct = context_guard::estimate_pct(bytes, marker, &mimir.config.hooks);
     let threshold = mimir.config.hooks.context_guard_threshold_pct;
     if let Some(reason) = context_guard::guard_message(pct, threshold, mode) {
-        println!("{}", serde_json::json!({ "decision": "block", "reason": reason }));
+        println!(
+            "{}",
+            serde_json::json!({ "decision": "block", "reason": reason })
+        );
     }
     Ok(())
 }
@@ -133,7 +141,10 @@ pub fn session_start() -> Result<()> {
     let Some(session_id) = input.get("session_id").and_then(|v| v.as_str()) else {
         return Ok(());
     };
-    let source = input.get("source").and_then(|v| v.as_str()).unwrap_or("startup");
+    let source = input
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("startup");
     let bytes = transcript_bytes(&input);
     let _ = context_guard::handle_session_start(&mimir.conn, session_id, source, bytes);
 
@@ -155,14 +166,27 @@ pub fn pretool() -> Result<()> {
     let Some(session_id) = input.get("session_id").and_then(|v| v.as_str()) else {
         return Ok(());
     };
-    let tool_name = input.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    let tool_name = input
+        .get("tool_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
     let (target, is_command) = match tool_name {
-        "Bash" => (input.pointer("/tool_input/command").and_then(|v| v.as_str()), true),
-        "Edit" | "Write" | "MultiEdit" => {
-            (input.pointer("/tool_input/file_path").and_then(|v| v.as_str()), false)
-        }
+        "Bash" => (
+            input
+                .pointer("/tool_input/command")
+                .and_then(|v| v.as_str()),
+            true,
+        ),
+        "Edit" | "Write" | "MultiEdit" => (
+            input
+                .pointer("/tool_input/file_path")
+                .and_then(|v| v.as_str()),
+            false,
+        ),
         "NotebookEdit" => (
-            input.pointer("/tool_input/notebook_path").and_then(|v| v.as_str()),
+            input
+                .pointer("/tool_input/notebook_path")
+                .and_then(|v| v.as_str()),
             false,
         ),
         _ => (None, false),

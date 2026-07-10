@@ -8,7 +8,12 @@ use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope}
 use mimir_core::search::SearchQuery;
 use mimir_core::{db, store, Mimir};
 
-pub fn init(no_model: bool, hooks: bool, auto_recall: bool, context_guard: Option<&str>) -> Result<()> {
+pub fn init(
+    no_model: bool,
+    hooks: bool,
+    auto_recall: bool,
+    context_guard: Option<&str>,
+) -> Result<()> {
     let paths = Paths::resolve()?;
     let mut config = Config::load(&paths.config_file)?;
     if let Some(mode) = context_guard {
@@ -59,9 +64,7 @@ pub fn init(no_model: bool, hooks: bool, auto_recall: bool, context_guard: Optio
     }
     if hooks && config.hooks.context_guard == "off" {
         println!();
-        println!(
-            "Context-window guard (nudge before an auto-compact takes control) is opt-in:"
-        );
+        println!("Context-window guard (nudge before an auto-compact takes control) is opt-in:");
         println!("  mimir init --hooks --context-guard pause   # or: handoff");
     }
     Ok(())
@@ -272,12 +275,18 @@ fn install_hooks(config: &Config, auto_recall: bool) -> Result<()> {
     // 3. Context-guard delegate scripts — only written when opted in.
     let context_guard_scripts = if config.hooks.context_guard != "off" {
         Some((
-            write_script("mimir-context-guard-prompt.sh", MIMIR_CONTEXT_GUARD_PROMPT_SH)?,
+            write_script(
+                "mimir-context-guard-prompt.sh",
+                MIMIR_CONTEXT_GUARD_PROMPT_SH,
+            )?,
             write_script(
                 "mimir-context-guard-precompact.sh",
                 MIMIR_CONTEXT_GUARD_PRECOMPACT_SH,
             )?,
-            write_script("mimir-context-guard-session.sh", MIMIR_CONTEXT_GUARD_SESSION_SH)?,
+            write_script(
+                "mimir-context-guard-session.sh",
+                MIMIR_CONTEXT_GUARD_SESSION_SH,
+            )?,
         ))
     } else {
         None
@@ -469,7 +478,6 @@ fn merge_hook_settings(
 
     Ok((root, messages))
 }
-
 
 /// True if any hook entry (or its nested hooks) has a command containing `needle`.
 fn entries_mention(entries: &[serde_json::Value], needle: &str) -> bool {
@@ -1069,7 +1077,11 @@ pub fn recall(
 /// `MIMIR_RECALL_SH`'s `git diff`), passed straight through to
 /// `inject::compute_with_mode` — see that function's doc comment for how
 /// it's used.
-pub fn recall_inject(prompt: String, enrich: Option<String>, session: Option<String>) -> Result<()> {
+pub fn recall_inject(
+    prompt: String,
+    enrich: Option<String>,
+    session: Option<String>,
+) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let scope = read_scope(&mimir, false, false)?;
     let enrich = enrich.unwrap_or_default();
@@ -1077,7 +1089,10 @@ pub fn recall_inject(prompt: String, enrich: Option<String>, session: Option<Str
         "fast" => true,
         "full" => false,
         other => {
-            tracing::warn!(cold_mode = other, "unknown [hooks] cold_mode value; treating as full");
+            tracing::warn!(
+                cold_mode = other,
+                "unknown [hooks] cold_mode value; treating as full"
+            );
             false
         }
     };
@@ -1817,7 +1832,9 @@ mod hooks_tests {
     #[test]
     fn default_inject_url_matches_documented_port() {
         let script = render_recall_script("http://127.0.0.1:8077/inject");
-        assert!(script.contains(r#"INJECT_URL="${MIMIR_INJECT_URL:-http://127.0.0.1:8077/inject}""#));
+        assert!(
+            script.contains(r#"INJECT_URL="${MIMIR_INJECT_URL:-http://127.0.0.1:8077/inject}""#)
+        );
     }
 
     /// `auto_recall=false` (recall_script = None) must be byte-identical to
@@ -1852,10 +1869,18 @@ mod hooks_tests {
             "context_guard=off must add exactly one SessionStart entry (rules), not two"
         );
         let pre_arr = root["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_arr.len(), 2, "rewrite + anchors, unconditionally under --hooks");
+        assert_eq!(
+            pre_arr.len(),
+            2,
+            "rewrite + anchors, unconditionally under --hooks"
+        );
         assert!(messages.iter().any(|m| m.contains("SessionStart")));
-        assert!(messages.iter().any(|m| m.contains("PreToolUse (command filter)")));
-        assert!(messages.iter().any(|m| m.contains("PreToolUse (guard anchors)")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("PreToolUse (command filter)")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("PreToolUse (guard anchors)")));
         assert!(!messages.iter().any(|m| m.contains("UserPromptSubmit")));
         assert!(!messages.iter().any(|m| m.contains("PreCompact")));
     }
@@ -1907,7 +1932,9 @@ mod hooks_tests {
         .unwrap();
         let pre_arr = root["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(pre_arr.len(), 2);
-        assert!(messages.iter().any(|m| m.contains("PreToolUse (guard anchors) added")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("PreToolUse (guard anchors) added")));
 
         let (root2, messages2) = merge_hook_settings(
             root,
@@ -1918,8 +1945,14 @@ mod hooks_tests {
         )
         .unwrap();
         let pre_arr2 = root2["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(pre_arr2.len(), 2, "re-running must not duplicate the anchors entry");
-        assert!(messages2.iter().any(|m| m.contains("PreToolUse anchors already installed")));
+        assert_eq!(
+            pre_arr2.len(),
+            2,
+            "re-running must not duplicate the anchors entry"
+        );
+        assert!(messages2
+            .iter()
+            .any(|m| m.contains("PreToolUse anchors already installed")));
     }
 
     /// `context_guard_scripts = Some(...)` adds exactly one UserPromptSubmit,
@@ -1939,16 +1972,25 @@ mod hooks_tests {
             Some(scripts),
         )
         .unwrap();
-        assert_eq!(root["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            root["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(root["hooks"]["PreCompact"].as_array().unwrap().len(), 1);
         assert_eq!(
             root["hooks"]["SessionStart"].as_array().unwrap().len(),
             2,
             "rules entry + context-guard entry"
         );
-        assert!(messages.iter().any(|m| m.contains("UserPromptSubmit (context guard) added")));
-        assert!(messages.iter().any(|m| m.contains("PreCompact (context guard) added")));
-        assert!(messages.iter().any(|m| m.contains("SessionStart (context guard) added")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("UserPromptSubmit (context guard) added")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("PreCompact (context guard) added")));
+        assert!(messages
+            .iter()
+            .any(|m| m.contains("SessionStart (context guard) added")));
 
         let (root2, messages2) = merge_hook_settings(
             root,
@@ -1958,13 +2000,18 @@ mod hooks_tests {
             Some(scripts),
         )
         .unwrap();
-        assert_eq!(root2["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            root2["hooks"]["UserPromptSubmit"].as_array().unwrap().len(),
+            1
+        );
         assert_eq!(root2["hooks"]["PreCompact"].as_array().unwrap().len(), 1);
         assert_eq!(root2["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
         assert!(messages2
             .iter()
             .any(|m| m.contains("UserPromptSubmit context-guard already installed")));
-        assert!(messages2.iter().any(|m| m.contains("PreCompact already installed")));
+        assert!(messages2
+            .iter()
+            .any(|m| m.contains("PreCompact already installed")));
         assert!(messages2
             .iter()
             .any(|m| m.contains("SessionStart context-guard already installed")));

@@ -237,9 +237,18 @@ fn evaluate_all(
 }
 
 fn build_result(k: usize, rows: Vec<(Category, QuestionSet, Metrics)>) -> EvalResult {
-    let by_category = aggregate_by(k, &rows, &ALL_CATEGORIES, |c, _| c, |c| c.label().to_string());
+    let by_category = aggregate_by(
+        k,
+        &rows,
+        &ALL_CATEGORIES,
+        |c, _| c,
+        |c| c.label().to_string(),
+    );
     let by_set = aggregate_by(k, &rows, &ALL_SETS, |_, s| s, |s| s.label().to_string());
-    EvalResult { by_category, by_set }
+    EvalResult {
+        by_category,
+        by_set,
+    }
 }
 
 /// Confusion counts for the **preventer end-to-end eval**: unlike
@@ -349,7 +358,10 @@ pub fn run_inject_eval_hermetic() -> Result<InjectConfusion> {
         .map(|q| (q.query, q.topic))
         .collect();
     evaluate_inject_all(&conn, &ids, fixtures::SYNTHETIC_MODEL, |query| {
-        Ok(fixtures::synthetic_query_vector(topic_by_query[query], query))
+        Ok(fixtures::synthetic_query_vector(
+            topic_by_query[query],
+            query,
+        ))
     })
 }
 
@@ -392,7 +404,12 @@ pub fn run_inject_eval_real_model() -> Result<Option<InjectConfusion>> {
         conn.execute(
             "INSERT INTO embedding (node_id, model, dim, vec, content_hash) \
              VALUES (?1, ?2, ?3, ?4, x'00')",
-            params![node_id, embedder.name, embedder.dim as i64, embed::to_blob(&vec)],
+            params![
+                node_id,
+                embedder.name,
+                embedder.dim as i64,
+                embed::to_blob(&vec)
+            ],
         )?;
     }
     let model_name = embedder.name.clone();
@@ -446,7 +463,12 @@ pub fn run_real_model(k: usize) -> Result<Option<EvalResult>> {
         conn.execute(
             "INSERT INTO embedding (node_id, model, dim, vec, content_hash) \
              VALUES (?1, ?2, ?3, ?4, x'00')",
-            params![node_id, embedder.name, embedder.dim as i64, embed::to_blob(&vec)],
+            params![
+                node_id,
+                embedder.name,
+                embedder.dim as i64,
+                embed::to_blob(&vec)
+            ],
         )?;
     }
 
@@ -456,7 +478,6 @@ pub fn run_real_model(k: usize) -> Result<Option<EvalResult>> {
     })?;
     Ok(Some(build_result(k, rows)))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -520,7 +541,10 @@ mod tests {
     #[ignore]
     fn eval_baseline_report() {
         let result = run_hermetic(5).unwrap();
-        print_report("hermetic — by category (synthetic vectors, k=5)", &result.by_category);
+        print_report(
+            "hermetic — by category (synthetic vectors, k=5)",
+            &result.by_category,
+        );
         print_report("hermetic — by question set (k=5)", &result.by_set);
     }
 
@@ -585,7 +609,11 @@ mod tests {
             let relevant = fixtures::relevant_ids(ids, q);
             println!("\n[{:?}/{:?}] {}", q.category, q.set, q.query);
             for (rank, h) in hits.iter().enumerate() {
-                let mark = if relevant.contains(&h.node.id) { "*" } else { " " };
+                let mark = if relevant.contains(&h.node.id) {
+                    "*"
+                } else {
+                    " "
+                };
                 println!(
                     "  {mark} #{rank} {} (score {:.4})",
                     fixtures::key_for_id(ids, h.node.id),
@@ -628,8 +656,8 @@ mod tests {
             );
             return;
         }
-        let mut embedder = Embedder::load(&paths, &model_name, &config.embedding.device, false)
-            .unwrap();
+        let mut embedder =
+            Embedder::load(&paths, &model_name, &config.embedding.device, false).unwrap();
 
         let conn = db::open_in_memory().unwrap();
         let ids = fixtures::insert_fixture_nodes(&conn).unwrap();

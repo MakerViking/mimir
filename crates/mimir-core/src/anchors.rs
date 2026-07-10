@@ -71,7 +71,9 @@ fn anchored_candidates(conn: &Connection, scope: Scope) -> Result<Vec<crate::mod
         crate::search::scope_sql(scope)
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([], row_to_node)?.collect::<rusqlite::Result<_>>()?;
+    let rows = stmt
+        .query_map([], row_to_node)?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
 }
 
@@ -172,7 +174,9 @@ pub fn find_and_record(
         }
         let _ = store::record_injection(conn, session_id, node.id);
         let projects = store::project_titles(conn).unwrap_or_default();
-        let project_name = node.project_id.and_then(|id| projects.get(&id).map(String::as_str));
+        let project_name = node
+            .project_id
+            .and_then(|id| projects.get(&id).map(String::as_str));
         return Ok(Some(format!(
             "Guard anchor matched — relevant memory: {}",
             agent_line(&node, project_name, 400)
@@ -195,28 +199,43 @@ mod tests {
         assert!(glob_match("*.rs", "store.rs"));
         assert!(glob_match("store.*", "store.rs"));
         assert!(glob_match("s?ore.rs", "store.rs"));
-        assert!(glob_match("mimir-core/*/store.rs", "mimir-core/src/store.rs"));
+        assert!(glob_match(
+            "mimir-core/*/store.rs",
+            "mimir-core/src/store.rs"
+        ));
         // `*` matches any run of characters INCLUDING '/' (no `**` distinction
         // here — see the function's doc comment), so a single `*` segment
         // spans "src/deep" too.
-        assert!(glob_match("mimir-core/*/store.rs", "mimir-core/src/deep/store.rs"));
+        assert!(glob_match(
+            "mimir-core/*/store.rs",
+            "mimir-core/src/deep/store.rs"
+        ));
     }
 
     #[test]
     fn anchor_matches_path_tries_every_suffix() {
-        assert!(anchor_matches_path("store.rs", "/home/t/repo/crates/mimir-core/src/store.rs"));
+        assert!(anchor_matches_path(
+            "store.rs",
+            "/home/t/repo/crates/mimir-core/src/store.rs"
+        ));
         assert!(anchor_matches_path(
             "mimir-core/src/store.rs",
             "/home/t/repo/crates/mimir-core/src/store.rs"
         ));
-        assert!(!anchor_matches_path("commands.rs", "/home/t/repo/crates/mimir-core/src/store.rs"));
+        assert!(!anchor_matches_path(
+            "commands.rs",
+            "/home/t/repo/crates/mimir-core/src/store.rs"
+        ));
         assert!(anchor_matches_path("*.rs", "/a/b/store.rs"));
         assert!(!anchor_matches_path("*.rs", "/a/b/store.txt"));
     }
 
     #[test]
     fn anchor_matches_command_scans_tokens() {
-        assert!(anchor_matches_command("store.rs", "cat crates/mimir-core/src/store.rs"));
+        assert!(anchor_matches_command(
+            "store.rs",
+            "cat crates/mimir-core/src/store.rs"
+        ));
         assert!(anchor_matches_command(
             "store.rs",
             r#"rg "meta.anchors" crates/mimir-core/src/store.rs"#
@@ -233,7 +252,10 @@ mod tests {
             "   ".into(),
             "x".repeat(201),
         ]);
-        assert_eq!(out, vec!["store.rs".to_string(), "crates/mimir-core/**".to_string()]);
+        assert_eq!(
+            out,
+            vec!["store.rs".to_string(), "crates/mimir-core/**".to_string()]
+        );
     }
 
     #[test]
@@ -265,29 +287,61 @@ mod tests {
     #[test]
     fn find_and_record_matches_edit_and_dedupes_per_session() {
         let conn = db::open_in_memory().unwrap();
-        seed_anchored(&conn, "store.rs: never call json_set twice in one UPDATE", &["store.rs"]);
+        seed_anchored(
+            &conn,
+            "store.rs: never call json_set twice in one UPDATE",
+            &["store.rs"],
+        );
 
-        let first = find_and_record(&conn, "s1", Scope::All, "/home/t/repo/crates/mimir-core/src/store.rs", false)
-            .unwrap();
+        let first = find_and_record(
+            &conn,
+            "s1",
+            Scope::All,
+            "/home/t/repo/crates/mimir-core/src/store.rs",
+            false,
+        )
+        .unwrap();
         assert!(first.unwrap().contains("json_set"));
 
         // Same session, same file again: silent (already surfaced).
-        let second = find_and_record(&conn, "s1", Scope::All, "/home/t/repo/crates/mimir-core/src/store.rs", false)
-            .unwrap();
+        let second = find_and_record(
+            &conn,
+            "s1",
+            Scope::All,
+            "/home/t/repo/crates/mimir-core/src/store.rs",
+            false,
+        )
+        .unwrap();
         assert!(second.is_none());
 
         // A different session sees it fresh.
-        let third = find_and_record(&conn, "s2", Scope::All, "/home/t/repo/crates/mimir-core/src/store.rs", false)
-            .unwrap();
+        let third = find_and_record(
+            &conn,
+            "s2",
+            Scope::All,
+            "/home/t/repo/crates/mimir-core/src/store.rs",
+            false,
+        )
+        .unwrap();
         assert!(third.is_some());
     }
 
     #[test]
     fn find_and_record_matches_bash_command_text() {
         let conn = db::open_in_memory().unwrap();
-        seed_anchored(&conn, "migrations.rs: bump schema_version too", &["migrations.rs"]);
-        let hit = find_and_record(&conn, "s1", Scope::All, "cat crates/mimir-core/src/db/migrations.rs", true)
-            .unwrap();
+        seed_anchored(
+            &conn,
+            "migrations.rs: bump schema_version too",
+            &["migrations.rs"],
+        );
+        let hit = find_and_record(
+            &conn,
+            "s1",
+            Scope::All,
+            "cat crates/mimir-core/src/db/migrations.rs",
+            true,
+        )
+        .unwrap();
         assert!(hit.unwrap().contains("schema_version"));
     }
 

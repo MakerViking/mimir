@@ -425,7 +425,10 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_creat
             .unwrap()
             .query_row("SELECT count(*) FROM recall_event", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(remaining, 1, "only the 200-day-old row clears the 180-day cutoff");
+        assert_eq!(
+            remaining, 1,
+            "only the 200-day-old row clears the 180-day cutoff"
+        );
     }
 
     /// Same locking-wrapper coverage as `prune_events_once_removes_only_rows_past_the_window`,
@@ -458,6 +461,9 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_creat
             .unwrap()
             .query_row("SELECT count(*) FROM session_state", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(remaining, 1, "only the 10-day-old row clears the fixed 7-day cutoff");
+        assert_eq!(
+            remaining, 1,
+            "only the 10-day-old row clears the fixed 7-day cutoff"
+        );
     }
 }

@@ -73,7 +73,12 @@ pub fn sanitize_tags(tags: Vec<String>) -> Vec<String> {
 pub fn sanitize_fires_when(phrases: Vec<String>) -> Vec<String> {
     phrases
         .into_iter()
-        .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
+        .map(|p| {
+            p.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        })
         .filter(|p| !p.is_empty() && p.split_whitespace().count() <= 6)
         .take(8)
         .collect()

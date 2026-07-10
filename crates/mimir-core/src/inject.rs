@@ -99,7 +99,12 @@ pub const TOP_CANDIDATES: usize = 1;
 /// floor. Rule 3 (vector-leg agreement) still applies when a vector leg
 /// exists: a declared trigger says "this topic matters", not "ignore a
 /// contradicting embedding signal".
-pub fn compute(mimir: &mut Mimir, prompt: &str, enrich: &str, scope: Scope) -> Result<Option<String>> {
+pub fn compute(
+    mimir: &mut Mimir,
+    prompt: &str,
+    enrich: &str,
+    scope: Scope,
+) -> Result<Option<String>> {
     compute_with_session(mimir, prompt, enrich, scope, false, None)
 }
 
@@ -244,7 +249,10 @@ pub fn select_injection<'h>(
     enrich: &str,
     legs: &[Vec<i64>],
 ) -> Option<&'h Hit> {
-    if let Some(hit) = hits.iter().find(|hit| fires_when_clears(hit, prompt, enrich, legs)) {
+    if let Some(hit) = hits
+        .iter()
+        .find(|hit| fires_when_clears(hit, prompt, enrich, legs))
+    {
         return Some(hit);
     }
     hits.iter()
@@ -278,7 +286,8 @@ fn select_unseen_injection<'h>(
     enrich: &str,
     legs: &[Vec<i64>],
 ) -> Option<&'h Hit> {
-    let unseen = |hit: &&Hit| !store::injection_seen(conn, session_id, hit.node.id).unwrap_or(false);
+    let unseen =
+        |hit: &&Hit| !store::injection_seen(conn, session_id, hit.node.id).unwrap_or(false);
     if let Some(hit) = hits
         .iter()
         .filter(|hit| fires_when_clears(hit, prompt, enrich, legs))
@@ -302,7 +311,10 @@ fn fires_when_matches(phrase: &str, prompt_lower: &str, prompt_tokens: &HashSet<
     if !phrase.is_empty() && prompt_lower.contains(phrase) {
         return true;
     }
-    let mut words = phrase.split_whitespace().filter(|w| !fts::is_stopword(w)).peekable();
+    let mut words = phrase
+        .split_whitespace()
+        .filter(|w| !fts::is_stopword(w))
+        .peekable();
     if words.peek().is_none() {
         return false;
     }
@@ -340,7 +352,10 @@ fn fires_when_clears(top: &Hit, prompt: &str, enrich: &str, legs: &[Vec<i64>]) -
         return false;
     }
     match legs.get(1) {
-        Some(vector_leg) => vector_leg.iter().take(LEG_TOP_K).any(|id| *id == top.node.id),
+        Some(vector_leg) => vector_leg
+            .iter()
+            .take(LEG_TOP_K)
+            .any(|id| *id == top.node.id),
         None => true,
     }
 }
@@ -386,7 +401,10 @@ fn clears_floor(top: &Hit, prompt: &str, enrich: &str, legs: &[Vec<i64>]) -> boo
     // Rule 3: dual-leg agreement, only when a vector leg exists (legs[0] is
     // always FTS, legs[1] is vector iff a model embedded this query).
     let vector_agrees = match legs.get(1) {
-        Some(vector_leg) => vector_leg.iter().take(LEG_TOP_K).any(|id| *id == top.node.id),
+        Some(vector_leg) => vector_leg
+            .iter()
+            .take(LEG_TOP_K)
+            .any(|id| *id == top.node.id),
         None => false,
     };
     if legs.get(1).is_some() && !vector_agrees {
@@ -499,7 +517,10 @@ mod tests {
             Scope::All,
         )
         .unwrap();
-        assert!(out.is_some(), "pinned hit should clear rule 1 like a gotcha/decision");
+        assert!(
+            out.is_some(),
+            "pinned hit should clear rule 1 like a gotcha/decision"
+        );
     }
 
     #[test]
@@ -562,7 +583,10 @@ mod tests {
             Scope::All,
         )
         .unwrap();
-        assert!(out.is_none(), "enrichment-only overlap must not self-license an injection");
+        assert!(
+            out.is_none(),
+            "enrichment-only overlap must not self-license an injection"
+        );
     }
 
     #[test]
@@ -586,7 +610,10 @@ mod tests {
             Scope::All,
         )
         .unwrap();
-        assert!(out.is_some(), "enrichment should extend a real single-token overlap");
+        assert!(
+            out.is_some(),
+            "enrichment should extend a real single-token overlap"
+        );
     }
 
     #[test]
@@ -607,9 +634,8 @@ mod tests {
             "remember to check this before shipping",
             &["scram", "nfkc", "normalization"],
         );
-        let out =
-            compute_with_mode(&mut mimir, "scram nfkc normalization", "", Scope::All, true)
-                .unwrap();
+        let out = compute_with_mode(&mut mimir, "scram nfkc normalization", "", Scope::All, true)
+            .unwrap();
         assert!(
             out.is_some(),
             "bm25_only mode must still inject on a clean lexical match \

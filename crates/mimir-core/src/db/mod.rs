@@ -150,7 +150,7 @@ pub fn data_version(conn: &Connection) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Kind, NewNode, now_unix};
+    use crate::model::{now_unix, Kind, NewNode};
     use crate::store;
 
     fn seed_old_event(conn: &Connection, age_days: i64) {
@@ -187,7 +187,11 @@ mod tests {
         seed_old_event(&conn, 200);
         seed_old_event(&conn, 10);
         prune_events_once(&conn, 180);
-        assert_eq!(event_count(&conn), 1, "only the 200-day-old row is past a 180-day window");
+        assert_eq!(
+            event_count(&conn),
+            1,
+            "only the 200-day-old row is past a 180-day window"
+        );
     }
 
     #[test]
@@ -238,7 +242,11 @@ mod tests {
         // instant) — a short, generous sleep stands in for "never happens".
         std::thread::sleep(Duration::from_millis(300));
         let conn = open(&db_path).unwrap();
-        assert_eq!(event_count(&conn), 1, "None must disable the prune entirely");
+        assert_eq!(
+            event_count(&conn),
+            1,
+            "None must disable the prune entirely"
+        );
     }
 
     /// `session_state`/`injection_log` pruning is unconditional (no config
@@ -273,6 +281,10 @@ mod tests {
         seed_old_session_state(&conn, 10);
         seed_old_session_state(&conn, 1);
         prune_session_state_once(&conn);
-        assert_eq!(session_state_count(&conn), 1, "only the 10-day-old row is past the 7-day cutoff");
+        assert_eq!(
+            session_state_count(&conn),
+            1,
+            "only the 10-day-old row is past the 7-day cutoff"
+        );
     }
 }

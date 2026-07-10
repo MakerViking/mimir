@@ -512,10 +512,7 @@ mod learn_config_tests {
 
     #[test]
     fn default_180_passes_through_unclamped() {
-        assert_eq!(
-            LearnConfig::default().effective_retention_days(),
-            Some(180)
-        );
+        assert_eq!(LearnConfig::default().effective_retention_days(), Some(180));
     }
 
     #[test]

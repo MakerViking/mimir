@@ -122,11 +122,7 @@ impl MatrixCache {
         if c.model != model || ids.is_empty() {
             return Ok(());
         }
-        let id_list = ids
-            .iter()
-            .map(i64::to_string)
-            .collect::<Vec<_>>()
-            .join(",");
+        let id_list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
         let mut stmt = conn.prepare(&format!(
             "SELECT e.node_id, e.dim, e.vec, n.project_id, n.kind, n.created_at
              FROM embedding e JOIN node n ON n.id = e.node_id
@@ -422,9 +418,12 @@ mod tests {
         let mut rebuilt = None;
         let full = leg(&conn, &mut rebuilt, MODEL, &[0.0, 1.0], &q(), 10).unwrap();
         assert_eq!(patched, full, "patched cache diverged from a full rebuild");
-        assert_eq!(patched, vec![b, a], "b (dot=1.0) outranks patched a (dot=0.8)");
+        assert_eq!(
+            patched,
+            vec![b, a],
+            "b (dot=1.0) outranks patched a (dot=0.8)"
+        );
     }
-
 
     #[test]
     fn upsert_is_noop_without_a_cache_or_on_model_mismatch() {

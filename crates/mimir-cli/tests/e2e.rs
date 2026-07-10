@@ -245,8 +245,8 @@ fn hooks_install_bakes_custom_inject_url_into_recall_script() {
         .output()
         .expect("binary runs");
     assert!(out2.status.success());
-    let script2 = std::fs::read_to_string(fake_home.path().join(".claude/hooks/mimir-recall.sh"))
-        .unwrap();
+    let script2 =
+        std::fs::read_to_string(fake_home.path().join(".claude/hooks/mimir-recall.sh")).unwrap();
     assert!(
         script2.contains(r#"INJECT_URL="${MIMIR_INJECT_URL:-http://192.168.1.1:7000/inject}""#),
         "re-init did not rewrite the script with the new inject_url:\n{script2}"
@@ -291,7 +291,10 @@ fn context_guard_hooks_install_and_are_idempotent() {
         "mimir-context-guard-precompact.sh",
         "mimir-context-guard-session.sh",
     ] {
-        assert!(hooks_dir.join(script).is_file(), "{script} must have been written");
+        assert!(
+            hooks_dir.join(script).is_file(),
+            "{script} must have been written"
+        );
     }
 
     let settings: serde_json::Value = serde_json::from_str(
@@ -299,7 +302,11 @@ fn context_guard_hooks_install_and_are_idempotent() {
     )
     .unwrap();
     let hooks = &settings["hooks"];
-    assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 2, "rewrite + anchors");
+    assert_eq!(
+        hooks["PreToolUse"].as_array().unwrap().len(),
+        2,
+        "rewrite + anchors"
+    );
     assert_eq!(hooks["UserPromptSubmit"].as_array().unwrap().len(), 1);
     assert_eq!(hooks["PreCompact"].as_array().unwrap().len(), 1);
     assert_eq!(
@@ -364,10 +371,18 @@ fn context_guard_off_by_default_adds_no_new_hook_entries() {
     )
     .unwrap();
     let hooks = &settings["hooks"];
-    assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 2, "rewrite + anchors");
+    assert_eq!(
+        hooks["PreToolUse"].as_array().unwrap().len(),
+        2,
+        "rewrite + anchors"
+    );
     assert!(hooks.get("UserPromptSubmit").is_none());
     assert!(hooks.get("PreCompact").is_none());
-    assert_eq!(hooks["SessionStart"].as_array().unwrap().len(), 1, "rules pack only");
+    assert_eq!(
+        hooks["SessionStart"].as_array().unwrap().len(),
+        1,
+        "rules pack only"
+    );
 }
 
 #[test]
