@@ -4,8 +4,10 @@
 //! projects, tags) in one SQLite database, searched by hybrid
 //! BM25 + vector retrieval with reciprocal-rank fusion.
 
+pub mod anchors;
 pub mod config;
 pub mod consolidate;
+pub mod context_guard;
 pub mod db;
 pub mod embed;
 #[cfg(any(test, feature = "eval"))]

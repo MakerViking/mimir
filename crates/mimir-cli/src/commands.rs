@@ -8,9 +8,15 @@ use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope}
 use mimir_core::search::SearchQuery;
 use mimir_core::{db, store, Mimir};
 
-pub fn init(no_model: bool, hooks: bool, auto_recall: bool) -> Result<()> {
+pub fn init(no_model: bool, hooks: bool, auto_recall: bool, context_guard: Option<&str>) -> Result<()> {
     let paths = Paths::resolve()?;
-    let config = Config::load(&paths.config_file)?;
+    let mut config = Config::load(&paths.config_file)?;
+    if let Some(mode) = context_guard {
+        if !matches!(mode, "off" | "pause" | "handoff") {
+            bail!("--context-guard must be one of: off, pause, handoff (got {mode:?})");
+        }
+        config.hooks.context_guard = mode.to_string();
+    }
     config.save(&paths.config_file)?;
     // Opening creates + migrates the database.
     let _conn = db::open(&paths.db_file)?;
@@ -50,6 +56,13 @@ pub fn init(no_model: bool, hooks: bool, auto_recall: bool) -> Result<()> {
         println!();
         println!("Per-prompt auto-recall (inject a relevant memory into every prompt) is opt-in:");
         println!("  mimir init --hooks --auto-recall");
+    }
+    if hooks && config.hooks.context_guard == "off" {
+        println!();
+        println!(
+            "Context-window guard (nudge before an auto-compact takes control) is opt-in:"
+        );
+        println!("  mimir init --hooks --context-guard pause   # or: handoff");
     }
     Ok(())
 }
@@ -148,22 +161,73 @@ fi
 exit 0
 "#;
 
+/// The PreToolUse(Bash|Edit|Write) guard-anchors hook script: unconditional
+/// under `--hooks` (no separate opt-in flag) — a memory with no
+/// `meta.anchors` makes every invocation a silent no-op, so there is
+/// nothing to gate. All matching logic lives in `mimir_core::anchors` /
+/// `mimir context-guard pretool`; this script only pipes the hook's stdin
+/// JSON straight through (no jq needed — the JSON is parsed in Rust).
+const MIMIR_ANCHORS_SH: &str = r#"#!/usr/bin/env bash
+# mimir-hook-version: 1
+# Mimir PreToolUse guard-anchors hook — surfaces at most one anchored
+# memory (see `mimir remember --anchor`) as extra context when a matching
+# file is edited/written, or mentioned in a Bash command. Requires: mimir.
+command -v mimir >/dev/null 2>&1 || exit 0
+mimir context-guard pretool 2>/dev/null
+exit 0
+"#;
+
+/// The opt-in `[hooks] context_guard != "off"` hook scripts — one each for
+/// UserPromptSubmit, PreCompact, SessionStart. All logic lives in
+/// `mimir_core::context_guard` / `mimir context-guard <subcommand>`; each
+/// script only pipes stdin through (no jq — parsed in Rust).
+const MIMIR_CONTEXT_GUARD_PROMPT_SH: &str = r#"#!/usr/bin/env bash
+# mimir-hook-version: 1
+# Mimir UserPromptSubmit context-guard hook — see `mimir_core::context_guard`
+# and `[hooks] context_guard` in config.toml. Requires: mimir.
+command -v mimir >/dev/null 2>&1 || exit 0
+mimir context-guard prompt 2>/dev/null
+exit 0
+"#;
+const MIMIR_CONTEXT_GUARD_PRECOMPACT_SH: &str = r#"#!/usr/bin/env bash
+# mimir-hook-version: 1
+# Mimir PreCompact context-guard hook — see `mimir_core::context_guard`
+# and `[hooks] context_guard` in config.toml. Requires: mimir.
+command -v mimir >/dev/null 2>&1 || exit 0
+mimir context-guard precompact 2>/dev/null
+exit 0
+"#;
+const MIMIR_CONTEXT_GUARD_SESSION_SH: &str = r#"#!/usr/bin/env bash
+# mimir-hook-version: 1
+# Mimir SessionStart context-guard hook — see `mimir_core::context_guard`
+# and `[hooks] context_guard` in config.toml. Requires: mimir.
+command -v mimir >/dev/null 2>&1 || exit 0
+mimir context-guard session-start 2>/dev/null
+exit 0
+"#;
+
 /// Bakes `config.hooks.inject_url` into `MIMIR_RECALL_SH`'s fallback default,
 /// split out as a pure function so it's unit-testable without touching disk.
 fn render_recall_script(inject_url: &str) -> String {
     MIMIR_RECALL_SH.replace("__MIMIR_INJECT_URL_DEFAULT__", inject_url)
 }
 
-/// Install the opt-in Claude Code hooks: a PreToolUse(Bash) rewrite hook and a
-/// SessionStart hook that injects the project rules pack, plus (when
-/// `auto_recall`) a UserPromptSubmit hook that injects at most one relevant
-/// memory per prompt. Idempotent, backs up settings.json, and never clobbers
-/// existing hooks. `auto_recall=false` leaves `hooks.UserPromptSubmit`
-/// untouched — behavior is otherwise identical to before this flag existed
-/// (see `merge_hook_settings`'s unit tests). Re-running after editing
-/// `config.hooks.inject_url` rewrites `mimir-recall.sh` unconditionally
-/// (step 2 below is a plain `fs::write`, no existence check), so the new
-/// URL always lands on the next `mimir init --hooks --auto-recall`.
+/// Install the opt-in Claude Code hooks: a PreToolUse(Bash) rewrite hook, a
+/// PreToolUse(Bash|Edit|Write) guard-anchors hook, and a SessionStart hook
+/// that injects the project rules pack — all unconditional under `--hooks`
+/// — plus (when `auto_recall`) a UserPromptSubmit hook that injects at
+/// most one relevant memory per prompt, and (when `config.hooks.
+/// context_guard != "off"`) the UserPromptSubmit/PreCompact/SessionStart
+/// context-guard hooks. Idempotent, backs up settings.json, and never
+/// clobbers existing hooks. `auto_recall=false` leaves
+/// `hooks.UserPromptSubmit`'s auto-recall entry untouched, and
+/// `context_guard == "off"` (the default) adds none of the context-guard
+/// entries at all — behavior is otherwise identical to before either flag
+/// existed (see `merge_hook_settings`'s unit tests). Re-running after
+/// editing `config.hooks.inject_url` rewrites `mimir-recall.sh`
+/// unconditionally (step 2 below is a plain `fs::write`, no existence
+/// check), so the new URL always lands on the next `mimir init --hooks
+/// --auto-recall`.
 fn install_hooks(config: &Config, auto_recall: bool) -> Result<()> {
     if std::env::var_os("MIMIR_HOME").is_some() {
         return Ok(()); // isolated instances never touch the user's agent config
@@ -178,36 +242,51 @@ fn install_hooks(config: &Config, auto_recall: bool) -> Result<()> {
     let hooks_dir = claude.join("hooks");
     std::fs::create_dir_all(&hooks_dir)?;
 
-    // 1. Write the PreToolUse delegate script (executable).
-    let script = hooks_dir.join("mimir-rewrite.sh");
-    std::fs::write(&script, MIMIR_REWRITE_SH)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))?;
-    }
-    let script_str = script.to_string_lossy().into_owned();
+    let write_script = |name: &str, content: &str| -> Result<String> {
+        let path = hooks_dir.join(name);
+        std::fs::write(&path, content)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(path.to_string_lossy().into_owned())
+    };
+
+    // 1. Write the PreToolUse delegate scripts (executable).
+    let script_str = write_script("mimir-rewrite.sh", MIMIR_REWRITE_SH)?;
+    let anchors_script_str = write_script("mimir-anchors.sh", MIMIR_ANCHORS_SH)?;
 
     // 2. Auto-recall delegate script — only written when opted in. Always
     // rewritten (not skipped if already present), so changing
     // config.hooks.inject_url and re-running takes effect immediately.
     let recall_script_str = if auto_recall {
-        let recall_script = hooks_dir.join("mimir-recall.sh");
-        std::fs::write(
-            &recall_script,
-            render_recall_script(&config.hooks.inject_url),
-        )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&recall_script, std::fs::Permissions::from_mode(0o755))?;
-        }
-        Some(recall_script.to_string_lossy().into_owned())
+        Some(write_script(
+            "mimir-recall.sh",
+            &render_recall_script(&config.hooks.inject_url),
+        )?)
     } else {
         None
     };
 
-    // 3. Merge into settings.json (back it up first).
+    // 3. Context-guard delegate scripts — only written when opted in.
+    let context_guard_scripts = if config.hooks.context_guard != "off" {
+        Some((
+            write_script("mimir-context-guard-prompt.sh", MIMIR_CONTEXT_GUARD_PROMPT_SH)?,
+            write_script(
+                "mimir-context-guard-precompact.sh",
+                MIMIR_CONTEXT_GUARD_PRECOMPACT_SH,
+            )?,
+            write_script("mimir-context-guard-session.sh", MIMIR_CONTEXT_GUARD_SESSION_SH)?,
+        ))
+    } else {
+        None
+    };
+    let context_guard_scripts_ref = context_guard_scripts
+        .as_ref()
+        .map(|(p, c, s)| (p.as_str(), c.as_str(), s.as_str()));
+
+    // 4. Merge into settings.json (back it up first).
     let settings_path = claude.join("settings.json");
     let root: serde_json::Value = match std::fs::read_to_string(&settings_path) {
         Ok(text) => {
@@ -217,7 +296,13 @@ fn install_hooks(config: &Config, auto_recall: bool) -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(e) => return Err(e.into()),
     };
-    let (root, messages) = merge_hook_settings(root, &script_str, recall_script_str.as_deref())?;
+    let (root, messages) = merge_hook_settings(
+        root,
+        &script_str,
+        recall_script_str.as_deref(),
+        &anchors_script_str,
+        context_guard_scripts_ref,
+    )?;
 
     std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
     println!("hooks   {}", messages.join("; "));
@@ -232,12 +317,19 @@ fn install_hooks(config: &Config, auto_recall: bool) -> Result<()> {
 /// logic (idempotency, which keys get touched) is unit-testable without a
 /// real `~/.claude` — `install_hooks` early-returns under `MIMIR_HOME`, so
 /// this is the only way to test it at all. `recall_script = None` must
-/// leave `hooks.UserPromptSubmit` completely untouched: that's what makes
-/// `auto_recall=false` byte-identical to pre-auto-recall behavior.
+/// leave `hooks.UserPromptSubmit`'s auto-recall entry completely untouched
+/// — that's what makes `auto_recall=false` byte-identical to
+/// pre-auto-recall behavior. Likewise `context_guard_scripts = None`
+/// (prompt, precompact, session_start script paths, in that order) must
+/// add none of the UserPromptSubmit/PreCompact/SessionStart context-guard
+/// entries — what makes `context_guard == "off"` byte-identical to
+/// pre-context-guard behavior.
 fn merge_hook_settings(
     mut root: serde_json::Value,
     rewrite_script: &str,
     recall_script: Option<&str>,
+    anchors_script: &str,
+    context_guard_scripts: Option<(&str, &str, &str)>,
 ) -> Result<(serde_json::Value, Vec<String>)> {
     if !root.is_object() {
         bail!("settings.json is not a JSON object");
@@ -293,6 +385,19 @@ fn merge_hook_settings(
         messages.push("PreToolUse (command filter) added".into());
     }
 
+    // PreToolUse(Bash|Edit|Write): guard anchors. Unconditional under
+    // `--hooks` — see `MIMIR_ANCHORS_SH`'s doc comment for why there's no
+    // separate opt-in.
+    if entries_mention(pre_arr, "mimir-anchors") {
+        messages.push("PreToolUse anchors already installed".into());
+    } else {
+        pre_arr.push(serde_json::json!({
+            "matcher": "Bash|Edit|Write",
+            "hooks": [{ "type": "command", "command": anchors_script }]
+        }));
+        messages.push("PreToolUse (guard anchors) added".into());
+    }
+
     // UserPromptSubmit: opt-in auto-recall. Only touched when asked for.
     if let Some(recall_script) = recall_script {
         let prompt = hooks
@@ -308,6 +413,57 @@ fn merge_hook_settings(
                 "hooks": [{ "type": "command", "command": recall_script }]
             }));
             messages.push("UserPromptSubmit (auto-recall) added".into());
+        }
+    }
+
+    // Context guard: UserPromptSubmit + PreCompact + SessionStart entries,
+    // only when `[hooks] context_guard != "off"` — this is what keeps a
+    // default (`"off"`) install byte-identical to pre-context-guard
+    // settings.json output (see this fn's unit tests).
+    if let Some((prompt_script, precompact_script, session_script)) = context_guard_scripts {
+        let cg_prompt = hooks
+            .entry("UserPromptSubmit")
+            .or_insert_with(|| serde_json::json!([]));
+        let cg_prompt_arr = cg_prompt
+            .as_array_mut()
+            .context("hooks.UserPromptSubmit is not an array")?;
+        if entries_mention(cg_prompt_arr, "mimir-context-guard-prompt") {
+            messages.push("UserPromptSubmit context-guard already installed".into());
+        } else {
+            cg_prompt_arr.push(serde_json::json!({
+                "hooks": [{ "type": "command", "command": prompt_script }]
+            }));
+            messages.push("UserPromptSubmit (context guard) added".into());
+        }
+
+        let precompact = hooks
+            .entry("PreCompact")
+            .or_insert_with(|| serde_json::json!([]));
+        let precompact_arr = precompact
+            .as_array_mut()
+            .context("hooks.PreCompact is not an array")?;
+        if entries_mention(precompact_arr, "mimir-context-guard-precompact") {
+            messages.push("PreCompact already installed".into());
+        } else {
+            precompact_arr.push(serde_json::json!({
+                "hooks": [{ "type": "command", "command": precompact_script }]
+            }));
+            messages.push("PreCompact (context guard) added".into());
+        }
+
+        let session_cg = hooks
+            .entry("SessionStart")
+            .or_insert_with(|| serde_json::json!([]));
+        let session_cg_arr = session_cg
+            .as_array_mut()
+            .context("hooks.SessionStart is not an array")?;
+        if entries_mention(session_cg_arr, "mimir-context-guard-session") {
+            messages.push("SessionStart context-guard already installed".into());
+        } else {
+            session_cg_arr.push(serde_json::json!({
+                "hooks": [{ "type": "command", "command": session_script }]
+            }));
+            messages.push("SessionStart (context guard) added".into());
         }
     }
 
@@ -733,6 +889,8 @@ pub fn remember(
     global: bool,
     force: bool,
     link_ref: Option<String>,
+    fires_when: Vec<String>,
+    anchors: Vec<String>,
 ) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let mtype: MemoryType = mtype.parse()?;
@@ -764,6 +922,18 @@ pub fn remember(
                 let target = store::resolve_ref(&mimir.conn, &r)?;
                 store::link(&mimir.conn, node.id, target.id, Rel::Relates, 1.0)?;
                 println!("linked → {}", line(&target, &projects, 0));
+            }
+            if !fires_when.is_empty() {
+                let phrases = memory::sanitize_fires_when(fires_when);
+                if !phrases.is_empty() {
+                    store::set_fires_when(&mimir.conn, node.id, &phrases)?;
+                }
+            }
+            if !anchors.is_empty() {
+                let patterns = mimir_core::anchors::sanitize_anchors(anchors);
+                if !patterns.is_empty() {
+                    mimir_core::anchors::set_anchors(&mimir.conn, node.id, &patterns)?;
+                }
             }
             // Keep semantic recall fresh; harmless no-op without a model.
             if let Err(err) = mimir.embed_pending() {
@@ -899,7 +1069,7 @@ pub fn recall(
 /// `MIMIR_RECALL_SH`'s `git diff`), passed straight through to
 /// `inject::compute_with_mode` — see that function's doc comment for how
 /// it's used.
-pub fn recall_inject(prompt: String, enrich: Option<String>) -> Result<()> {
+pub fn recall_inject(prompt: String, enrich: Option<String>, session: Option<String>) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let scope = read_scope(&mimir, false, false)?;
     let enrich = enrich.unwrap_or_default();
@@ -911,9 +1081,14 @@ pub fn recall_inject(prompt: String, enrich: Option<String>) -> Result<()> {
             false
         }
     };
-    if let Some(text) =
-        mimir_core::inject::compute_with_mode(&mut mimir, &prompt, &enrich, scope, bm25_only)?
-    {
+    if let Some(text) = mimir_core::inject::compute_with_session(
+        &mut mimir,
+        &prompt,
+        &enrich,
+        scope,
+        bm25_only,
+        session.as_deref(),
+    )? {
         println!("{text}");
     }
     Ok(())
@@ -1647,20 +1822,42 @@ mod hooks_tests {
 
     /// `auto_recall=false` (recall_script = None) must be byte-identical to
     /// pre-auto-recall behavior: no `UserPromptSubmit` key appears at all.
+    /// `context_guard_scripts = None` must likewise add none of the
+    /// context-guard entries — this is the full default-off byte-identical
+    /// case: only SessionStart(rules) + PreToolUse(rewrite, anchors) exist.
     #[test]
     fn no_recall_script_leaves_user_prompt_submit_untouched() {
-        let (root, messages) =
-            merge_hook_settings(serde_json::json!({}), "/path/mimir-rewrite.sh", None).unwrap();
+        let (root, messages) = merge_hook_settings(
+            serde_json::json!({}),
+            "/path/mimir-rewrite.sh",
+            None,
+            "/path/mimir-anchors.sh",
+            None,
+        )
+        .unwrap();
         assert!(
             root["hooks"].get("UserPromptSubmit").is_none(),
-            "auto_recall=false must not add hooks.UserPromptSubmit, got: {root}"
+            "auto_recall=false and context_guard=off must not add hooks.UserPromptSubmit, got: {root}"
         );
-        // The pre-existing hooks still get installed as before.
+        assert!(
+            root["hooks"].get("PreCompact").is_none(),
+            "context_guard=off must not add hooks.PreCompact, got: {root}"
+        );
+        // The pre-existing hooks still get installed as before, plus the
+        // unconditional guard-anchors entry.
         assert!(root["hooks"]["SessionStart"].is_array());
-        assert!(root["hooks"]["PreToolUse"].is_array());
+        assert_eq!(
+            root["hooks"]["SessionStart"].as_array().unwrap().len(),
+            1,
+            "context_guard=off must add exactly one SessionStart entry (rules), not two"
+        );
+        let pre_arr = root["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_arr.len(), 2, "rewrite + anchors, unconditionally under --hooks");
         assert!(messages.iter().any(|m| m.contains("SessionStart")));
-        assert!(messages.iter().any(|m| m.contains("PreToolUse")));
+        assert!(messages.iter().any(|m| m.contains("PreToolUse (command filter)")));
+        assert!(messages.iter().any(|m| m.contains("PreToolUse (guard anchors)")));
         assert!(!messages.iter().any(|m| m.contains("UserPromptSubmit")));
+        assert!(!messages.iter().any(|m| m.contains("PreCompact")));
     }
 
     /// `auto_recall=true` adds exactly one `UserPromptSubmit` entry
@@ -1671,6 +1868,8 @@ mod hooks_tests {
             serde_json::json!({}),
             "/path/mimir-rewrite.sh",
             Some("/path/mimir-recall.sh"),
+            "/path/mimir-anchors.sh",
+            None,
         )
         .unwrap();
         let entries = root["hooks"]["UserPromptSubmit"].as_array().unwrap();
@@ -1683,6 +1882,8 @@ mod hooks_tests {
             root,
             "/path/mimir-rewrite.sh",
             Some("/path/mimir-recall.sh"),
+            "/path/mimir-anchors.sh",
+            None,
         )
         .unwrap();
         let entries2 = root2["hooks"]["UserPromptSubmit"].as_array().unwrap();
@@ -1690,6 +1891,83 @@ mod hooks_tests {
         assert!(messages2
             .iter()
             .any(|m| m.contains("UserPromptSubmit already installed")));
+    }
+
+    /// Guard anchors install unconditionally under `--hooks` regardless of
+    /// `auto_recall`/`context_guard`, and re-running is idempotent.
+    #[test]
+    fn anchors_entry_is_unconditional_and_idempotent() {
+        let (root, messages) = merge_hook_settings(
+            serde_json::json!({}),
+            "/path/mimir-rewrite.sh",
+            None,
+            "/path/mimir-anchors.sh",
+            None,
+        )
+        .unwrap();
+        let pre_arr = root["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_arr.len(), 2);
+        assert!(messages.iter().any(|m| m.contains("PreToolUse (guard anchors) added")));
+
+        let (root2, messages2) = merge_hook_settings(
+            root,
+            "/path/mimir-rewrite.sh",
+            None,
+            "/path/mimir-anchors.sh",
+            None,
+        )
+        .unwrap();
+        let pre_arr2 = root2["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(pre_arr2.len(), 2, "re-running must not duplicate the anchors entry");
+        assert!(messages2.iter().any(|m| m.contains("PreToolUse anchors already installed")));
+    }
+
+    /// `context_guard_scripts = Some(...)` adds exactly one UserPromptSubmit,
+    /// one PreCompact, and a second SessionStart entry, all idempotently.
+    #[test]
+    fn context_guard_scripts_add_three_entries_idempotently() {
+        let scripts = (
+            "/path/mimir-context-guard-prompt.sh",
+            "/path/mimir-context-guard-precompact.sh",
+            "/path/mimir-context-guard-session.sh",
+        );
+        let (root, messages) = merge_hook_settings(
+            serde_json::json!({}),
+            "/path/mimir-rewrite.sh",
+            None,
+            "/path/mimir-anchors.sh",
+            Some(scripts),
+        )
+        .unwrap();
+        assert_eq!(root["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+        assert_eq!(root["hooks"]["PreCompact"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            root["hooks"]["SessionStart"].as_array().unwrap().len(),
+            2,
+            "rules entry + context-guard entry"
+        );
+        assert!(messages.iter().any(|m| m.contains("UserPromptSubmit (context guard) added")));
+        assert!(messages.iter().any(|m| m.contains("PreCompact (context guard) added")));
+        assert!(messages.iter().any(|m| m.contains("SessionStart (context guard) added")));
+
+        let (root2, messages2) = merge_hook_settings(
+            root,
+            "/path/mimir-rewrite.sh",
+            None,
+            "/path/mimir-anchors.sh",
+            Some(scripts),
+        )
+        .unwrap();
+        assert_eq!(root2["hooks"]["UserPromptSubmit"].as_array().unwrap().len(), 1);
+        assert_eq!(root2["hooks"]["PreCompact"].as_array().unwrap().len(), 1);
+        assert_eq!(root2["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert!(messages2
+            .iter()
+            .any(|m| m.contains("UserPromptSubmit context-guard already installed")));
+        assert!(messages2.iter().any(|m| m.contains("PreCompact already installed")));
+        assert!(messages2
+            .iter()
+            .any(|m| m.contains("SessionStart context-guard already installed")));
     }
 }
 

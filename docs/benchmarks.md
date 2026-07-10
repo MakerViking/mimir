@@ -94,3 +94,37 @@ cap rather than RTK's lossy line compression. On top of that, Mimir's outline
 
 **Recommendation:** switch the PreToolUse hook to Mimir (`mimir init --hooks`,
 then remove the RTK hook). Nothing about RTK's coverage is lost.
+
+## Reproduce the eval (retrieval quality, not token savings)
+
+The numbers above measure token cost. Retrieval *quality* — does auto-recall
+inject the right memory, and stay silent when it should — has its own
+dev-only harness at `crates/mimir-core/src/eval` (not shipped on any user
+surface). It scores precision@k/recall/MRR by [`Category`] and
+[`QuestionSet`], plus a confusion table (injected-correct/wrong,
+silent-correct/wrong) over `inject::select_injection`'s actual decision,
+including drift-preventer fixtures — the case that matters most in practice.
+
+Two modes, since determinism and semantic realism conflict:
+
+```sh
+# hermetic: deterministic synthetic vectors, no model/network — a
+# regression guard, always runnable, part of plain `cargo test`
+cargo test -p mimir-mem-core eval:: -- --ignored --nocapture
+
+# real-model: identical corpus/questions, embedded with the actual default
+# model — the honest number for accuracy work; skips (doesn't fail) if the
+# model isn't downloaded locally
+cargo test -p mimir-mem-core --features eval eval:: -- --ignored --nocapture
+
+# the specific report CHANGELOG entries cite for injection decisions:
+cargo test -p mimir-mem-core eval::tests::eval_inject_baseline_report -- --ignored --nocapture
+
+# compare a different embedding model without touching config.toml:
+MIMIR_EVAL_MODEL=granite-embedding-small-r2 cargo test -p mimir-mem-core \
+  --features eval eval:: -- --ignored --nocapture
+```
+
+The product rule enforced on every ranking/floor change: injected-wrong must
+never rise, even when the change also fixes an intended case — a wrong
+injection is worse than a missed one.

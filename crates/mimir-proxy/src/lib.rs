@@ -85,12 +85,22 @@ pub async fn serve(cfg: ProxyConfig) -> Result<()> {
     // Same connection also prunes old `recall_event` rows on the same idle
     // cadence, once at startup and then every tick — see `db::
     // spawn_checkpoint_timer`'s doc comment in mimir-core for why this rides
-    // along with the checkpoint instead of its own timer.
+    // along with the checkpoint instead of its own timer. `injection_log`/
+    // `session_state` rows get the same treatment, unconditionally (no user
+    // config, unlike recall_event's retention) on the fixed
+    // `mimir_core::db::SESSION_STATE_RETENTION_DAYS` cutoff — mirrors
+    // `db::spawn_checkpoint_timer`'s variant for the sync daemons; the proxy
+    // can't share that thread since it locks a request-shared connection
+    // instead of opening its own.
     if let Some(db) = db.clone() {
         let event_retention_days = cfg.event_retention_days;
         if let Some(days) = event_retention_days {
             let db = db.clone();
             let _ = tokio::task::spawn_blocking(move || prune_events_once(&db, days)).await;
+        }
+        {
+            let db = db.clone();
+            let _ = tokio::task::spawn_blocking(move || prune_session_state_once(&db)).await;
         }
         tokio::spawn(async move {
             let period = std::time::Duration::from_secs(120);
@@ -107,6 +117,7 @@ pub async fn serve(cfg: ProxyConfig) -> Result<()> {
                     if let Some(days) = event_retention_days {
                         prune_events_once(&db, days);
                     }
+                    prune_session_state_once(&db);
                 })
                 .await;
             }
@@ -138,6 +149,22 @@ fn prune_events_once(db: &Db, days: u32) {
         Ok(n) if n > 0 => tracing::info!("proxy: pruned {n} old recall_event rows"),
         Ok(_) => {}
         Err(e) => tracing::warn!("proxy: recall_event prune failed ({e})"),
+    }
+}
+
+/// One `injection_log`/`session_state` prune pass, mirroring
+/// `mimir_core::db::spawn_checkpoint_timer`'s variant for the sync daemons
+/// on the same fixed `mimir_core::db::SESSION_STATE_RETENTION_DAYS` cutoff
+/// (unconditional — no user config, unlike `prune_events_once`'s `days`).
+/// Best-effort and non-fatal, same locking shape as `prune_events_once`.
+fn prune_session_state_once(db: &Db) {
+    let cutoff =
+        mimir_core::model::now_unix() - mimir_core::db::SESSION_STATE_RETENTION_DAYS * 86_400;
+    let Ok(conn) = db.lock() else { return };
+    match mimir_core::store::prune_session_state(&conn, cutoff) {
+        Ok(n) if n > 0 => tracing::info!("proxy: pruned {n} old session_state/injection_log rows"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("proxy: session_state prune failed ({e})"),
     }
 }
 
@@ -348,7 +375,7 @@ fn field_u64(s: &str, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{field_u64, prune_events_once, Db};
+    use super::{field_u64, prune_events_once, prune_session_state_once, Db};
     use std::sync::{Arc, Mutex};
 
     #[test]
@@ -399,5 +426,38 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_creat
             .query_row("SELECT count(*) FROM recall_event", [], |r| r.get(0))
             .unwrap();
         assert_eq!(remaining, 1, "only the 200-day-old row clears the 180-day cutoff");
+    }
+
+    /// Same locking-wrapper coverage as `prune_events_once_removes_only_rows_past_the_window`,
+    /// for the `session_state`/`injection_log` prune this proxy timer also
+    /// runs — `prune_session_state` itself is already covered in
+    /// `mimir-core`; this just proves the proxy's shared-connection lock
+    /// path calls it with the right (fixed) cutoff.
+    #[test]
+    fn prune_session_state_once_removes_only_rows_past_the_seven_day_window() {
+        let conn = mimir_core::db::open_in_memory().unwrap();
+        let now = mimir_core::model::now_unix();
+        let old_at = now - 10 * 86_400;
+        let recent_at = now - 86_400;
+        conn.execute(
+            "INSERT INTO session_state (session_id, key, value, updated_at) VALUES ('s', 'old', 'v', ?1)",
+            rusqlite::params![old_at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_state (session_id, key, value, updated_at) VALUES ('s', 'recent', 'v', ?1)",
+            rusqlite::params![recent_at],
+        )
+        .unwrap();
+
+        let db: Db = Arc::new(Mutex::new(conn));
+        prune_session_state_once(&db);
+
+        let remaining: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM session_state", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "only the 10-day-old row clears the fixed 7-day cutoff");
     }
 }

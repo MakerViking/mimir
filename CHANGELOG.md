@@ -224,6 +224,47 @@ the `mimir-mem` crate, and the on-disk schema move together.
   that one real (if minor) quality cost, this isn't a case for flipping the
   default either — shipped selectable for anyone who wants the CPU headroom
   and can tolerate mild top-3 reshuffling.
+- **Opt-in context-window guard: `mimir init --hooks --context-guard pause`**
+  (or `handoff`), default `"off"`. Three new hook entries
+  (`UserPromptSubmit`, `PreCompact`, `SessionStart`) estimate how full the
+  context window is from the transcript file's *size* — cheap, no JSONL
+  parsing on every prompt — and act once the estimate crosses
+  `[hooks] context_guard_threshold_pct` (default 45% of
+  `context_window_tokens`, default 200,000; both tunable, e.g. for a
+  1M-context model). `"pause"` nudges toward a deliberate `/clear`/
+  `/compact` at most once per +10 percentage-point band, and blocks an
+  *automatic* compact attempted over threshold (`PreCompact`
+  `decision:block`) — a user's own `/compact` is never blocked. `"handoff"`
+  additionally instructs the agent to save a `session-handoff`-tagged
+  memory before the clear, then auto-restores the latest one on the next
+  `SessionStart` after a clear/compact, so the new session isn't starting
+  cold. Clean-room design, byte-size estimation and message wording are
+  Mimir-native. New CLI surface: `mimir context-guard prompt|precompact|
+  session-start|pretool` — hook-event entry points, not meant to be run by
+  hand. `--context-guard` implies `--hooks`; `off` (the default) installs
+  nothing new and leaves the previous hook set byte-identical.
+- **Guard anchors: `mimir remember --anchor "<pattern>"`** (repeatable, up
+  to 8 per memory). Surfaces a memory on `PreToolUse` the moment a matching
+  file is edited/written, or a matching command mentions it — before the
+  tool call happens, no prompt needed. The pattern matches on path suffix
+  (`"store.rs"` matches regardless of how deep it lives), tried against
+  every `/`-delimited suffix and, for Bash, every whitespace/quote-
+  delimited token of the command. Deduped per session via the same
+  `injection_log` ledger auto-recall's `--session` dedup uses, so a match
+  fires once per session, not once per matching tool call. `mimir init
+  --hooks` installs the `PreToolUse` matcher unconditionally — it's inert
+  until a memory actually declares an anchor. Clean-room design: the
+  functional idea ("a memory can declare which files/commands should
+  surface it") is THOR-inspired, but this module was written from that
+  one-sentence spec only — THOR's (GPLv3) implementation was never read.
+- **`mimir remember --fires-when "<phrase>"`** (repeatable) declares
+  trigger phrase(s) that bypass auto-recall's inferred-relevance floor on a
+  close match — for facts that are easy for BM25/vector search to
+  under-rank but should always fire when that phrase comes up. Not exposed
+  on the MCP `remember` tool (CLI-only, same reasoning as `--anchor`).
+  `mimir recall-inject --session <id>` threads a session id through so
+  auto-recall and guard anchors share one per-session "already shown" list
+  instead of two independent ones.
 
 ### Internal
 - New `mimir_core::inject` module: the auto-recall relevance floor,

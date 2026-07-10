@@ -1,5 +1,6 @@
 mod commands;
 mod context_cmd;
+mod context_guard_cmd;
 mod dashboard;
 mod filters;
 mod fsutil;
@@ -47,6 +48,13 @@ enum Command {
         /// one clears the relevance floor (see `recall-inject`).
         #[arg(long)]
         auto_recall: bool,
+        /// Also install the opt-in context-window guard (implies --hooks):
+        /// "off" (default, installs nothing new) | "pause" (nudge to
+        /// deliberately /clear or /compact) | "handoff" (also
+        /// auto-save/restore a handoff memory across the clear). See
+        /// `mimir context-guard` and `[hooks] context_guard` in config.toml.
+        #[arg(long)]
+        context_guard: Option<String>,
     },
     /// Rewrite a shell command to use `mimir run` (used by the PreToolUse hook).
     Rewrite {
@@ -63,6 +71,11 @@ enum Command {
         /// trailing var-arg and would otherwise swallow it.
         #[arg(long)]
         enrich: Option<String>,
+        /// Per-session dedup: skip a memory already injected earlier in
+        /// this session (see `inject::compute_with_session`). Same
+        /// positional constraint as `--enrich`.
+        #[arg(long)]
+        session: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         prompt: Vec<String>,
     },
@@ -103,6 +116,17 @@ enum Command {
         /// Link the new memory to an existing node.
         #[arg(long, value_name = "REF")]
         link: Option<String>,
+        /// Author-declared trigger phrase(s) that bypass the inferred-
+        /// relevance floor on auto-recall (repeatable) — see
+        /// `memory::sanitize_fires_when`.
+        #[arg(long = "fires-when")]
+        fires_when: Vec<String>,
+        /// Guard-anchor pattern(s) (repeatable): surface this memory on
+        /// PreToolUse when a matching file is edited/written, or mentioned
+        /// in a Bash command — e.g. `--anchor "file:store.rs"`. See
+        /// `mimir_core::anchors`.
+        #[arg(long = "anchor")]
+        anchors: Vec<String>,
     },
     /// Search memories (and later docs/code) with hybrid ranking.
     Recall {
@@ -344,6 +368,13 @@ enum Command {
         #[command(subcommand)]
         cmd: ProjectCmd,
     },
+    /// Context-window guard hook-event entry points (see `mimir init
+    /// --context-guard` and `[hooks] context_guard`). Not meant to be run
+    /// by hand — Claude Code pipes each event's JSON on stdin.
+    ContextGuard {
+        #[command(subcommand)]
+        cmd: ContextGuardCmd,
+    },
     /// Run a command, printing token-lean output (drops build/progress noise).
     Run {
         /// Print raw, unfiltered output (debugging).
@@ -373,6 +404,18 @@ enum ProjectCmd {
         #[arg(long)]
         sync: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum ContextGuardCmd {
+    /// UserPromptSubmit: nudge when the transcript crosses the threshold.
+    Prompt,
+    /// PreCompact: block an auto-compact over threshold with the guard message.
+    Precompact,
+    /// SessionStart: marker/nag bookkeeping, and (handoff mode) restore.
+    SessionStart,
+    /// PreToolUse (Bash/Edit/Write): surface a matching guard-anchored memory.
+    Pretool,
 }
 
 #[derive(Subcommand)]
@@ -544,9 +587,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             no_model,
             hooks,
             auto_recall,
-        } => commands::init(no_model, hooks || auto_recall, auto_recall),
+            context_guard,
+        } => commands::init(
+            no_model,
+            hooks || auto_recall || context_guard.is_some(),
+            auto_recall,
+            context_guard.as_deref(),
+        ),
         Command::Rewrite { cmd } => rewrite_cmd::rewrite(cmd),
-        Command::RecallInject { enrich, prompt } => commands::recall_inject(prompt.join(" "), enrich),
+        Command::RecallInject { enrich, session, prompt } => {
+            commands::recall_inject(prompt.join(" "), enrich, session)
+        }
         Command::Status => commands::status(cli.json),
         Command::Doctor => commands::doctor(),
         Command::Remember {
@@ -556,7 +607,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             global,
             force,
             link,
-        } => commands::remember(cli.json, text.join(" "), &mtype, tags, global, force, link),
+            fires_when,
+            anchors,
+        } => commands::remember(
+            cli.json,
+            text.join(" "),
+            &mtype,
+            tags,
+            global,
+            force,
+            link,
+            fires_when,
+            anchors,
+        ),
         Command::Recall {
             query,
             kind,
@@ -708,6 +771,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         },
         Command::Project { cmd } => match cmd {
             ProjectCmd::Init { sync } => project_cmd::init(sync),
+        },
+        Command::ContextGuard { cmd } => match cmd {
+            ContextGuardCmd::Prompt => context_guard_cmd::prompt(),
+            ContextGuardCmd::Precompact => context_guard_cmd::precompact(),
+            ContextGuardCmd::SessionStart => context_guard_cmd::session_start(),
+            ContextGuardCmd::Pretool => context_guard_cmd::pretool(),
         },
         Command::Run { raw, cmd } => run_cmd::run(raw, cmd),
     }

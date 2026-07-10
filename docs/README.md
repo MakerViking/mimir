@@ -37,7 +37,19 @@ relevance floor (term overlap, plus lexical+semantic agreement when the
 embedding model is loaded); below that floor it injects nothing on purpose —
 a wrong memory in context is worse than none. See the README's Token savings
 section for the full mechanics (warm `/inject` endpoint vs. cold CLI
-fallback, git-diff enrichment).
+fallback, git-diff enrichment). To override the floor for a specific fact,
+tag it with `mimir remember --fires-when "<phrase>"`: a close match on the
+phrase fires regardless of overlap/agreement. For file- or command-triggered
+recall instead of prompt-triggered, see guard anchors
+(`mimir remember --anchor "<pattern>"`) in the README's Context guard
+section.
+
+**How do I avoid running out of context mid-session?**
+`mimir init --hooks --context-guard pause` (or `handoff`) — off by default —
+nudges you to deliberately `/clear`/`/compact` once the transcript crosses a
+configurable percent of the context window, and in `handoff` mode also
+saves/restores a handoff memory across the clear so the new session isn't
+starting cold. See the README's Context guard section.
 
 **What languages are supported?**
 14 via tree-sitter, for both the code graph (`mimir graph build`) and code

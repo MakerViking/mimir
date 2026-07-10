@@ -91,6 +91,31 @@ pub struct HooksConfig {
     ///   is available locally) on the cold path too, same as before this
     ///   setting existed.
     pub cold_mode: String,
+    /// Context-window guard mode: `"off"` (default) | `"pause"` | `"handoff"`.
+    /// See `mimir_core::context_guard` for the estimation/messaging logic and
+    /// `mimir context-guard` (crates/mimir-cli) for the hook subcommands that
+    /// consume it. `"off"` installs no new hook entries and changes nothing.
+    /// `"pause"` nudges the user to deliberately `/clear`/`/compact` once the
+    /// transcript crosses `context_guard_threshold_pct`. `"handoff"`
+    /// instructs the agent to write a structured handoff memory via `mimir
+    /// remember` before the user clears, then auto-restores it on the next
+    /// `SessionStart`.
+    pub context_guard: String,
+    /// Percent of the estimated context window (see `context_window_tokens`)
+    /// at which the guard first fires. Default 45 — well before Claude
+    /// Code's own auto-compact, so there is time to act deliberately instead
+    /// of losing control of *when* a compact happens.
+    pub context_guard_threshold_pct: u8,
+    /// The model's context window, in tokens, used as the denominator for
+    /// the guard's percent estimate. Default 200_000 (Claude's standard
+    /// window); raise it for a 1M-context model.
+    pub context_window_tokens: u32,
+    /// Approximate bytes-per-token used to convert the transcript file's
+    /// byte size into an estimated token count — cheap (no real
+    /// tokenization of a potentially large transcript on every prompt) but
+    /// deliberately approximate. Default 8.0 is a rough transcript-JSONL
+    /// average; tune it if your own transcripts run leaner/richer than that.
+    pub transcript_bytes_per_token: f32,
 }
 
 impl Default for HooksConfig {
@@ -98,6 +123,10 @@ impl Default for HooksConfig {
         HooksConfig {
             inject_url: "http://127.0.0.1:8077/inject".into(),
             cold_mode: "fast".into(),
+            context_guard: "off".into(),
+            context_guard_threshold_pct: 45,
+            context_window_tokens: 200_000,
+            transcript_bytes_per_token: 8.0,
         }
     }
 }

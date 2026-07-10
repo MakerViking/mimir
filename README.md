@@ -222,6 +222,53 @@ mimir doctor                          # confirms "daemon: warm (...)"
 To keep the daemon across reboots, install the systemd user unit:
 `cp contrib/mimir-daemon.service ~/.config/systemd/user/ && systemctl --user enable --now mimir-daemon`.
 
+### Context guard
+
+Opt-in, off by default. `mimir init --hooks --context-guard pause` (or
+`handoff`) adds three more hook entries that estimate how full the
+context window is from the transcript file's **size** (no JSONL parsing,
+so it's cheap on every prompt) and act once the estimate crosses
+`context_guard_threshold_pct` (default 45%, of `context_window_tokens`,
+default 200,000):
+
+- **`pause`** nudges you, at most once per +10 percentage-point band, to
+  deliberately `/clear` or `/compact` instead of leaving it to Claude
+  Code's own auto-compact. If an *automatic* compact is attempted anyway
+  while still over threshold, `PreCompact` blocks it — your own
+  `/compact` is never blocked.
+- **`handoff`** does the same nudge, plus instructs the agent to save a
+  `session-handoff`-tagged memory before you clear. The next
+  `SessionStart` after a clear or compact restores the latest handoff
+  memory automatically, so the new session picks up where the old one
+  left off instead of starting cold.
+
+Tune the estimate in `config.toml`:
+
+```toml
+[hooks]
+context_guard = "pause"              # off (default) | pause | handoff
+context_guard_threshold_pct = 45
+context_window_tokens = 200000       # raise for a 1M-context model
+transcript_bytes_per_token = 8.0     # rough transcript-JSONL average
+```
+
+**Guard anchors** are a separate, independent opt-in — `mimir init --hooks`
+always installs the hook, but it stays dormant until a memory declares one:
+
+```bash
+mimir remember "This table needs a migration, not an ALTER" --anchor "schema.sql"
+```
+
+The pattern matches a path suffix, so it fires the moment a matching file
+is edited/written *or* a matching command runs (e.g. `psql -f schema.sql`)
+— surfaced via `PreToolUse`, before the tool call happens, no prompt
+needed. Up to 8 patterns per memory; `--anchor` is repeatable.
+
+Related: `mimir remember --fires-when "phrase"` (also repeatable) declares
+trigger phrase(s) that bypass auto-recall's inferred-relevance floor on a
+close match — for facts that are easy for BM25/vector search to under-rank
+but you always want recalled when that phrase comes up.
+
 ### Already have a memory system?
 
 Don't start from zero — migrate, verify, then retire the old one.

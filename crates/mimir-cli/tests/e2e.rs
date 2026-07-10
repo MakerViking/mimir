@@ -254,6 +254,123 @@ fn hooks_install_bakes_custom_inject_url_into_recall_script() {
 }
 
 #[test]
+fn context_guard_hooks_install_and_are_idempotent() {
+    // Same fake-$HOME trick as the recall-hook test above: install_hooks
+    // early-returns under MIMIR_HOME, so this exercises the real install
+    // path while staying fully sandboxed via $HOME.
+    let fake_home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(fake_home.path().join(".claude")).unwrap();
+
+    let run_init = || {
+        Command::new(env!("CARGO_BIN_EXE_mimir"))
+            .args(["init", "--no-model", "--hooks", "--context-guard", "pause"])
+            .env("HOME", fake_home.path())
+            .env("USERPROFILE", fake_home.path())
+            .env_remove("MIMIR_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .current_dir(cwd.path())
+            .output()
+            .expect("binary runs")
+    };
+
+    let out = run_init();
+    assert!(
+        out.status.success(),
+        "init failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let hooks_dir = fake_home.path().join(".claude/hooks");
+    for script in [
+        "mimir-anchors.sh",
+        "mimir-context-guard-prompt.sh",
+        "mimir-context-guard-precompact.sh",
+        "mimir-context-guard-session.sh",
+    ] {
+        assert!(hooks_dir.join(script).is_file(), "{script} must have been written");
+    }
+
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fake_home.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    let hooks = &settings["hooks"];
+    assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 2, "rewrite + anchors");
+    assert_eq!(hooks["UserPromptSubmit"].as_array().unwrap().len(), 1);
+    assert_eq!(hooks["PreCompact"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        hooks["SessionStart"].as_array().unwrap().len(),
+        2,
+        "rules pack + context guard"
+    );
+
+    // Re-running must not duplicate any entry.
+    let out2 = run_init();
+    assert!(out2.status.success());
+    let settings2: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fake_home.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    let hooks2 = &settings2["hooks"];
+    assert_eq!(hooks2["PreToolUse"].as_array().unwrap().len(), 2);
+    assert_eq!(hooks2["UserPromptSubmit"].as_array().unwrap().len(), 1);
+    assert_eq!(hooks2["PreCompact"].as_array().unwrap().len(), 1);
+    assert_eq!(hooks2["SessionStart"].as_array().unwrap().len(), 2);
+}
+
+#[test]
+fn context_guard_off_by_default_adds_no_new_hook_entries() {
+    // The default (`mimir init --hooks`, no --context-guard) must be
+    // byte-identical, for hooks purposes, to pre-context-guard behavior:
+    // no UserPromptSubmit/PreCompact entries, and no second SessionStart
+    // entry, and none of the three context-guard scripts get written —
+    // only the unconditional anchors script does.
+    let fake_home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(fake_home.path().join(".claude")).unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_mimir"))
+        .args(["init", "--no-model", "--hooks"])
+        .env("HOME", fake_home.path())
+        .env("USERPROFILE", fake_home.path())
+        .env_remove("MIMIR_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CACHE_HOME")
+        .current_dir(cwd.path())
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+
+    let hooks_dir = fake_home.path().join(".claude/hooks");
+    assert!(hooks_dir.join("mimir-anchors.sh").is_file());
+    for script in [
+        "mimir-context-guard-prompt.sh",
+        "mimir-context-guard-precompact.sh",
+        "mimir-context-guard-session.sh",
+    ] {
+        assert!(
+            !hooks_dir.join(script).exists(),
+            "{script} must not be written when context_guard is off"
+        );
+    }
+
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(fake_home.path().join(".claude/settings.json")).unwrap(),
+    )
+    .unwrap();
+    let hooks = &settings["hooks"];
+    assert_eq!(hooks["PreToolUse"].as_array().unwrap().len(), 2, "rewrite + anchors");
+    assert!(hooks.get("UserPromptSubmit").is_none());
+    assert!(hooks.get("PreCompact").is_none());
+    assert_eq!(hooks["SessionStart"].as_array().unwrap().len(), 1, "rules pack only");
+}
+
+#[test]
 fn concurrent_writers_and_readers_no_sqlite_busy() {
     // CLI + MCP running at once is the normal, supported case. Simulate:
     // one thread writes memories while another searches, both as real
