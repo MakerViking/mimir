@@ -25,7 +25,11 @@ pub fn serve(bind: &str) -> Result<()> {
 
     // Long-lived writing daemon: reclaim the WAL on an idle timer so its read
     // marks don't starve PASSIVE autocheckpoints (same profile as `mimir mcp`).
-    mimir_core::db::spawn_checkpoint_timer(mimir.paths.db_file.clone());
+    // Same timer also prunes old `recall_event` rows ([learn] event_retention_days).
+    mimir_core::db::spawn_checkpoint_timer(
+        mimir.paths.db_file.clone(),
+        mimir.config.learn.effective_retention_days(),
+    );
 
     for req in server.incoming_requests() {
         handle(&mut mimir, req, &token);

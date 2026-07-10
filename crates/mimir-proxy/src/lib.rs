@@ -44,6 +44,11 @@ pub struct ProxyConfig {
     pub dedup: bool,
     pub prune: bool,
     pub db_path: Option<PathBuf>,
+    /// `recall_event` retention window in days for the idle-timer prune
+    /// below (`config::LearnConfig::effective_retention_days`); `None`
+    /// disables it. Unrelated to `prune` above (that's lossy tool-result
+    /// trimming in the request-optimization pass, not ledger retention).
+    pub event_retention_days: Option<u32>,
 }
 
 struct AppState {
@@ -76,7 +81,17 @@ pub async fn serve(cfg: ProxyConfig) -> Result<()> {
     // reuses the shared savings connection (autocommit between requests, so no
     // read mark blocks it), and runs the blocking checkpoint on spawn_blocking
     // so a large TRUNCATE never stalls a runtime worker.
+    //
+    // Same connection also prunes old `recall_event` rows on the same idle
+    // cadence, once at startup and then every tick — see `db::
+    // spawn_checkpoint_timer`'s doc comment in mimir-core for why this rides
+    // along with the checkpoint instead of its own timer.
     if let Some(db) = db.clone() {
+        let event_retention_days = cfg.event_retention_days;
+        if let Some(days) = event_retention_days {
+            let db = db.clone();
+            let _ = tokio::task::spawn_blocking(move || prune_events_once(&db, days)).await;
+        }
         tokio::spawn(async move {
             let period = std::time::Duration::from_secs(120);
             let mut tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
@@ -88,6 +103,9 @@ pub async fn serve(cfg: ProxyConfig) -> Result<()> {
                         if let Err(e) = mimir_core::db::checkpoint_truncate(&conn) {
                             tracing::warn!("proxy: wal checkpoint failed ({e})");
                         }
+                    }
+                    if let Some(days) = event_retention_days {
+                        prune_events_once(&db, days);
                     }
                 })
                 .await;
@@ -106,6 +124,21 @@ pub async fn serve(cfg: ProxyConfig) -> Result<()> {
     }
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// One `recall_event` prune pass against the proxy's shared connection, on
+/// the same idle cadence as the WAL checkpoint above. Best-effort and
+/// non-fatal, mirroring `mimir_core::db::spawn_checkpoint_timer`'s variant
+/// for the sync daemons — this one just locks the shared `Db` first since
+/// the proxy can't give the prune its own dedicated connection.
+fn prune_events_once(db: &Db, days: u32) {
+    let cutoff = mimir_core::model::now_unix() - i64::from(days) * 86_400;
+    let Ok(conn) = db.lock() else { return };
+    match mimir_core::store::prune_old_events(&conn, cutoff) {
+        Ok(n) if n > 0 => tracing::info!("proxy: pruned {n} old recall_event rows"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("proxy: recall_event prune failed ({e})"),
+    }
 }
 
 async fn handle(State(state): State<Arc<AppState>>, req: axum::extract::Request) -> Response {
@@ -315,7 +348,8 @@ fn field_u64(s: &str, key: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::field_u64;
+    use super::{field_u64, prune_events_once, Db};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn parses_usage_field() {
@@ -324,5 +358,46 @@ data: {"type":"message_start","message":{"usage":{"input_tokens":12,"cache_creat
         assert_eq!(field_u64(sse, "\"cache_read_input_tokens\""), Some(2048));
         assert_eq!(field_u64(sse, "\"input_tokens\""), Some(12));
         assert_eq!(field_u64(sse, "\"missing\""), None);
+    }
+
+    /// The proxy can't give the prune its own dedicated connection (unlike
+    /// `mimir_core::db::spawn_checkpoint_timer`'s variant) — it locks the
+    /// same `Arc<Mutex<Connection>>` every request handler shares. This
+    /// covers that locking wrapper directly, since `prune_old_events`
+    /// itself is already covered in `mimir-core`.
+    #[test]
+    fn prune_events_once_removes_only_rows_past_the_window() {
+        let conn = mimir_core::db::open_in_memory().unwrap();
+        let node_id = conn
+            .execute(
+                "INSERT INTO node (uid, kind, body, created_at, updated_at) \
+                 VALUES ('n1', 'memory', 'x', 0, 0)",
+                [],
+            )
+            .map(|_| conn.last_insert_rowid())
+            .unwrap();
+        let now = mimir_core::model::now_unix();
+        let old_at = now - 200 * 86_400;
+        let recent_at = now - 10 * 86_400;
+        conn.execute(
+            "INSERT INTO recall_event (node_id, event, at) VALUES (?1, 'shown', ?2)",
+            rusqlite::params![node_id, old_at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recall_event (node_id, event, at) VALUES (?1, 'shown', ?2)",
+            rusqlite::params![node_id, recent_at],
+        )
+        .unwrap();
+
+        let db: Db = Arc::new(Mutex::new(conn));
+        prune_events_once(&db, 180);
+
+        let remaining: i64 = db
+            .lock()
+            .unwrap()
+            .query_row("SELECT count(*) FROM recall_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "only the 200-day-old row clears the 180-day cutoff");
     }
 }

@@ -57,6 +57,12 @@ enum Command {
     /// clears the relevance floor (used by the UserPromptSubmit hook —
     /// see `mimir init --auto-recall`). Always exits 0.
     RecallInject {
+        /// Working-tree enrichment signal (changed-file stems), passed
+        /// separately from `prompt` — see `mimir_core::inject::compute`.
+        /// Must be given before `prompt` (or after `--`): `prompt` is a
+        /// trailing var-arg and would otherwise swallow it.
+        #[arg(long)]
+        enrich: Option<String>,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         prompt: Vec<String>,
     },
@@ -276,6 +282,13 @@ enum Command {
         #[arg(long, requires = "http")]
         http_allow_remote: bool,
     },
+    /// Run the warm daemon: a thin alias for `mimir mcp --http <addr>`
+    /// where <addr> comes from `[hooks] inject_url` (host:port only, scheme
+    /// and /inject path stripped) — the same config key the auto-recall
+    /// hook already reads, so one setting drives both sides. Does nothing
+    /// beyond that: no auto-spawn, no process supervision — see
+    /// contrib/mimir-daemon.service to run it as a systemd unit.
+    Daemon,
     /// Run the optional local API proxy (prompt-cache optimization; see docs/proxy.md).
     Proxy {
         /// Address to bind (default from [proxy] config, 127.0.0.1:8788).
@@ -533,7 +546,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             auto_recall,
         } => commands::init(no_model, hooks || auto_recall, auto_recall),
         Command::Rewrite { cmd } => rewrite_cmd::rewrite(cmd),
-        Command::RecallInject { prompt } => commands::recall_inject(prompt.join(" ")),
+        Command::RecallInject { enrich, prompt } => commands::recall_inject(prompt.join(" "), enrich),
         Command::Status => commands::status(cli.json),
         Command::Doctor => commands::doctor(),
         Command::Remember {
@@ -653,6 +666,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             http,
             http_allow_remote,
         } => mcp::run(http, http_allow_remote),
+        Command::Daemon => commands::daemon(),
         Command::Proxy {
             bind,
             dry_run,

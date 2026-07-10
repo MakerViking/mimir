@@ -164,6 +164,15 @@ CREATE INDEX savings_source ON savings_event(source);
 CREATE INDEX node_project_pkey
   ON node(json_extract(meta, '$.portable_key')) WHERE kind = 'project';
 "#,
+    // v7: `recall_event` retention (`learn.event_retention_days`) prunes by
+    // `at` alone (no `node_id` in the WHERE clause), which the existing
+    // `recall_node(node_id, at)` index can't serve — it full-scans without
+    // this. Runs on an idle background timer, but the table is unbounded
+    // (every recall/inject logs impressions), so an unindexed scan only
+    // gets more expensive over the life of the store.
+    r#"
+CREATE INDEX recall_event_at ON recall_event(at);
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

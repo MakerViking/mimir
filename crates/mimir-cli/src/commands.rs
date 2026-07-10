@@ -96,28 +96,55 @@ jq -n --argjson updated "$UPDATED" '{
 /// different bind without touching config.toml. If no daemon answers there,
 /// curl fails fast (2s timeout) and behavior is identical to before this
 /// endpoint existed — just slower.
+///
+/// Also extracts a cheap enrichment signal from the caller's working tree:
+/// the stems (basename, extension stripped) of up to 8 files changed since
+/// HEAD, via `git diff --name-only`. Passed as `enrich=` on the warm URL and
+/// `--enrich` on the cold CLI path — never mixed into `prompt` itself.
+/// `inject::compute`/`clears_floor` treat it as strictly weaker than the raw
+/// prompt: it can extend a real overlap but can never single-handedly clear
+/// the relevance floor (see `inject.rs`'s self-licensing guard doc comment).
+/// Silent if `git` isn't on PATH or the cwd isn't a repo — enrichment is a
+/// nice-to-have, not a requirement.
 const MIMIR_RECALL_SH: &str = r#"#!/usr/bin/env bash
-# mimir-hook-version: 2
+# mimir-hook-version: 3
 # Mimir UserPromptSubmit hook — prints at most one relevant memory (or
 # nothing) as extra context for this turn. Tries the warm HTTP endpoint
 # (fast; requires `mimir mcp --http` to be running) first, falls back to
 # the cold CLI path (slower, always available). All relevance-floor logic
 # lives in mimir_core::inject::compute, shared by both. Requires: mimir, jq;
-# curl is optional (falls straight to cold path without it).
+# curl and git are optional (git enrichment and the warm path are both
+# skipped gracefully when unavailable).
 command -v jq >/dev/null 2>&1 || exit 0
 command -v mimir >/dev/null 2>&1 || exit 0
 INPUT=$(cat)
 PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // empty')
 [ -z "$PROMPT" ] && exit 0
 INJECT_URL="${MIMIR_INJECT_URL:-__MIMIR_INJECT_URL_DEFAULT__}"
+PROJECT_DIR=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
+[ -z "$PROJECT_DIR" ] && PROJECT_DIR="$PWD"
+ENRICH=""
+if command -v git >/dev/null 2>&1; then
+    ENRICH=$(git -C "$PROJECT_DIR" diff --name-only HEAD 2>/dev/null | head -8 \
+        | sed -E 's#.*/##; s#\.[^./]+$##' | tr '\n' ' ' | sed -E 's/^ +| +$//g')
+fi
 if command -v curl >/dev/null 2>&1; then
     ENC_PROMPT=$(printf '%s' "$PROMPT" | jq -sRr @uri)
-    if WARM=$(curl -sf --max-time 2 "${INJECT_URL}?prompt=${ENC_PROMPT}" 2>/dev/null); then
+    URL="${INJECT_URL}?prompt=${ENC_PROMPT}"
+    if [ -n "$ENRICH" ]; then
+        ENC_ENRICH=$(printf '%s' "$ENRICH" | jq -sRr @uri)
+        URL="${URL}&enrich=${ENC_ENRICH}"
+    fi
+    if WARM=$(curl -sf --max-time 2 "$URL" 2>/dev/null); then
         [ -n "$WARM" ] && printf '%s\n' "$WARM"
         exit 0
     fi
 fi
-mimir recall-inject "$PROMPT" 2>/dev/null
+if [ -n "$ENRICH" ]; then
+    mimir recall-inject --enrich "$ENRICH" -- "$PROMPT" 2>/dev/null
+else
+    mimir recall-inject -- "$PROMPT" 2>/dev/null
+fi
 exit 0
 "#;
 
@@ -663,6 +690,32 @@ pub fn doctor() -> Result<()> {
         &mut failures,
     );
 
+    // Informational only (ok=true regardless): whether `mimir daemon` /
+    // `mimir mcp --http` is actually up. Absence is a normal, supported
+    // state — the hooks fall back to the cold `mimir recall-inject` path —
+    // so this must never fail `doctor`'s exit code, same precedent as the
+    // "model" check above.
+    let inject_url = Config::load(&paths.config_file)
+        .map(|c| c.hooks.inject_url)
+        .unwrap_or_else(|_| mimir_core::config::HooksConfig::default().inject_url);
+    let warm = ureq::get(&inject_url)
+        .timeout(std::time::Duration::from_secs(1))
+        .call()
+        .is_ok();
+    check(
+        "daemon",
+        true,
+        if warm {
+            format!("warm ({inject_url} reachable — hooks use the fast HTTP path)")
+        } else {
+            format!(
+                "cold ({inject_url} not reachable — hooks fall back to `mimir recall-inject`; \
+                 run `mimir daemon` for the warm path)"
+            )
+        },
+        &mut failures,
+    );
+
     if failures > 0 {
         anyhow::bail!("{failures} check(s) failed");
     }
@@ -825,15 +878,79 @@ pub fn recall(
 /// first (see `mcp.rs::inject_router`, only live while `mimir mcp --http`
 /// is running) and only falls back to this command when that's
 /// unreachable. All relevance-floor/formatting/budget logic lives in
-/// `mimir_core::inject::compute` — single-sourced so the warm and cold
-/// paths can never disagree.
-pub fn recall_inject(prompt: String) -> Result<()> {
+/// `mimir_core::inject::compute`/`compute_with_mode` — single-sourced so the
+/// warm and cold paths can never disagree on *how* a hit is judged, only on
+/// whether a vector leg is available to judge it with.
+///
+/// Config `[hooks] cold_mode` governs whether this cold path pays the
+/// embedder's load cost:
+///   - `"fast"` (default): BM25-only, via `compute_with_mode(.., bm25_only
+///     = true)` — never calls `ensure_embedder`, so no ONNX load and no
+///     matrix build. This is the mode actually measured for hook latency
+///     (see CHANGELOG); an unrecognized value logs a warning and falls back
+///     to `"full"`, the safe default, same precedent as `[rerank] auto`.
+///   - `"full"`: restores the pre-`cold_mode` behavior — hybrid search with
+///     the embedder loaded cold, same as the warm endpoint.
+///
+/// Only this cold CLI path reads `cold_mode`; the warm `/inject` endpoint
+/// always uses the best available signal via the unchanged `compute`.
+///
+/// `enrich`: optional working-tree signal (changed-file stems from
+/// `MIMIR_RECALL_SH`'s `git diff`), passed straight through to
+/// `inject::compute_with_mode` — see that function's doc comment for how
+/// it's used.
+pub fn recall_inject(prompt: String, enrich: Option<String>) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let scope = read_scope(&mimir, false, false)?;
-    if let Some(text) = mimir_core::inject::compute(&mut mimir, &prompt, scope)? {
+    let enrich = enrich.unwrap_or_default();
+    let bm25_only = match mimir.config.hooks.cold_mode.as_str() {
+        "fast" => true,
+        "full" => false,
+        other => {
+            tracing::warn!(cold_mode = other, "unknown [hooks] cold_mode value; treating as full");
+            false
+        }
+    };
+    if let Some(text) =
+        mimir_core::inject::compute_with_mode(&mut mimir, &prompt, &enrich, scope, bm25_only)?
+    {
         println!("{text}");
     }
     Ok(())
+}
+
+/// `mimir daemon` — a thin, discoverable alias for `mimir mcp --http <addr>`.
+/// The bind address is derived from `config.hooks.inject_url` (the exact
+/// same key `MIMIR_RECALL_SH` already reads — see `render_recall_script`),
+/// so there is one setting for "where does the warm path live" instead of
+/// two independent ones that could drift apart. No auto-spawn, no process
+/// supervision: this is purely a memorable name for a command the hooks
+/// already know how to fall back from — see `contrib/mimir-daemon.service`
+/// for running it unattended.
+pub fn daemon() -> Result<()> {
+    let mimir = Mimir::open()?;
+    let addr = inject_addr(&mimir.config.hooks.inject_url)?;
+    println!(
+        "mimir daemon: warm path at http://{addr}/inject — the auto-recall hook will use \
+         this instead of the cold `mimir recall-inject` fallback"
+    );
+    crate::mcp::run(Some(addr), false)
+}
+
+/// Strip `config.hooks.inject_url` (e.g. `"http://127.0.0.1:8077/inject"`)
+/// down to the bare `host:port` that `mimir mcp --http` binds to. Split out
+/// as a pure function so the parsing is unit-testable without a real config
+/// file — mirrors `render_recall_script`'s split for the same reason.
+fn inject_addr(inject_url: &str) -> Result<String> {
+    let without_scheme = inject_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(inject_url);
+    let host_port = without_scheme.split('/').next().unwrap_or("");
+    if host_port.is_empty() {
+        bail!("config.hooks.inject_url `{inject_url}` has no host:port to bind to");
+    }
+    Ok(host_port.to_string())
 }
 
 pub fn get(json: bool, refs: Vec<String>) -> Result<()> {
@@ -1576,3 +1693,30 @@ mod hooks_tests {
     }
 }
 
+#[cfg(test)]
+mod inject_addr_tests {
+    use super::inject_addr;
+
+    #[test]
+    fn strips_scheme_and_inject_path() {
+        assert_eq!(
+            inject_addr("http://127.0.0.1:8077/inject").unwrap(),
+            "127.0.0.1:8077"
+        );
+        assert_eq!(
+            inject_addr("https://10.0.0.5:9999/inject").unwrap(),
+            "10.0.0.5:9999"
+        );
+    }
+
+    #[test]
+    fn tolerates_a_bare_host_port_with_no_scheme_or_path() {
+        assert_eq!(inject_addr("127.0.0.1:8077").unwrap(), "127.0.0.1:8077");
+    }
+
+    #[test]
+    fn empty_url_is_an_error_not_a_panic() {
+        assert!(inject_addr("").is_err());
+        assert!(inject_addr("http://").is_err());
+    }
+}
