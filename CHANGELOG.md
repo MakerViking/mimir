@@ -22,19 +22,49 @@ the `mimir-mem` crate, and the on-disk schema move together.
   changed rows in place (~258 ms → ~6 ms on a 97k-node store); the fused
   `get_node` fan-out is also batched into one query. Result ordering is
   unchanged (parity-tested).
+- **`mimir code add <dir>` was a silent no-op on a path already registered
+  for docs.** Collections are now keyed by (path, kind), not path alone, so
+  a code collection and a docs collection can coexist at the same root — the
+  common case for `auto.docs` roots. Also: non-source, non-markdown files in
+  either a docs or a code collection (`Cargo.toml`, `Dockerfile`,
+  `.env.example`, a workflow `.yml`, ...) are now indexed too, as
+  plain-text/config chunks (`Kind::Chunk`, so `code_damp` doesn't suppress
+  them) — whitelisted by extension/name, lockfiles and real `.env` files
+  excluded outright, size-capped. `collection_stats` and `mimir docs list`
+  now count these alongside tree-sitter chunks instead of undercounting;
+  the dashboard's embeddable-kind coverage query draws from the same
+  `EMBEDDABLE_KINDS` list `embed_pending` uses instead of a second,
+  hand-copied one; and `CodeChunk` search-result breadcrumbs now carry the
+  file's relative path instead of just its stem, so same-named files in
+  different directories (`mod.rs`, `index.ts`, ...) no longer produce
+  identical, ambiguous crumbs. Plain-text/config chunk crumbs also switched
+  from stem to full file name — `.env.example`'s title was displaying as
+  `.env` (Rust's `file_stem` strips the extension *after* a leading dot,
+  not the leading dot itself), which read as if a real, blacklisted `.env`
+  had been indexed.
 
 ### Added
 - **Opt-in per-prompt auto-recall: `mimir init --hooks --auto-recall`**
   installs a UserPromptSubmit hook that injects at most one relevant memory
   into each prompt's context — the counterpart to the existing static
   SessionStart rules pack. Off by default; `--hooks` alone is unchanged.
-  Errs toward silence: only gotcha/decision memories qualify, and a hit
-  must clear a documented relevance floor (minimum prompt/memory term
-  overlap, plus lexical+semantic leg agreement when the embedding model is
-  loaded) before it's ever shown — a wrong injected memory is worse than
-  none. Compact single-line format, capped at ~200 tokens. THOR has this;
-  Mimir didn't — closing the gap. New CLI plumbing: `mimir recall-inject
-  <prompt>` (not exposed on the MCP tool surface).
+  Errs toward silence: only gotcha/decision memories (or pinned ones)
+  qualify, and a hit must clear a documented relevance floor (minimum
+  prompt/memory term overlap against title+body+tags, plus
+  lexical+semantic leg agreement when the embedding model is loaded)
+  before it's ever shown — a wrong injected memory is worse than none.
+  Compact single-line format, capped at ~200 tokens. THOR has this; Mimir
+  didn't — closing the gap. New CLI plumbing: `mimir recall-inject
+  <prompt>` (not exposed on the MCP tool surface). The hook tries a warm
+  `GET /inject` endpoint on `mimir mcp --http` first (one process-wide
+  engine, ~30ms once loaded vs ~285ms for a fresh CLI process on the same
+  store) and falls back to the cold CLI path when no daemon answers —
+  correctness is identical either way; only latency differs. The warm
+  endpoint's address is now a real config key, `[hooks] inject_url`
+  (default `http://127.0.0.1:8077/inject`, matching the port already
+  documented for `mimir mcp --http`), baked into the generated hook script
+  at install time; `MIMIR_INJECT_URL` still overrides it at invocation
+  time as the highest-precedence escape hatch.
 - **Code content in recall: `mimir code add <dir>`** indexes source files
   chunked on tree-sitter symbol boundaries — function/method *bodies* (not
   just signatures) are now searchable, as `Kind::CodeChunk` nodes alongside
@@ -45,6 +75,16 @@ the `mimir-mem` crate, and the on-disk schema move together.
   THOR fork of Mimir — thanks!
 
 ### Internal
+- New `mimir_core::inject` module: the auto-recall relevance floor,
+  formatting, and token budget, single-sourced between the cold CLI path
+  (`mimir recall-inject`) and the warm HTTP endpoint (`mcp.rs`'s
+  `/inject`), so the two can never disagree on what counts as relevant.
+  Token-budget truncation switched from exact BPE counting
+  (`mimir_core::tokens::count`) to a chars/4 heuristic on this hot path —
+  it runs on every prompt, and the ~100ms one-time tokenizer-table-parse
+  cost wasn't worth paying for a 200-token budget that doesn't need BPE
+  precision; `tokens::count` is unchanged everywhere precision matters
+  (the savings ledger).
 - `search_hybrid` gains a sibling `search_hybrid_with_legs` (and
   `Mimir::search_with_legs`) that also returns the raw per-leg ranked id
   lists before RRF fusion — needed by auto-recall's relevance floor, kept
