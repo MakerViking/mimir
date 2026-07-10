@@ -156,13 +156,18 @@ fn load_granite(paths: &Paths, device: &str, allow_download: bool) -> Result<Tex
     let model = UserDefinedEmbeddingModel::new(read(&onnx_path)?, tokenizer_files)
         // external-data ONNX: the graph file references its weights buffer
         // by this basename (onnx-community's export layout).
-        .with_external_initializer(GRANITE_ONNX_DATA_BASENAME.to_string(), read(&onnx_data_path)?);
+        .with_external_initializer(
+            GRANITE_ONNX_DATA_BASENAME.to_string(),
+            read(&onnx_data_path)?,
+        );
     // Pooling: left at fastembed's default (Cls). Granite's own
     // 1_Pooling/config.json specifies pooling_mode_cls_token, NOT
     // config.json's unrelated classifier_pooling field — verified against
     // IBM's original sentence-transformers repo before trusting it.
-    let options = InitOptionsUserDefined::new().with_execution_providers(execution_providers(device));
-    TextEmbedding::try_new_from_user_defined(model, options).map_err(|e| Error::Embed(e.to_string()))
+    let options =
+        InitOptionsUserDefined::new().with_execution_providers(execution_providers(device));
+    TextEmbedding::try_new_from_user_defined(model, options)
+        .map_err(|e| Error::Embed(e.to_string()))
 }
 
 /// Marker written after the first successful model load; its presence is
@@ -562,7 +567,10 @@ mod tests {
             .embed(vec!["what does retry_with_backoff do".to_string()])
             .unwrap();
         let norm: f32 = out[0].iter().map(|x| x * x).sum::<f32>().sqrt();
-        assert!((norm - 1.0).abs() < 1e-4, "Embedder::embed must L2-normalize");
+        assert!(
+            (norm - 1.0).abs() < 1e-4,
+            "Embedder::embed must L2-normalize"
+        );
 
         // Marker present now — a silent (non-downloading) reload must succeed
         // purely from the hf-hub cache, same contract as the registry path.
@@ -584,9 +592,8 @@ mod tests {
         let paths = crate::config::Paths::under_root(tmp.path());
 
         let t0 = std::time::Instant::now();
-        let mut reranker =
-            Reranker::load(&paths, "jina-reranker-v1-turbo-en-int8", "cpu", true)
-                .expect("int8 jina-turbo should load via the hf-hub download plumbing");
+        let mut reranker = Reranker::load(&paths, "jina-reranker-v1-turbo-en-int8", "cpu", true)
+            .expect("int8 jina-turbo should load via the hf-hub download plumbing");
         eprintln!("cold load: {:?}", t0.elapsed());
         assert!(model_ready(&paths, "jina-reranker-v1-turbo-en-int8"));
 
@@ -612,5 +619,3 @@ mod tests {
         eprintln!("warm cache reload: {:?}", t1.elapsed());
     }
 }
-
-

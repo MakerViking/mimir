@@ -690,7 +690,10 @@ protocol Runnable {
             .iter()
             .map(|i| (i.local.as_str(), i.source.as_str()))
             .collect();
-        assert!(imports.contains(&("Foundation", "Foundation")), "{imports:?}");
+        assert!(
+            imports.contains(&("Foundation", "Foundation")),
+            "{imports:?}"
+        );
     }
 
     #[test]

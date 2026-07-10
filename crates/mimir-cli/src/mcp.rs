@@ -80,6 +80,13 @@ pub struct RememberArgs {
     /// Link at capture time so the memory and the code surface together.
     #[serde(default)]
     pub link: Option<String>,
+    /// Optional "fires when ..." trigger phrases (short topic markers, e.g.
+    /// "release checklist"): a later prompt that matches one of these
+    /// still auto-injects this memory even if it doesn't share enough
+    /// words to clear the normal relevance floor. Max 8 phrases, 6 words
+    /// each; oversized phrases are dropped, not truncated.
+    #[serde(default)]
+    pub fires_when: Vec<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -266,7 +273,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Store a typed memory (gotcha/decision/insight/idea/note/person). Search first with recall; near-duplicates are refused with the existing entry. When the fact is about specific code, pass `link` with the symbol or file so memory and code surface together."
+        description = "Store a typed memory (gotcha/decision/insight/idea/note/person). Search first with recall; near-duplicates are refused with the existing entry. When the fact is about specific code, pass `link` with the symbol or file so memory and code surface together. Pass `fires_when` to declare trigger phrases that force auto-injection on a matching future prompt even without normal keyword overlap."
     )]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         let project_id = self.project_id;
@@ -301,6 +308,13 @@ impl MimirServer {
                 RememberOutcome::Created(node) => {
                     if let Err(err) = m.embed_pending() {
                         tracing::warn!(%err, "embedding new memory failed");
+                    }
+                    if !args.fires_when.is_empty() {
+                        let phrases = memory::sanitize_fires_when(args.fires_when);
+                        if !phrases.is_empty() {
+                            store::set_fires_when(&m.conn, node.id, &phrases)
+                                .map_err(engine_err)?;
+                        }
                     }
                     let mut msg = format!("stored {}", line(&node));
                     if let Some(target) = args.link.as_deref() {
@@ -1018,19 +1032,35 @@ struct InjectState {
 /// answer" rule the floor itself already follows.
 ///
 /// `enrich` is optional working-tree signal (see `MIMIR_RECALL_SH` in
-/// `commands.rs`) — passed straight through to `inject::compute`, which
-/// never lets it single-handedly clear the relevance floor.
+/// `commands.rs`) — passed straight through to `inject::compute_with_session`,
+/// which never lets it single-handedly clear the relevance floor.
+///
+/// `session` is an optional per-session id (the hook script's own session
+/// identifier — see `commands.rs`'s UserPromptSubmit wiring). When present,
+/// a memory already injected earlier in that session is skipped in favor of
+/// the next floor-clearing candidate (or silence) instead of repeating —
+/// see `inject::compute_with_session`'s doc comment for the ledger and its
+/// fail-open behavior. Omitted or empty: behaves exactly as before, no
+/// ledger check.
 async fn inject_handler(
     axum::extract::State(state): axum::extract::State<InjectState>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> String {
     let prompt = params.get("prompt").cloned().unwrap_or_default();
     let enrich = params.get("enrich").cloned().unwrap_or_default();
+    let session = params.get("session").filter(|s| !s.is_empty()).cloned();
     let scope = state.project_id.map(Scope::Project).unwrap_or(Scope::All);
     let engine = state.engine.clone();
     tokio::task::spawn_blocking(move || {
         let mut engine = engine.lock().unwrap_or_else(|p| p.into_inner());
-        match mimir_core::inject::compute(&mut engine, &prompt, &enrich, scope) {
+        match mimir_core::inject::compute_with_session(
+            &mut engine,
+            &prompt,
+            &enrich,
+            scope,
+            false,
+            session.as_deref(),
+        ) {
             Ok(text) => text.unwrap_or_default(),
             Err(err) => {
                 tracing::warn!(%err, "inject: compute failed");
@@ -1150,6 +1180,7 @@ mod tests {
             tags: vec!["auth".into()],
             global: true,
             link: None,
+            fires_when: Vec::new(),
         }
     }
 

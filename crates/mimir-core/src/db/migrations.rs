@@ -173,6 +173,31 @@ CREATE INDEX node_project_pkey
     r#"
 CREATE INDEX recall_event_at ON recall_event(at);
 "#,
+    // v8: per-session agent state, two tables. `injection_log` backs the
+    // auto-recall injection ledger (the same memory must not be re-injected
+    // on every prompt of one session); `session_state` is a small KV used by
+    // the context guard (e.g. the transcript byte-offset marker recorded at
+    // SessionStart so post-compact size estimates subtract pre-compact
+    // content). Both are ephemeral working state, not knowledge: rows expire
+    // on the same idle-cadence prune as `recall_event` (anything older than
+    // 7 days is dead — sessions don't live that long).
+    r#"
+CREATE TABLE injection_log (
+    session_id TEXT NOT NULL,
+    node_id    INTEGER NOT NULL,
+    at         INTEGER NOT NULL,
+    PRIMARY KEY (session_id, node_id)
+);
+CREATE INDEX injection_log_at ON injection_log(at);
+CREATE TABLE session_state (
+    session_id TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (session_id, key)
+);
+CREATE INDEX session_state_at ON session_state(updated_at);
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

@@ -192,13 +192,12 @@ pub fn search_hybrid_with_legs_scored(
             // is the *max* of that (0,1] range, so applying it unconditionally
             // would hand every non-decaying kind a permanent boost relative to
             // every aging memory instead of leaving them recency-neutral.
-            let recency_term = if crate::learn::half_life_days(node.kind, node.subkind.as_deref())
-                .is_some()
-            {
-                1.0 + query.recency_alpha * crate::learn::recency_factor(&node, now)
-            } else {
-                1.0
-            };
+            let recency_term =
+                if crate::learn::half_life_days(node.kind, node.subkind.as_deref()).is_some() {
+                    1.0 + query.recency_alpha * crate::learn::recency_factor(&node, now)
+                } else {
+                    1.0
+                };
             // Optional type-priority boost (config scoring.type_prior_alpha):
             // gotcha/decision nudged over an equally-matching note/idea.
             let prior = crate::learn::type_prior(node.subkind.as_deref());
@@ -253,7 +252,6 @@ pub fn search_hybrid_with_legs_scored(
     );
     Ok((hits, legs))
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -489,8 +487,20 @@ mod tests {
 
         // Same query, no impression history at all seeded on a fresh store.
         let clean_conn = db::open_in_memory().unwrap();
-        add(&clean_conn, Kind::Memory, None, "notes", "zebra pattern alpha");
-        add(&clean_conn, Kind::Memory, None, "notes", "zebra pattern beta");
+        add(
+            &clean_conn,
+            Kind::Memory,
+            None,
+            "notes",
+            "zebra pattern alpha",
+        );
+        add(
+            &clean_conn,
+            Kind::Memory,
+            None,
+            "notes",
+            "zebra pattern beta",
+        );
         let without_impressions =
             search_hybrid(&clean_conn, &q("zebra pattern"), None, &mut None).unwrap();
         let scores_b: Vec<f64> = without_impressions.iter().map(|h| h.score).collect();
@@ -512,8 +522,7 @@ mod tests {
         let shown: Vec<(i64, i64, f64)> = (0..20).map(|rank| (noisy.id, rank, 1.0)).collect();
         store::record_shown(&conn, b"q", &shown).unwrap();
 
-        let hits =
-            search_hybrid_scored(&conn, &q("zebra pattern"), None, &mut None, 0.4).unwrap();
+        let hits = search_hybrid_scored(&conn, &q("zebra pattern"), None, &mut None, 0.4).unwrap();
         assert_eq!(hits.len(), 2);
         assert_eq!(
             hits[0].node.id, quiet.id,

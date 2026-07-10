@@ -267,8 +267,7 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
     // walking its (often huge) object store would cost real time for zero
     // payoff (blob filenames have no extension, so plain_text_kind rejects
     // them all anyway).
-    walk.hidden(false)
-        .filter_entry(|e| e.file_name() != ".git");
+    walk.hidden(false).filter_entry(|e| e.file_name() != ".git");
     for entry in walk.build() {
         let entry = match entry {
             Ok(e) => e,
@@ -700,7 +699,10 @@ mod tests {
         let stats = index_collection(&mut conn, &coll).unwrap();
 
         // Cargo.lock and .env are excluded outright — never even "seen".
-        assert_eq!(stats.seen, 3, "expected src/lib.rs, Cargo.toml, .env.example only");
+        assert_eq!(
+            stats.seen, 3,
+            "expected src/lib.rs, Cargo.toml, .env.example only"
+        );
 
         let kind_of = |path: &str| -> Option<String> {
             conn.query_row(
@@ -773,7 +775,10 @@ mod tests {
         let mut conn = db::open_in_memory().unwrap();
         let coll = add_collection(&conn, dir.path(), "demo", None, "docs").unwrap();
         let stats = index_collection(&mut conn, &coll).unwrap();
-        assert_eq!(stats.seen, 3, "expected README.md, config.yml, Dockerfile only");
+        assert_eq!(
+            stats.seen, 3,
+            "expected README.md, config.yml, Dockerfile only"
+        );
 
         let hits = search::search(
             &conn,

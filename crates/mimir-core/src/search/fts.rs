@@ -112,7 +112,11 @@ fn ranked_ids(conn: &Connection, query: &SearchQuery, expr: &str, cap: usize) ->
 /// no identifier-shaped word.
 fn identifier_match_expr(text: &str) -> String {
     text.split_whitespace()
-        .map(|w| w.trim_matches(|c: char| !(c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ':')))
+        .map(|w| {
+            w.trim_matches(|c: char| {
+                !(c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == ':')
+            })
+        })
         .filter(|w| is_identifier_shaped(w))
         .filter_map(|w| {
             let toks = tokens(w);

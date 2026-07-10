@@ -323,7 +323,10 @@ pub fn chunk_source(lang: Lang, doc_title: &str, source: &str) -> Vec<DocChunk> 
             .next()
             .unwrap_or(&sym.signature)
             .trim();
-        let crumb = format!("{doc_title} › {} ({}) — {sig_line}", sym.qualified, sym.kind);
+        let crumb = format!(
+            "{doc_title} › {} ({}) — {sig_line}",
+            sym.qualified, sym.kind
+        );
         for (run_start, run_end) in uncovered_runs(&covered, start, end) {
             let paras = line_paras(&lines, run_start, run_end);
             if !paras.is_empty() {
@@ -743,7 +746,15 @@ class Widget {
 
     #[test]
     fn plain_text_kind_whitelist() {
-        for name in ["Cargo.toml", "config.yaml", "config.yml", "data.json", "run.sh", "run.bash", "settings.ini"] {
+        for name in [
+            "Cargo.toml",
+            "config.yaml",
+            "config.yml",
+            "data.json",
+            "run.sh",
+            "run.bash",
+            "settings.ini",
+        ] {
             assert_eq!(
                 plain_text_kind(Path::new(name), 100),
                 Some(PlainTextKind::Config),
@@ -787,7 +798,11 @@ class Widget {
             "pnpm-lock.yaml",
             "go.sum",
         ] {
-            assert_eq!(plain_text_kind(Path::new(name), 100), None, "{name} should be excluded");
+            assert_eq!(
+                plain_text_kind(Path::new(name), 100),
+                None,
+                "{name} should be excluded"
+            );
         }
     }
 

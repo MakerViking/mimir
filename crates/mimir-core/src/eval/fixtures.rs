@@ -1083,7 +1083,48 @@ const FIXTURES: &[Fixture] = &[
         topic: "filler_20",
         age_days: None,
     },
+    // ---- Fires-when: a gotcha whose title/body deliberately share only one
+    // lexical token ("confetti") with the paraphrased question below — see
+    // FIRES_WHEN and INJECT_QUESTIONS' fires-when pair. One shared token is
+    // required, not zero: RRF fusion (search/mod.rs) sums a rank-based
+    // score across every leg a node appears in, so a node absent from the
+    // FTS leg entirely (zero shared tokens) loses to nodes that share even
+    // one *generic* word (e.g. "need") with the query and so appear in
+    // both legs — no vector-leg rank, however strong, recovers from being
+    // single-leg. One *rare* shared token (unique to this fixture in the
+    // whole corpus) is enough to also win the FTS leg outright, while
+    // staying below MIN_OVERLAP=2 so the normal floor's rule 2 still
+    // blocks it without the trigger. A release/checklist themed fixture
+    // was tried first and got crowded out of the fused top-5 by the
+    // *already-existing* `mem_decision_release_new` fixture, which
+    // legitimately shares that vocabulary — the fires-when candidate never
+    // even reached `select_injection` to be checked. This topic and its
+    // "confetti" anchor word have no other fixture anywhere in the corpus.
+    Fixture {
+        key: "mem_gotcha_confetti_deploy_trigger",
+        kind: Kind::Memory,
+        subkind: Some("gotcha"),
+        title: "The confetti animation fired during the wrong build last quarter",
+        body: "An internal-only visual effect played in front of a client because \
+               nobody disabled it first. Switch it off before anything external happens.",
+        path: None,
+        lang: None,
+        topic: "confetti_deploy_trigger",
+        age_days: None,
+    },
 ];
+
+/// Author-declared `meta.fires_when` trigger phrases for specific fixtures
+/// (mirrors `CODE_SPANS`'s per-key override pattern) — kept out of the
+/// shared `Fixture` struct so the other fixtures don't all need an empty
+/// `fires_when: &[]` field.
+const FIRES_WHEN: &[(&str, &[&str])] = &[(
+    "mem_gotcha_confetti_deploy_trigger",
+    &[
+        "confetti toggle before demo",
+        "disable easter egg for customers",
+    ],
+)];
 
 pub type FixtureIds = HashMap<&'static str, i64>;
 
@@ -1113,6 +1154,10 @@ pub fn insert_fixture_nodes(conn: &Connection) -> Result<FixtureIds> {
             new.span_end = Some(end);
         }
         let node = store::insert_node(conn, new)?;
+        if let Some(&(_, phrases)) = FIRES_WHEN.iter().find(|(key, _)| *key == f.key) {
+            let owned: Vec<String> = phrases.iter().map(|s| s.to_string()).collect();
+            store::set_fires_when(conn, node.id, &owned)?;
+        }
         if let Some(days) = f.age_days {
             // NewNode/insert_node always stamps now_unix(); backdate via a
             // direct UPDATE for the recency scenario instead of adding a
@@ -1496,11 +1541,16 @@ const INJECT_QUESTIONS: &[InjectQuestion] = &[
         query: "anything I should watch out for before I start working in this repo",
         enrich: &[],
         expects_injection: true,
-        acceptable: &["mem_drift_no_verify", "mem_drift_matrix_cache", "mem_drift_force_push"],
+        acceptable: &[
+            "mem_drift_no_verify",
+            "mem_drift_matrix_cache",
+            "mem_drift_force_push",
+        ],
         topic: "force_push_gotcha",
     },
     InjectQuestion {
-        query: "what should I know about past mistakes in the search or storage code before I touch it",
+        query:
+            "what should I know about past mistakes in the search or storage code before I touch it",
         enrich: &[],
         expects_injection: true,
         acceptable: &["mem_drift_matrix_cache"],
@@ -1578,6 +1628,32 @@ const INJECT_QUESTIONS: &[InjectQuestion] = &[
         expects_injection: false,
         acceptable: &[],
         topic: "editor_support",
+    },
+    // ---- Fires-when: an author-declared trigger on `mem_gotcha_confetti_
+    // deploy_trigger` (see FIRES_WHEN in fixtures above). Its title/body
+    // share exactly one lexical token ("confetti") with the question below
+    // — enough to survive RRF fusion via the FTS leg (see the fixture's
+    // comment), but still below MIN_OVERLAP=2, so rule 2 (and, for this
+    // fixture's node type, rule 1 already passes since it's a gotcha)
+    // would leave this silent without the trigger. Positive: the prompt
+    // matches "confetti toggle before demo" (order-free); the trigger
+    // bypass must convert this from silent-wrong to injected-correct.
+    // Negative: same fixture, a prompt that matches neither declared
+    // trigger phrase nor the normal floor must still stay silent — a
+    // fires_when list is not a blanket license to inject on any prompt.
+    InjectQuestion {
+        query: "before we demo this to a customer, is there a confetti toggle I need to flip?",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_gotcha_confetti_deploy_trigger"],
+        topic: "confetti_deploy_trigger",
+    },
+    InjectQuestion {
+        query: "anything unusual about how the sqlite fts tokenizer handles unicode?",
+        enrich: &[],
+        expects_injection: false,
+        acceptable: &[],
+        topic: "fts_tokenizer_unicode",
     },
 ];
 
