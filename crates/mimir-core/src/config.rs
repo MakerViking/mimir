@@ -54,6 +54,111 @@ pub struct Config {
     pub sync: SyncConfig,
     pub proxy: ProxyConfig,
     pub savings: SavingsConfig,
+    pub hooks: HooksConfig,
+    pub learn: LearnConfig,
+}
+
+/// Settings for the opt-in Claude Code hooks (`mimir init --hooks`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    /// Base URL for the warm `/inject` endpoint the auto-recall
+    /// (`--auto-recall`) UserPromptSubmit hook tries first, falling back to
+    /// the cold `mimir recall-inject` CLI path when unreachable — only live
+    /// while `mimir mcp --http` is running (see `mcp.rs::inject_router`).
+    /// Baked into the generated hook script at install/re-init time; the
+    /// `MIMIR_INJECT_URL` environment variable (read at hook-invocation
+    /// time, not install time) still overrides it as the highest-precedence
+    /// escape hatch — e.g. a per-machine bind without editing config.toml.
+    /// Default matches the port documented in README.md's remote-MCP
+    /// example (`127.0.0.1:8077`).
+    pub inject_url: String,
+    /// Governs ONLY the cold `mimir recall-inject` CLI fallback (no warm
+    /// daemon reachable) — never the warm `/inject` HTTP endpoint, and
+    /// never a normal `mimir recall`, both of which always do full hybrid
+    /// search regardless of this setting.
+    /// - `"fast"` (default): skip the embedder entirely — BM25 +
+    ///   identifier legs only. Measured cold (release build, bge-small-en
+    ///   already cached locally, 3-memory store): ~5-6ms end to end, vs
+    ///   ~230-240ms for `"full"` on the identical prompt/store — about 40x,
+    ///   not just "faster". The cost: it never fires on a purely-semantic
+    ///   match (no shared lexical/identifier token with the prompt) while
+    ///   cold. `inject::clears_floor` already degrades cleanly with no
+    ///   vector leg (same path a model-less machine takes today), so this
+    ///   doesn't weaken the silence-beats-wrong-injection contract — it
+    ///   just narrows which real matches clear the floor cold.
+    /// - `"full"`: restores hybrid search (embeds the query when a model
+    ///   is available locally) on the cold path too, same as before this
+    ///   setting existed.
+    pub cold_mode: String,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        HooksConfig {
+            inject_url: "http://127.0.0.1:8077/inject".into(),
+            cold_mode: "fast".into(),
+        }
+    }
+}
+
+/// The lowest `event_retention_days` allowed to take effect as configured
+/// (see [`LearnConfig::effective_retention_days`]) — below this, a shorter
+/// window would start truncating the very history `impression_damp` (30-day
+/// decay half-life) needs to compute against.
+const MIN_SAFE_RETENTION_DAYS: u32 = 60;
+
+/// Settings for the implicit-feedback ledger (`recall_event`: shown/opened,
+/// logged by every recall/inject — see `store::record_shown`,
+/// `learn::record_opened`, `scoring.impression_alpha`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LearnConfig {
+    /// Days of `recall_event` history to keep before a background prune
+    /// deletes older rows (see `db::spawn_checkpoint_timer`, which runs the
+    /// prune on the same idle cadence as the WAL checkpoint, plus once at
+    /// daemon startup). `0` disables pruning — keep forever.
+    ///
+    /// Default 180: `impression_damp`'s decay half-life is 30 days, so 180
+    /// keeps 6 half-lives of signal, comfortably more than the decay ever
+    /// weights meaningfully. See [`effective_retention_days`] for the safety
+    /// floor on configuring this too low.
+    ///
+    /// [`effective_retention_days`]: LearnConfig::effective_retention_days
+    pub event_retention_days: u32,
+}
+
+impl Default for LearnConfig {
+    fn default() -> Self {
+        LearnConfig {
+            event_retention_days: 180,
+        }
+    }
+}
+
+impl LearnConfig {
+    /// The retention window a prune should actually use: `None` means never
+    /// prune (explicit `0`); otherwise the configured value, clamped up to
+    /// [`MIN_SAFE_RETENTION_DAYS`] with a `tracing::warn!` if it was
+    /// configured lower — a too-short window would silently truncate the
+    /// history `impression_damp` needs, degrading a ranking signal without
+    /// any visible symptom. `0` is exempt from the floor: it's an explicit
+    /// "never prune" opt-out, not an accidentally-tiny window.
+    pub fn effective_retention_days(&self) -> Option<u32> {
+        match self.event_retention_days {
+            0 => None,
+            n if n < MIN_SAFE_RETENTION_DAYS => {
+                tracing::warn!(
+                    configured_days = n,
+                    clamped_to = MIN_SAFE_RETENTION_DAYS,
+                    "learn.event_retention_days is below the safe floor for \
+                     impression_damp's 30-day decay half-life; clamping"
+                );
+                Some(MIN_SAFE_RETENTION_DAYS)
+            }
+            n => Some(n),
+        }
+    }
 }
 
 /// Pricing for the token-savings analytics (`mimir savings`, dashboard).
@@ -196,6 +301,31 @@ pub struct RerankConfig {
     pub model: String,
     /// How many fused candidates the reranker scores.
     pub candidates: usize,
+    /// When a caller doesn't explicitly ask for reranking, should
+    /// `Mimir::search_with` default it on anyway? An explicit `rerank: true`
+    /// argument always reranks (cold-loading the model if needed) in every
+    /// mode — this only controls the default.
+    /// - `"off"` (default): automatic reranking never fires; only an
+    ///   explicit request reranks. Off by default because the cost is
+    ///   measured and the benefit is not: the cross-encoder runs ~84 ms per
+    ///   candidate on realistic code chunks (~1.3 s per warm recall at the
+    ///   default 15 candidates), while the retrieval eval does not yet
+    ///   exercise reranking. Revisit once rerank is wired into the eval
+    ///   harness and shows a measured win.
+    /// - `"warm"`: rerank only if the model is *already resident* in this
+    ///   process — checked, never loaded, so a one-shot CLI call never eats
+    ///   a cold ONNX load just because this is on. Long-lived processes
+    ///   (the MCP server) eager-load at startup to make this fire from
+    ///   their first query — see `mcp.rs`'s startup wiring. Choose this if
+    ///   you run a daemon and accept the latency for possible precision.
+    /// - `"always"`: also loads the model on demand if it isn't resident
+    ///   yet (same cost as an explicit `--rerank`, just automatic).
+    ///
+    /// Either way it's still gated per-query (see
+    /// `Mimir::should_auto_rerank`): a tiny store or a single-token/
+    /// identifier-shaped query skips it, since a cross-encoder only adds
+    /// cost (and can reshuffle a correct exact match) there.
+    pub auto: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,10 +333,69 @@ pub struct RerankConfig {
 pub struct ScoringConfig {
     /// Multiplier weight for learned strength in final ranking.
     pub strength_alpha: f64,
-    /// Opt-in recency boost (default 0.0 = off). When > 0, fresher memories get
-    /// a small multiplicative nudge, capped so it never buries a stronger match.
-    /// Time-sensitive types (decision/note) feel it most via their half-lives.
+    /// Recency boost weight; 0.0 = off. Fresher memories get a small
+    /// multiplicative nudge, capped so it never buries a stronger match.
+    /// Applied only to kinds/subkinds with a defined half-life (decision,
+    /// gotcha, insight, note, idea memories — see `learn::half_life_days`);
+    /// non-decaying kinds (docs, code, person/summary memories) get NO
+    /// recency term at all, so they stay recency-neutral relative to aging
+    /// memories instead of enjoying a permanent boost. Default 0.012: at
+    /// this gated formula, a *fresh* decaying-kind memory gets up to a full
+    /// `1+alpha` multiplier while every non-decaying kind sits flat at 1.0 —
+    /// a real, uncancelled edge (unlike the pre-gating bug, where both got
+    /// the same flat boost, so freshness never had to compete against
+    /// symbols/docs/code). 0.4 was tuned against that ungated formula and no
+    /// longer holds once gating is correct: on real embeddings, where
+    /// score gaps are already tight, anything above ~0.015 lets a fresh,
+    /// off-topic memory outrank a symbol/doc/code hit that's the actual
+    /// answer (0.02 alone regressed real-model `core` MRR to 0.94; 0.4
+    /// regressed hermetic `core` to 0.73). 0.012 is eval-tuned to be the
+    /// largest weight that clears `core` at 1.0 on *both* hermetic and
+    /// real-model modes, while still deciding a stale-vs-current Memory
+    /// pair (e.g. a superseded-in-practice decision nobody marked
+    /// superseded) and letting a still-relevant aged gotcha hold its rank
+    /// against fresher, topically-adjacent doc/code noise.
     pub recency_alpha: f64,
+    /// Type-priority weight; 0.0 = off. Nudges gotcha/decision memories —
+    /// drift-preventers and policy calls — ahead of an equally-matching but
+    /// non-critical note/idea/insight. The per-subkind prior is fixed (see
+    /// `learn::type_prior`); this only scales how strongly it counts.
+    /// Default 0.12: eval-tuned against real embeddings, not synthetic ones —
+    /// the same weight that's safe on hermetic (clustered, well-separated)
+    /// vectors already reorders real, fuzzier score gaps hard enough to bury
+    /// a correct code-structure answer under a topically-adjacent decoy at
+    /// 0.15+. 0.12 sits just under that observed cliff.
+    pub type_prior_alpha: f64,
+    /// Sub-1.0 multiplier applied to `Kind::CodeChunk` hits at the fused
+    /// score. Code content dwarfs memories on a real project (~99% of
+    /// nodes vs ~1%), so undamped it drowns out memories in the default
+    /// `all` search pool even when a memory is the better answer. Default
+    /// 0.85: the `eval::hermetic`/`eval::real_model` fixture corpus has no
+    /// `CodeChunk` cases (yet), so this isn't eval-swept — it's verified by
+    /// a real end-to-end smoke test (index this repo's own `crates/`, query
+    /// a term shared by a memory and a code chunk) where 0.85 flips a tied
+    /// ranking to favor the memory, while `code_damp = 1.0` does not. Both
+    /// eval modes confirm this addition doesn't regress the existing
+    /// (non-code) `core` scenario set.
+    pub code_damp: f64,
+    /// Weight for the shown-but-never-opened negative prior (`learn::
+    /// impression_damp`): a node repeatedly surfaced (`store::record_shown`,
+    /// logged by every recall/inject) without ever being opened
+    /// (`learn::record_opened`) gets a mild multiplicative damp, decaying
+    /// back toward 1.0 as the impressions age so it isn't punished forever.
+    /// An opened node is exempt outright, and a node needs a minimum
+    /// impression count before this applies at all — see
+    /// `learn::impression_damp` for the exact thresholds/floor.
+    ///
+    /// Default **0.0 (off)**: this is a real ranking-signal change, and the
+    /// `eval::hermetic`/`eval::real_model` fixture corpora have no
+    /// impression history to score it against — shipping it on by default
+    /// would be an unmeasured change to production ranking, which is
+    /// exactly how the `recency_alpha` regression (see that field's doc
+    /// comment) happened. Opt in once you have real recall_event history to
+    /// judge it against; a future eval fixture with seeded impressions
+    /// should gate raising this default.
+    pub impression_alpha: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +422,7 @@ impl Default for RerankConfig {
             // --rerank around a second while still covering the realistic
             // winners. Raise for deeper reshuffles.
             candidates: 15,
+            auto: "off".into(),
         }
     }
 }
@@ -241,7 +431,10 @@ impl Default for ScoringConfig {
     fn default() -> Self {
         ScoringConfig {
             strength_alpha: 0.15,
-            recency_alpha: 0.0,
+            recency_alpha: 0.012,
+            type_prior_alpha: 0.12,
+            code_damp: 0.85,
+            impression_alpha: 0.0,
         }
     }
 }
@@ -273,5 +466,42 @@ impl Config {
         let text = toml::to_string_pretty(self)
             .map_err(|e| Error::Config(format!("serialize config: {e}")))?;
         std::fs::write(path, text).map_err(|e| Error::io(path, e))
+    }
+}
+
+#[cfg(test)]
+mod learn_config_tests {
+    use super::LearnConfig;
+
+    #[test]
+    fn zero_means_never_prune() {
+        let cfg = LearnConfig {
+            event_retention_days: 0,
+        };
+        assert_eq!(cfg.effective_retention_days(), None);
+    }
+
+    #[test]
+    fn default_180_passes_through_unclamped() {
+        assert_eq!(
+            LearnConfig::default().effective_retention_days(),
+            Some(180)
+        );
+    }
+
+    #[test]
+    fn below_floor_is_clamped_up_to_the_floor() {
+        let cfg = LearnConfig {
+            event_retention_days: 7,
+        };
+        assert_eq!(cfg.effective_retention_days(), Some(60));
+    }
+
+    #[test]
+    fn exactly_at_the_floor_is_not_clamped_further() {
+        let cfg = LearnConfig {
+            event_retention_days: 60,
+        };
+        assert_eq!(cfg.effective_retention_days(), Some(60));
     }
 }

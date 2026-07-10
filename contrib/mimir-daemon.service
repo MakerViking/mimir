@@ -1,0 +1,12 @@
+[Unit]
+Description=Mimir warm memory daemon (mimir daemon)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/mimir daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

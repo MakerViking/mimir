@@ -8,7 +8,7 @@ use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope}
 use mimir_core::search::SearchQuery;
 use mimir_core::{db, store, Mimir};
 
-pub fn init(no_model: bool, hooks: bool) -> Result<()> {
+pub fn init(no_model: bool, hooks: bool, auto_recall: bool) -> Result<()> {
     let paths = Paths::resolve()?;
     let config = Config::load(&paths.config_file)?;
     config.save(&paths.config_file)?;
@@ -35,7 +35,7 @@ pub fn init(no_model: bool, hooks: bool) -> Result<()> {
     }
     install_agent_commands(&config);
     if hooks {
-        if let Err(err) = install_hooks() {
+        if let Err(err) = install_hooks(&config, auto_recall) {
             eprintln!("hooks   install failed: {err}");
         }
     }
@@ -46,6 +46,10 @@ pub fn init(no_model: bool, hooks: bool) -> Result<()> {
         println!();
         println!("Token-saving hooks (filter command output + inject project rules) are opt-in:");
         println!("  mimir init --hooks");
+    } else if !auto_recall {
+        println!();
+        println!("Per-prompt auto-recall (inject a relevant memory into every prompt) is opt-in:");
+        println!("  mimir init --hooks --auto-recall");
     }
     Ok(())
 }
@@ -74,10 +78,93 @@ jq -n --argjson updated "$UPDATED" '{
 }'
 "#;
 
+/// The opt-in UserPromptSubmit hook script: tries the warm `/inject` HTTP
+/// endpoint first (only live while `mimir mcp --http` is running — see
+/// `mcp.rs::inject_router`), falling back to the cold `mimir recall-inject`
+/// CLI path when that's unreachable. Both paths run the exact same
+/// relevance-floor/formatting/budget logic (`mimir_core::inject::compute`),
+/// so which one answers is purely a latency concern, never a behavior one.
+/// Unlike `MIMIR_REWRITE_SH`, plain stdout (not a `hookSpecificOutput` JSON
+/// envelope) is how Claude Code injects UserPromptSubmit context — same
+/// mechanism as the SessionStart rules hook.
+///
+/// The warm endpoint's address is `config.hooks.inject_url`
+/// (`HooksConfig::inject_url`, default `127.0.0.1:8077`, matching the port
+/// documented in README.md's remote-MCP example) — baked into the script at
+/// install time by `render_recall_script`. `MIMIR_INJECT_URL` still
+/// overrides it at hook-invocation time, for a one-off run against a
+/// different bind without touching config.toml. If no daemon answers there,
+/// curl fails fast (2s timeout) and behavior is identical to before this
+/// endpoint existed — just slower.
+///
+/// Also extracts a cheap enrichment signal from the caller's working tree:
+/// the stems (basename, extension stripped) of up to 8 files changed since
+/// HEAD, via `git diff --name-only`. Passed as `enrich=` on the warm URL and
+/// `--enrich` on the cold CLI path — never mixed into `prompt` itself.
+/// `inject::compute`/`clears_floor` treat it as strictly weaker than the raw
+/// prompt: it can extend a real overlap but can never single-handedly clear
+/// the relevance floor (see `inject.rs`'s self-licensing guard doc comment).
+/// Silent if `git` isn't on PATH or the cwd isn't a repo — enrichment is a
+/// nice-to-have, not a requirement.
+const MIMIR_RECALL_SH: &str = r#"#!/usr/bin/env bash
+# mimir-hook-version: 3
+# Mimir UserPromptSubmit hook — prints at most one relevant memory (or
+# nothing) as extra context for this turn. Tries the warm HTTP endpoint
+# (fast; requires `mimir mcp --http` to be running) first, falls back to
+# the cold CLI path (slower, always available). All relevance-floor logic
+# lives in mimir_core::inject::compute, shared by both. Requires: mimir, jq;
+# curl and git are optional (git enrichment and the warm path are both
+# skipped gracefully when unavailable).
+command -v jq >/dev/null 2>&1 || exit 0
+command -v mimir >/dev/null 2>&1 || exit 0
+INPUT=$(cat)
+PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // empty')
+[ -z "$PROMPT" ] && exit 0
+INJECT_URL="${MIMIR_INJECT_URL:-__MIMIR_INJECT_URL_DEFAULT__}"
+PROJECT_DIR=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
+[ -z "$PROJECT_DIR" ] && PROJECT_DIR="$PWD"
+ENRICH=""
+if command -v git >/dev/null 2>&1; then
+    ENRICH=$(git -C "$PROJECT_DIR" diff --name-only HEAD 2>/dev/null | head -8 \
+        | sed -E 's#.*/##; s#\.[^./]+$##' | tr '\n' ' ' | sed -E 's/^ +| +$//g')
+fi
+if command -v curl >/dev/null 2>&1; then
+    ENC_PROMPT=$(printf '%s' "$PROMPT" | jq -sRr @uri)
+    URL="${INJECT_URL}?prompt=${ENC_PROMPT}"
+    if [ -n "$ENRICH" ]; then
+        ENC_ENRICH=$(printf '%s' "$ENRICH" | jq -sRr @uri)
+        URL="${URL}&enrich=${ENC_ENRICH}"
+    fi
+    if WARM=$(curl -sf --max-time 2 "$URL" 2>/dev/null); then
+        [ -n "$WARM" ] && printf '%s\n' "$WARM"
+        exit 0
+    fi
+fi
+if [ -n "$ENRICH" ]; then
+    mimir recall-inject --enrich "$ENRICH" -- "$PROMPT" 2>/dev/null
+else
+    mimir recall-inject -- "$PROMPT" 2>/dev/null
+fi
+exit 0
+"#;
+
+/// Bakes `config.hooks.inject_url` into `MIMIR_RECALL_SH`'s fallback default,
+/// split out as a pure function so it's unit-testable without touching disk.
+fn render_recall_script(inject_url: &str) -> String {
+    MIMIR_RECALL_SH.replace("__MIMIR_INJECT_URL_DEFAULT__", inject_url)
+}
+
 /// Install the opt-in Claude Code hooks: a PreToolUse(Bash) rewrite hook and a
-/// SessionStart hook that injects the project rules pack. Idempotent, backs up
-/// settings.json, and never clobbers existing hooks.
-fn install_hooks() -> Result<()> {
+/// SessionStart hook that injects the project rules pack, plus (when
+/// `auto_recall`) a UserPromptSubmit hook that injects at most one relevant
+/// memory per prompt. Idempotent, backs up settings.json, and never clobbers
+/// existing hooks. `auto_recall=false` leaves `hooks.UserPromptSubmit`
+/// untouched — behavior is otherwise identical to before this flag existed
+/// (see `merge_hook_settings`'s unit tests). Re-running after editing
+/// `config.hooks.inject_url` rewrites `mimir-recall.sh` unconditionally
+/// (step 2 below is a plain `fs::write`, no existence check), so the new
+/// URL always lands on the next `mimir init --hooks --auto-recall`.
+fn install_hooks(config: &Config, auto_recall: bool) -> Result<()> {
     if std::env::var_os("MIMIR_HOME").is_some() {
         return Ok(()); // isolated instances never touch the user's agent config
     }
@@ -88,9 +175,10 @@ fn install_hooks() -> Result<()> {
         return Ok(());
     }
 
-    // 1. Write the PreToolUse delegate script (executable).
     let hooks_dir = claude.join("hooks");
     std::fs::create_dir_all(&hooks_dir)?;
+
+    // 1. Write the PreToolUse delegate script (executable).
     let script = hooks_dir.join("mimir-rewrite.sh");
     std::fs::write(&script, MIMIR_REWRITE_SH)?;
     #[cfg(unix)]
@@ -100,9 +188,28 @@ fn install_hooks() -> Result<()> {
     }
     let script_str = script.to_string_lossy().into_owned();
 
-    // 2. Merge into settings.json (back it up first).
+    // 2. Auto-recall delegate script — only written when opted in. Always
+    // rewritten (not skipped if already present), so changing
+    // config.hooks.inject_url and re-running takes effect immediately.
+    let recall_script_str = if auto_recall {
+        let recall_script = hooks_dir.join("mimir-recall.sh");
+        std::fs::write(
+            &recall_script,
+            render_recall_script(&config.hooks.inject_url),
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&recall_script, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Some(recall_script.to_string_lossy().into_owned())
+    } else {
+        None
+    };
+
+    // 3. Merge into settings.json (back it up first).
     let settings_path = claude.join("settings.json");
-    let mut root: serde_json::Value = match std::fs::read_to_string(&settings_path) {
+    let root: serde_json::Value = match std::fs::read_to_string(&settings_path) {
         Ok(text) => {
             std::fs::write(claude.join("settings.json.mimir-bak"), &text)?;
             serde_json::from_str(&text).context("settings.json is not valid JSON")?
@@ -110,6 +217,28 @@ fn install_hooks() -> Result<()> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::json!({}),
         Err(e) => return Err(e.into()),
     };
+    let (root, messages) = merge_hook_settings(root, &script_str, recall_script_str.as_deref())?;
+
+    std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
+    println!("hooks   {}", messages.join("; "));
+    println!(
+        "hooks   backup at {}",
+        claude.join("settings.json.mimir-bak").display()
+    );
+    Ok(())
+}
+
+/// Pure settings.json merge, split out of `install_hooks` so the merge
+/// logic (idempotency, which keys get touched) is unit-testable without a
+/// real `~/.claude` — `install_hooks` early-returns under `MIMIR_HOME`, so
+/// this is the only way to test it at all. `recall_script = None` must
+/// leave `hooks.UserPromptSubmit` completely untouched: that's what makes
+/// `auto_recall=false` byte-identical to pre-auto-recall behavior.
+fn merge_hook_settings(
+    mut root: serde_json::Value,
+    rewrite_script: &str,
+    recall_script: Option<&str>,
+) -> Result<(serde_json::Value, Vec<String>)> {
     if !root.is_object() {
         bail!("settings.json is not a JSON object");
     }
@@ -159,19 +288,32 @@ fn install_hooks() -> Result<()> {
     } else {
         pre_arr.push(serde_json::json!({
             "matcher": "Bash",
-            "hooks": [{ "type": "command", "command": script_str }]
+            "hooks": [{ "type": "command", "command": rewrite_script }]
         }));
         messages.push("PreToolUse (command filter) added".into());
     }
 
-    std::fs::write(&settings_path, serde_json::to_string_pretty(&root)?)?;
-    println!("hooks   {}", messages.join("; "));
-    println!(
-        "hooks   backup at {}",
-        claude.join("settings.json.mimir-bak").display()
-    );
-    Ok(())
+    // UserPromptSubmit: opt-in auto-recall. Only touched when asked for.
+    if let Some(recall_script) = recall_script {
+        let prompt = hooks
+            .entry("UserPromptSubmit")
+            .or_insert_with(|| serde_json::json!([]));
+        let prompt_arr = prompt
+            .as_array_mut()
+            .context("hooks.UserPromptSubmit is not an array")?;
+        if entries_mention(prompt_arr, "mimir-recall") {
+            messages.push("UserPromptSubmit already installed".into());
+        } else {
+            prompt_arr.push(serde_json::json!({
+                "hooks": [{ "type": "command", "command": recall_script }]
+            }));
+            messages.push("UserPromptSubmit (auto-recall) added".into());
+        }
+    }
+
+    Ok((root, messages))
 }
+
 
 /// True if any hook entry (or its nested hooks) has a command containing `needle`.
 fn entries_mention(entries: &[serde_json::Value], needle: &str) -> bool {
@@ -548,6 +690,32 @@ pub fn doctor() -> Result<()> {
         &mut failures,
     );
 
+    // Informational only (ok=true regardless): whether `mimir daemon` /
+    // `mimir mcp --http` is actually up. Absence is a normal, supported
+    // state — the hooks fall back to the cold `mimir recall-inject` path —
+    // so this must never fail `doctor`'s exit code, same precedent as the
+    // "model" check above.
+    let inject_url = Config::load(&paths.config_file)
+        .map(|c| c.hooks.inject_url)
+        .unwrap_or_else(|_| mimir_core::config::HooksConfig::default().inject_url);
+    let warm = ureq::get(&inject_url)
+        .timeout(std::time::Duration::from_secs(1))
+        .call()
+        .is_ok();
+    check(
+        "daemon",
+        true,
+        if warm {
+            format!("warm ({inject_url} reachable — hooks use the fast HTTP path)")
+        } else {
+            format!(
+                "cold ({inject_url} not reachable — hooks fall back to `mimir recall-inject`; \
+                 run `mimir daemon` for the warm path)"
+            )
+        },
+        &mut failures,
+    );
+
     if failures > 0 {
         anyhow::bail!("{failures} check(s) failed");
     }
@@ -633,6 +801,8 @@ pub fn recall(
         limit: limit.unwrap_or(mimir.config.output.default_limit),
         strength_alpha: mimir.config.scoring.strength_alpha,
         recency_alpha: mimir.config.scoring.recency_alpha,
+        type_prior_alpha: mimir.config.scoring.type_prior_alpha,
+        code_damp: mimir.config.scoring.code_damp,
         include_superseded,
         text,
     };
@@ -699,6 +869,88 @@ pub fn recall(
         }
     }
     Ok(())
+}
+
+/// Print at most one relevant memory for `prompt`, or nothing if none
+/// clears the relevance floor. This is the COLD fallback path: it opens a
+/// fresh `Mimir` (ONNX load + full matrix rebuild) every invocation, so the
+/// hook script (`MIMIR_RECALL_SH`) tries the warm `/inject` HTTP endpoint
+/// first (see `mcp.rs::inject_router`, only live while `mimir mcp --http`
+/// is running) and only falls back to this command when that's
+/// unreachable. All relevance-floor/formatting/budget logic lives in
+/// `mimir_core::inject::compute`/`compute_with_mode` — single-sourced so the
+/// warm and cold paths can never disagree on *how* a hit is judged, only on
+/// whether a vector leg is available to judge it with.
+///
+/// Config `[hooks] cold_mode` governs whether this cold path pays the
+/// embedder's load cost:
+///   - `"fast"` (default): BM25-only, via `compute_with_mode(.., bm25_only
+///     = true)` — never calls `ensure_embedder`, so no ONNX load and no
+///     matrix build. This is the mode actually measured for hook latency
+///     (see CHANGELOG); an unrecognized value logs a warning and falls back
+///     to `"full"`, the safe default, same precedent as `[rerank] auto`.
+///   - `"full"`: restores the pre-`cold_mode` behavior — hybrid search with
+///     the embedder loaded cold, same as the warm endpoint.
+///
+/// Only this cold CLI path reads `cold_mode`; the warm `/inject` endpoint
+/// always uses the best available signal via the unchanged `compute`.
+///
+/// `enrich`: optional working-tree signal (changed-file stems from
+/// `MIMIR_RECALL_SH`'s `git diff`), passed straight through to
+/// `inject::compute_with_mode` — see that function's doc comment for how
+/// it's used.
+pub fn recall_inject(prompt: String, enrich: Option<String>) -> Result<()> {
+    let mut mimir = Mimir::open()?;
+    let scope = read_scope(&mimir, false, false)?;
+    let enrich = enrich.unwrap_or_default();
+    let bm25_only = match mimir.config.hooks.cold_mode.as_str() {
+        "fast" => true,
+        "full" => false,
+        other => {
+            tracing::warn!(cold_mode = other, "unknown [hooks] cold_mode value; treating as full");
+            false
+        }
+    };
+    if let Some(text) =
+        mimir_core::inject::compute_with_mode(&mut mimir, &prompt, &enrich, scope, bm25_only)?
+    {
+        println!("{text}");
+    }
+    Ok(())
+}
+
+/// `mimir daemon` — a thin, discoverable alias for `mimir mcp --http <addr>`.
+/// The bind address is derived from `config.hooks.inject_url` (the exact
+/// same key `MIMIR_RECALL_SH` already reads — see `render_recall_script`),
+/// so there is one setting for "where does the warm path live" instead of
+/// two independent ones that could drift apart. No auto-spawn, no process
+/// supervision: this is purely a memorable name for a command the hooks
+/// already know how to fall back from — see `contrib/mimir-daemon.service`
+/// for running it unattended.
+pub fn daemon() -> Result<()> {
+    let mimir = Mimir::open()?;
+    let addr = inject_addr(&mimir.config.hooks.inject_url)?;
+    println!(
+        "mimir daemon: warm path at http://{addr}/inject — the auto-recall hook will use \
+         this instead of the cold `mimir recall-inject` fallback"
+    );
+    crate::mcp::run(Some(addr), false)
+}
+
+/// Strip `config.hooks.inject_url` (e.g. `"http://127.0.0.1:8077/inject"`)
+/// down to the bare `host:port` that `mimir mcp --http` binds to. Split out
+/// as a pure function so the parsing is unit-testable without a real config
+/// file — mirrors `render_recall_script`'s split for the same reason.
+fn inject_addr(inject_url: &str) -> Result<String> {
+    let without_scheme = inject_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(inject_url);
+    let host_port = without_scheme.split('/').next().unwrap_or("");
+    if host_port.is_empty() {
+        bail!("config.hooks.inject_url `{inject_url}` has no host:port to bind to");
+    }
+    Ok(host_port.to_string())
 }
 
 pub fn get(json: bool, refs: Vec<String>) -> Result<()> {
@@ -1013,6 +1265,18 @@ fn mentions_symbol(text: &str, name: &str) -> bool {
 // ---------- docs & index ----------
 
 pub fn docs_add(path: &str, name: Option<String>, global: bool) -> Result<()> {
+    add_collection_cmd(path, name, global, "docs")
+}
+
+/// Register + index a source-code collection: chunks function/method bodies
+/// (not just signatures) on tree-sitter symbol boundaries for recall —
+/// mirrors `docs add`, indexing source instead of markdown. Idea credit:
+/// nworks3d's THOR fork of Mimir (see CHANGELOG.md).
+pub fn code_add(path: &str, name: Option<String>, global: bool) -> Result<()> {
+    add_collection_cmd(path, name, global, "code")
+}
+
+fn add_collection_cmd(path: &str, name: Option<String>, global: bool, kind: &str) -> Result<()> {
     let mimir = Mimir::open()?;
     let root = std::path::Path::new(path);
     let canonical = std::fs::canonicalize(root).with_context(|| format!("no such dir: {path}"))?;
@@ -1032,6 +1296,7 @@ pub fn docs_add(path: &str, name: Option<String>, global: bool) -> Result<()> {
         &canonical,
         &name,
         project.as_ref().map(|p| p.id),
+        kind,
     )?;
     println!(
         "{} {} {}",
@@ -1059,8 +1324,13 @@ pub fn docs_list(json: bool) -> Result<()> {
             v["chunks"] = serde_json::json!(chunks);
             println!("{v}");
         } else {
+            let kind = coll
+                .meta
+                .get("kind")
+                .and_then(|v| v.as_str())
+                .unwrap_or("docs");
             println!(
-                "{} {} {} ({files} files, {chunks} chunks)",
+                "{} [{kind}] {} {} ({files} files, {chunks} chunks)",
                 short_uid(coll.kind, &coll.uid),
                 coll.title.as_deref().unwrap_or("?"),
                 coll.path.as_deref().unwrap_or("?"),
@@ -1160,7 +1430,7 @@ pub fn import_qmd(file: Option<String>) -> Result<()> {
             eprintln!("skipping {name}: {root} is not a directory");
             continue;
         }
-        let coll = mimir_core::index::add_collection(&mimir.conn, root_path, name, None)?;
+        let coll = mimir_core::index::add_collection(&mimir.conn, root_path, name, None, "docs")?;
         println!(
             "registered {} {} {}",
             short_uid(coll.kind, &coll.uid),
@@ -1228,10 +1498,17 @@ fn read_scope(mimir: &Mimir, global: bool, all: bool) -> Result<Scope> {
 
 fn parse_kind_filter(kind: &str) -> Result<Vec<Kind>> {
     Ok(match kind {
+        // No kind filter — deliberately includes CodeChunk. The point of
+        // indexing function bodies (not just signatures) is that a plain
+        // `recall` finds them without the caller knowing to ask for
+        // `--kind code`; ScoringConfig::code_damp keeps code from drowning
+        // out memories given its much larger corpus share.
         "all" => vec![],
         "memory" => vec![Kind::Memory],
         "doc" => vec![Kind::File, Kind::Chunk, Kind::Annotation],
-        "code" => vec![Kind::Symbol],
+        // Symbol = signature/doc only; CodeChunk = actual body/content text
+        // (see chunker::chunk_source). Both belong under `code`.
+        "code" => vec![Kind::Symbol, Kind::CodeChunk],
         other => bail!("unknown --kind '{other}' (use all|memory|doc|code)"),
     })
 }
@@ -1336,5 +1613,110 @@ mod scan_tests {
         ));
         assert!(!mentions_symbol("nothing here", "MimirServer"));
         assert!(!mentions_symbol("Pending tasks for tomorrow", "Pending"));
+    }
+}
+
+#[cfg(test)]
+mod hooks_tests {
+    use super::{merge_hook_settings, render_recall_script};
+
+    /// A custom `config.hooks.inject_url` must land verbatim as the
+    /// script's `MIMIR_INJECT_URL` fallback default — the actual install
+    /// path (`install_hooks`) is only exercised end-to-end by the
+    /// fake-$HOME e2e test (crates/mimir-cli/tests/e2e.rs), since it needs
+    /// a real `~/.claude` dir and MIMIR_HOME must be *unset* for it to run
+    /// at all; this covers the pure rendering logic in isolation.
+    #[test]
+    fn custom_inject_url_lands_in_generated_script() {
+        let script = render_recall_script("http://10.0.0.5:9999/inject");
+        assert!(
+            script.contains(r#"INJECT_URL="${MIMIR_INJECT_URL:-http://10.0.0.5:9999/inject}""#),
+            "custom URL missing from script:\n{script}"
+        );
+        // The env-var override placeholder syntax itself must survive
+        // untouched — only the default inside it gets substituted.
+        assert!(script.contains("${MIMIR_INJECT_URL:-"));
+        assert!(!script.contains("__MIMIR_INJECT_URL_DEFAULT__"));
+    }
+
+    #[test]
+    fn default_inject_url_matches_documented_port() {
+        let script = render_recall_script("http://127.0.0.1:8077/inject");
+        assert!(script.contains(r#"INJECT_URL="${MIMIR_INJECT_URL:-http://127.0.0.1:8077/inject}""#));
+    }
+
+    /// `auto_recall=false` (recall_script = None) must be byte-identical to
+    /// pre-auto-recall behavior: no `UserPromptSubmit` key appears at all.
+    #[test]
+    fn no_recall_script_leaves_user_prompt_submit_untouched() {
+        let (root, messages) =
+            merge_hook_settings(serde_json::json!({}), "/path/mimir-rewrite.sh", None).unwrap();
+        assert!(
+            root["hooks"].get("UserPromptSubmit").is_none(),
+            "auto_recall=false must not add hooks.UserPromptSubmit, got: {root}"
+        );
+        // The pre-existing hooks still get installed as before.
+        assert!(root["hooks"]["SessionStart"].is_array());
+        assert!(root["hooks"]["PreToolUse"].is_array());
+        assert!(messages.iter().any(|m| m.contains("SessionStart")));
+        assert!(messages.iter().any(|m| m.contains("PreToolUse")));
+        assert!(!messages.iter().any(|m| m.contains("UserPromptSubmit")));
+    }
+
+    /// `auto_recall=true` adds exactly one `UserPromptSubmit` entry
+    /// pointing at the recall script, and re-running is a no-op (idempotent).
+    #[test]
+    fn recall_script_adds_one_entry_idempotently() {
+        let (root, messages) = merge_hook_settings(
+            serde_json::json!({}),
+            "/path/mimir-rewrite.sh",
+            Some("/path/mimir-recall.sh"),
+        )
+        .unwrap();
+        let entries = root["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert!(messages.iter().any(|m| m.contains("UserPromptSubmit")));
+
+        // Re-run against the already-merged settings: still exactly one entry,
+        // and the message says "already installed" instead of "added".
+        let (root2, messages2) = merge_hook_settings(
+            root,
+            "/path/mimir-rewrite.sh",
+            Some("/path/mimir-recall.sh"),
+        )
+        .unwrap();
+        let entries2 = root2["hooks"]["UserPromptSubmit"].as_array().unwrap();
+        assert_eq!(entries2.len(), 1, "re-running must not duplicate the entry");
+        assert!(messages2
+            .iter()
+            .any(|m| m.contains("UserPromptSubmit already installed")));
+    }
+}
+
+#[cfg(test)]
+mod inject_addr_tests {
+    use super::inject_addr;
+
+    #[test]
+    fn strips_scheme_and_inject_path() {
+        assert_eq!(
+            inject_addr("http://127.0.0.1:8077/inject").unwrap(),
+            "127.0.0.1:8077"
+        );
+        assert_eq!(
+            inject_addr("https://10.0.0.5:9999/inject").unwrap(),
+            "10.0.0.5:9999"
+        );
+    }
+
+    #[test]
+    fn tolerates_a_bare_host_port_with_no_scheme_or_path() {
+        assert_eq!(inject_addr("127.0.0.1:8077").unwrap(), "127.0.0.1:8077");
+    }
+
+    #[test]
+    fn empty_url_is_an_error_not_a_panic() {
+        assert!(inject_addr("").is_err());
+        assert!(inject_addr("http://").is_err());
     }
 }

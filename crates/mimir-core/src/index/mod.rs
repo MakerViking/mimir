@@ -18,11 +18,25 @@ use crate::model::{now_unix, Kind, NewNode, Node};
 use crate::store::{self, row_to_node, NODE_COLS};
 
 /// Register (or return the existing) collection for a docs root.
+///
+/// `kind` is the collection's content type — "docs" (markdown, chunked by
+/// heading) or "code" (source, chunked by tree-sitter symbol; see
+/// `chunker::chunk_source`) — recorded in `meta.kind` and read back by
+/// `index_collection` to pick the walk filter and chunker.
+///
+/// Collections are keyed by (path, kind), not path alone: a docs collection
+/// and a code collection can coexist at the same root (they walk disjoint
+/// file sets — markdown vs. tree-sitter-parseable source), which is exactly
+/// what `mimir code add <root>` on a root already auto-registered for docs
+/// needs. Re-adding the same (path, kind) returns the existing node
+/// unchanged; a different kind at an already-registered path creates a
+/// second, independent collection rather than silently no-opping.
 pub fn add_collection(
     conn: &Connection,
     root: &Path,
     name: &str,
     project_id: Option<i64>,
+    kind: &str,
 ) -> Result<Node> {
     if !root.is_dir() {
         return Err(Error::Invalid(format!(
@@ -35,9 +49,10 @@ pub fn add_collection(
         .query_row(
             &format!(
                 "SELECT {NODE_COLS} FROM node
-                 WHERE kind = 'collection' AND path = ?1 AND deleted_at IS NULL"
+                 WHERE kind = 'collection' AND path = ?1 AND deleted_at IS NULL
+                 AND COALESCE(json_extract(meta, '$.kind'), 'docs') = ?2"
             ),
-            [&canonical],
+            params![&canonical, kind],
             row_to_node,
         )
         .optional()?;
@@ -48,7 +63,19 @@ pub fn add_collection(
     new.title = Some(name.to_string());
     new.path = Some(canonical);
     new.project_id = project_id;
+    new.meta = Some(serde_json::json!({ "kind": kind }));
     store::insert_node(conn, new)
+}
+
+/// A collection's content type, as recorded by `add_collection`. Absent
+/// (pre-existing collections indexed before this field existed) defaults
+/// to "docs" so old collections keep behaving exactly as before.
+fn collection_kind(collection: &Node) -> &str {
+    collection
+        .meta
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("docs")
 }
 
 pub fn list_collections(conn: &Connection) -> Result<Vec<Node>> {
@@ -100,7 +127,12 @@ pub fn collection_stats(conn: &Connection, collection_id: i64) -> Result<(i64, i
             |r| r.get(0),
         )?)
     };
-    Ok((count("file")?, count("chunk")?))
+    // A code collection's chunks are Kind::CodeChunk (tree-sitter symbol
+    // chunks); a docs collection's are Kind::Chunk (heading chunks); a code
+    // collection's plain-text/config fallback content (see plain_text_kind)
+    // is also Kind::Chunk. Count both so "chunks" reflects what was actually
+    // indexed regardless of which kind carried it.
+    Ok((count("file")?, count("chunk")? + count("codechunk")?))
 }
 
 /// Soft-delete a collection and everything indexed under it.
@@ -225,8 +257,19 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
 
     let mut stats = IndexStats::default();
     let mut seen: HashSet<String> = HashSet::new();
-
-    for entry in ignore::WalkBuilder::new(root).build() {
+    let is_code = collection_kind(collection) == "code";
+    let mut walk = ignore::WalkBuilder::new(root);
+    // The plain-text/config fallback (below) whitelists a few dotfiles
+    // (`.env.example`), which `ignore`'s default hidden-file filter would
+    // otherwise drop before we ever see them — for both collection kinds,
+    // now that both use the fallback. Unhide everything, but keep `.git`
+    // out explicitly — it's dot-prefixed but never itself gitignored, and
+    // walking its (often huge) object store would cost real time for zero
+    // payoff (blob filenames have no extension, so plain_text_kind rejects
+    // them all anyway).
+    walk.hidden(false)
+        .filter_entry(|e| e.file_name() != ".git");
+    for entry in walk.build() {
         let entry = match entry {
             Ok(e) => e,
             Err(err) => {
@@ -238,18 +281,6 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
             continue;
         }
         let path = entry.path();
-        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-        if !matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown") {
-            continue;
-        }
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        seen.insert(rel.clone());
-        stats.seen += 1;
-
         let meta = entry
             .metadata()
             .map_err(|e| Error::Invalid(format!("stat {}: {e}", path.display())))?;
@@ -262,6 +293,36 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
             .map(|d| d.as_secs() as i64)
             .unwrap_or(-1);
         let size = meta.len() as i64;
+
+        // Docs collections: markdown, plus the plain-text/config fallback
+        // (chunker::plain_text_kind) for whitelisted non-markdown files
+        // sitting in a docs root — a config how-to's actual .toml/.yml/
+        // Dockerfile. Code collections: any file a tree-sitter adapter can
+        // parse (Lang::from_path's extension list), plus the same fallback
+        // for everything else a source tree needs indexed — Cargo.toml,
+        // Dockerfile, .env.example — that tree-sitter can't parse.
+        let lang = mimir_syntax::languages::Lang::from_path(&path.to_string_lossy());
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+        let is_markdown = matches!(ext.to_ascii_lowercase().as_str(), "md" | "markdown");
+        let plain = if lang.is_none() && !is_markdown {
+            chunker::plain_text_kind(path, size)
+        } else {
+            None
+        };
+        if is_code {
+            if lang.is_none() && plain.is_none() {
+                continue;
+            }
+        } else if !is_markdown && plain.is_none() {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        seen.insert(rel.clone());
+        stats.seen += 1;
 
         let existing = conn
             .query_row(
@@ -307,7 +368,50 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| rel.clone());
-        let chunks = chunker::chunk_markdown(&stem, &content);
+        // Plain-text/config crumbs use the full file name, not the stem:
+        // `Path::file_stem` treats a leading dot as a hidden-file marker and
+        // then strips the *next* dot as an "extension" — so `.env.example`'s
+        // stem is `.env`, which reads in a search result as if a real .env
+        // got indexed (alarming, since .env itself is blacklisted). The
+        // markdown branches below intentionally keep using `stem` (e.g.
+        // "guide.md" -> crumb "guide"), which is what's wanted there.
+        let name = Path::new(&rel)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| rel.clone());
+        // Three chunking modes, mutually exclusive by construction (the
+        // walk filter above only let one of these `Some` through):
+        // tree-sitter source (CodeChunk, subject to code_damp), the
+        // plain-text/config fallback (Chunk — config hits must not be
+        // damped like code), or markdown (docs collections; also the
+        // txt/rst fallback, which packs paragraphs the same way).
+        let (file_lang, chunks, chunk_kind): (String, Vec<chunker::DocChunk>, Kind) =
+            match (lang, plain) {
+                // CodeChunk crumbs use the full relative path, not just the
+                // stem: two files named `mod.rs` or `index.ts` in different
+                // directories would otherwise produce identical, ambiguous
+                // breadcrumbs ("mod › Foo::bar (fn) — ...") in search results.
+                (Some(l), _) => (
+                    l.name().to_string(),
+                    chunker::chunk_source(l, &rel, &content),
+                    Kind::CodeChunk,
+                ),
+                (None, Some(chunker::PlainTextKind::Prose)) => (
+                    "text".into(),
+                    chunker::chunk_markdown(&name, &content),
+                    Kind::Chunk,
+                ),
+                (None, Some(chunker::PlainTextKind::Config)) => (
+                    "config".into(),
+                    chunker::chunk_plain_text(&name, &content),
+                    Kind::Chunk,
+                ),
+                (None, None) => (
+                    "markdown".into(),
+                    chunker::chunk_markdown(&stem, &content),
+                    Kind::Chunk,
+                ),
+            };
 
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let file_id = match &existing {
@@ -331,7 +435,7 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
                         .unwrap_or_else(|| rel.clone()),
                 );
                 new.path = Some(rel.clone());
-                new.lang = Some("markdown".into());
+                new.lang = Some(file_lang.clone());
                 new.collection_id = Some(collection.id);
                 new.project_id = collection.project_id;
                 new.content_hash = Some(hash);
@@ -340,11 +444,11 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
             }
         };
         for chunk in &chunks {
-            let mut new = NewNode::new(Kind::Chunk);
+            let mut new = NewNode::new(chunk_kind);
             new.title = Some(chunk.title.clone());
             new.body = Some(chunk.body.clone());
             new.path = Some(rel.clone());
-            new.lang = Some("markdown".into());
+            new.lang = Some(file_lang.clone());
             new.parent_id = Some(file_id);
             new.collection_id = Some(collection.id);
             new.project_id = collection.project_id;
@@ -402,9 +506,13 @@ mod tests {
             "# Install\n\nrun the installer with care\n\n# Use\n\ncall the api twice\n",
         );
         write(dir.path(), "sub/notes.md", "plain notes about turnips\n");
-        write(dir.path(), "ignored.txt", "not markdown\n");
+        // Not on any whitelist (no recognized extension) — must stay
+        // excluded even now that docs collections also pick up the
+        // plain-text/config fallback (unlike `.txt`, which the fallback
+        // now legitimately indexes; see docs_collection_indexes_whitelisted_config_too).
+        write(dir.path(), "ignored.bin", "not markdown\n");
         let conn = db::open_in_memory().unwrap();
-        let coll = add_collection(&conn, dir.path(), "docs", None).unwrap();
+        let coll = add_collection(&conn, dir.path(), "docs", None, "docs").unwrap();
         (dir, conn, coll)
     }
 
@@ -428,6 +536,8 @@ mod tests {
                 limit: 5,
                 strength_alpha: 0.0,
                 recency_alpha: 0.0,
+                type_prior_alpha: 0.0,
+                code_damp: 1.0,
                 include_superseded: false,
             },
         )
@@ -466,6 +576,8 @@ mod tests {
                 limit: 5,
                 strength_alpha: 0.0,
                 recency_alpha: 0.0,
+                type_prior_alpha: 0.0,
+                code_damp: 1.0,
                 include_superseded: false,
             },
         )
@@ -482,6 +594,8 @@ mod tests {
                 limit: 5,
                 strength_alpha: 0.0,
                 recency_alpha: 0.0,
+                type_prior_alpha: 0.0,
+                code_damp: 1.0,
                 include_superseded: false,
             },
         )
@@ -519,7 +633,7 @@ mod tests {
         let (_dir, mut conn, coll) = setup();
         index_collection(&mut conn, &coll).unwrap();
         let root = Path::new(coll.path.as_deref().unwrap());
-        let again = add_collection(&conn, root, "docs", None).unwrap();
+        let again = add_collection(&conn, root, "docs", None, "docs").unwrap();
         assert_eq!(again.id, coll.id);
 
         remove_collection(&conn, coll.id).unwrap();
@@ -537,5 +651,166 @@ mod tests {
         let edges = store::edges_of(&conn, note.id).unwrap();
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].dst, coll.id);
+    }
+
+    /// A "code" collection at a path a "docs" collection already owns must
+    /// not silently no-op: re-adding with a different `kind` creates a
+    /// second, independent collection rather than returning the first one
+    /// unchanged. This is exactly what `auto.docs` (registers a docs
+    /// collection at the project root on session start) + an explicit
+    /// `mimir code add <same root>` produces in practice.
+    #[test]
+    fn add_collection_keys_by_path_and_kind() {
+        let (_dir, conn, docs_coll) = setup();
+        let root = Path::new(docs_coll.path.as_deref().unwrap());
+
+        let code_coll = add_collection(&conn, root, "docs", None, "code").unwrap();
+        assert_ne!(
+            code_coll.id, docs_coll.id,
+            "different kind at the same path must not reuse the existing collection"
+        );
+        assert_eq!(collection_kind(&code_coll), "code");
+        assert_eq!(collection_kind(&docs_coll), "docs");
+
+        // Re-adding either one is still idempotent.
+        let again = add_collection(&conn, root, "docs", None, "code").unwrap();
+        assert_eq!(again.id, code_coll.id);
+        let again = add_collection(&conn, root, "docs", None, "docs").unwrap();
+        assert_eq!(again.id, docs_coll.id);
+    }
+
+    #[test]
+    fn code_collection_indexes_config_as_chunk_not_codechunk() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/lib.rs",
+            "fn distinctive_needle_marker() {}\n",
+        );
+        write(
+            dir.path(),
+            "Cargo.toml",
+            "# a config comment, not a markdown heading\nname = \"demo\"\n",
+        );
+        write(dir.path(), "Cargo.lock", "this must never be indexed\n");
+        write(dir.path(), ".env", "SECRET=must-never-be-indexed\n");
+        write(dir.path(), ".env.example", "SECRET=placeholder\n");
+        let mut conn = db::open_in_memory().unwrap();
+        let coll = add_collection(&conn, dir.path(), "demo", None, "code").unwrap();
+        let stats = index_collection(&mut conn, &coll).unwrap();
+
+        // Cargo.lock and .env are excluded outright — never even "seen".
+        assert_eq!(stats.seen, 3, "expected src/lib.rs, Cargo.toml, .env.example only");
+
+        let kind_of = |path: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT kind FROM node WHERE collection_id = ?1 AND path = ?2
+                 AND kind IN ('chunk','codechunk') AND deleted_at IS NULL LIMIT 1",
+                params![coll.id, path],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        assert_eq!(kind_of("src/lib.rs").as_deref(), Some("codechunk"));
+        assert_eq!(
+            kind_of("Cargo.toml").as_deref(),
+            Some("chunk"),
+            "config files must be Chunk, not CodeChunk, or code_damp would suppress them"
+        );
+        assert_eq!(kind_of(".env.example").as_deref(), Some("chunk"));
+
+        // Crumb regression: file_stem(".env.example") == ".env" (Rust's
+        // stem-stripping only ever removes the extension *after* a leading
+        // dot), which would make a config hit's title read as if a real
+        // .env got indexed. Must be the full file name instead.
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM node WHERE collection_id = ?1 AND path = '.env.example'
+                 AND kind = 'chunk' LIMIT 1",
+                [coll.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            title.starts_with(".env.example"),
+            "crumb must use the full file name, not the truncated stem: {title}"
+        );
+
+        let lockfile_present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM node WHERE collection_id = ?1 AND path = 'Cargo.lock'",
+                [coll.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lockfile_present, 0);
+        let env_present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM node WHERE collection_id = ?1 AND path = '.env'",
+                [coll.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(env_present, 0);
+    }
+
+    /// The plain-text/config fallback isn't code-collection-only: a docs
+    /// root's actual `.toml`/`.yml`/Dockerfile (the "how do I configure
+    /// this" files a user's question is often really about) must be
+    /// searchable too, not just its markdown.
+    #[test]
+    fn docs_collection_indexes_whitelisted_config_too() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "README.md", "# Setup\n\nfollow the guide\n");
+        write(
+            dir.path(),
+            "config.yml",
+            "# deploy config\nreplicas: 3\ntimeout_seconds: 42\n",
+        );
+        write(dir.path(), "Dockerfile", "FROM scratch\nCMD [\"run\"]\n");
+        write(dir.path(), "Cargo.lock", "must never be indexed\n");
+        let mut conn = db::open_in_memory().unwrap();
+        let coll = add_collection(&conn, dir.path(), "demo", None, "docs").unwrap();
+        let stats = index_collection(&mut conn, &coll).unwrap();
+        assert_eq!(stats.seen, 3, "expected README.md, config.yml, Dockerfile only");
+
+        let hits = search::search(
+            &conn,
+            &SearchQuery {
+                text: "timeout_seconds".into(),
+                scope: Scope::All,
+                kinds: vec![],
+                since: None,
+                limit: 5,
+                strength_alpha: 0.0,
+                recency_alpha: 0.0,
+                type_prior_alpha: 0.0,
+                code_damp: 1.0,
+                include_superseded: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].node.path.as_deref(), Some("config.yml"));
+
+        let kind: String = conn
+            .query_row(
+                "SELECT kind FROM node WHERE collection_id = ?1 AND path = 'config.yml'
+                 AND kind IN ('chunk','codechunk') LIMIT 1",
+                params![coll.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kind, "chunk");
+
+        let lockfile_present: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM node WHERE collection_id = ?1 AND path = 'Cargo.lock'",
+                [coll.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(lockfile_present, 0);
     }
 }

@@ -17,6 +17,10 @@ pub enum Lang {
     C,
     CSharp,
     Sql,
+    Cpp,
+    Kotlin,
+    Swift,
+    Php,
 }
 
 impl Lang {
@@ -30,7 +34,15 @@ impl Lang {
             "go" => Lang::Go,
             "java" => Lang::Java,
             "rb" | "rake" => Lang::Ruby,
-            "c" | "h" => Lang::C,
+            "c" => Lang::C,
+            // `.h` is deliberately Cpp, not C: the C++ grammar parses
+            // C-style headers acceptably, but the reverse isn't true (C
+            // can't parse `class`/`namespace`/templates at all). `.c` stays
+            // its own bucket since a `.c` file is never C++.
+            "cpp" | "cc" | "cxx" | "hpp" | "hxx" | "h" => Lang::Cpp,
+            "kt" | "kts" => Lang::Kotlin,
+            "swift" => Lang::Swift,
+            "php" => Lang::Php,
             "cs" | "csx" => Lang::CSharp,
             "sql" => Lang::Sql,
             _ => return None,
@@ -48,6 +60,10 @@ impl Lang {
             Lang::C => "c",
             Lang::CSharp => "csharp",
             Lang::Sql => "sql",
+            Lang::Cpp => "cpp",
+            Lang::Kotlin => "kotlin",
+            Lang::Swift => "swift",
+            Lang::Php => "php",
         }
     }
 
@@ -63,6 +79,10 @@ impl Lang {
             Lang::C => tree_sitter_c::LANGUAGE.into(),
             Lang::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
             Lang::Sql => tree_sitter_sequel_tsql::LANGUAGE.into(),
+            Lang::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Lang::Kotlin => tree_sitter_kotlin_ng::LANGUAGE.into(),
+            Lang::Swift => tree_sitter_swift::LANGUAGE.into(),
+            Lang::Php => tree_sitter_php::LANGUAGE_PHP.into(),
         }
     }
 
@@ -213,6 +233,101 @@ impl Lang {
                 "create_procedure" => sql_def_name(node, src).map(|n| (n, "procedure")),
                 _ => None,
             },
+            Lang::Cpp => match node.kind() {
+                // Bare declarator name, or (out-of-line) `Type::method` —
+                // the qualifier is kept so `Greeter::Format` defined outside
+                // its class body still nests under "Greeter" and reads as a
+                // method regardless of enclosing namespace scope, mirroring
+                // Go's receiver-type prefix for the same reason.
+                "function_definition" => {
+                    let name =
+                        c_declarator_name(node.child_by_field_name("declarator")?, src)?;
+                    let kind = if name.contains("::") { "method" } else { "function" };
+                    Some((name, kind))
+                }
+                "class_specifier" => Some((text(node.child_by_field_name("name")?), "class")),
+                "struct_specifier" => Some((text(node.child_by_field_name("name")?), "struct")),
+                "union_specifier" => Some((text(node.child_by_field_name("name")?), "struct")),
+                "enum_specifier" => Some((text(node.child_by_field_name("name")?), "enum")),
+                "namespace_definition" => {
+                    Some((text(node.child_by_field_name("name")?), "namespace"))
+                }
+                _ => None,
+            },
+            // kotlin-ng's declaration nodes carry a `name` field (only its
+            // calls/imports/navigation are fieldless — see call()/imports()
+            // below), so definitions read the same as any other adapter.
+            Lang::Kotlin => match node.kind() {
+                "class_declaration" => {
+                    let name = text(node.child_by_field_name("name")?);
+                    let mut cursor = node.walk();
+                    let kind = if node
+                        .children(&mut cursor)
+                        .any(|c| c.kind() == "enum_class_body")
+                    {
+                        "enum"
+                    } else {
+                        "class"
+                    };
+                    Some((name, kind))
+                }
+                "object_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "object"))
+                }
+                "function_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "function"))
+                }
+                _ => None,
+            },
+            // Swift's `class_declaration` covers class/struct/actor/extension,
+            // disambiguated by its `declaration_kind` field (the literal
+            // keyword). `function_declaration`'s `name` field matches twice
+            // in this grammar (once for the identifier, once for an
+            // optionally-present return type reusing the same field id) —
+            // `child_by_field_name` returns the first match in document
+            // order, which is always the identifier since it precedes any
+            // `-> ReturnType`.
+            Lang::Swift => match node.kind() {
+                "class_declaration" => {
+                    let kind = match node
+                        .child_by_field_name("declaration_kind")
+                        .map(text)
+                        .as_deref()
+                    {
+                        Some("struct") => "struct",
+                        Some("enum") => "enum",
+                        _ => "class",
+                    };
+                    Some((text(node.child_by_field_name("name")?), kind))
+                }
+                "protocol_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "interface"))
+                }
+                "function_declaration" | "protocol_function_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "function"))
+                }
+                // `init`'s `name` field is the literal `init` keyword token.
+                "init_declaration" => Some(("init".to_string(), "constructor")),
+                _ => None,
+            },
+            Lang::Php => match node.kind() {
+                "function_definition" => {
+                    Some((text(node.child_by_field_name("name")?), "function"))
+                }
+                "method_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "method"))
+                }
+                "class_declaration" => Some((text(node.child_by_field_name("name")?), "class")),
+                "interface_declaration" => {
+                    Some((text(node.child_by_field_name("name")?), "interface"))
+                }
+                "trait_declaration" => Some((text(node.child_by_field_name("name")?), "trait")),
+                "enum_declaration" => Some((text(node.child_by_field_name("name")?), "enum")),
+                "namespace_definition" => {
+                    Some((text(node.child_by_field_name("name")?), "namespace"))
+                }
+                _ => None,
+            },
         }
     }
 
@@ -347,6 +462,67 @@ impl Lang {
                     _ => None,
                 }
             }
+            Lang::Cpp => {
+                if node.kind() != "call_expression" {
+                    return None;
+                }
+                let f = node.child_by_field_name("function")?;
+                match f.kind() {
+                    "identifier" | "field_identifier" => Some(text(f)),
+                    // obj.method() / obj->method() — the field name.
+                    "field_expression" => f.child_by_field_name("field").map(text),
+                    // Foo::bar() — a namespace/static-qualified call.
+                    "qualified_identifier" => f.child_by_field_name("name").map(text),
+                    _ => None,
+                }
+            }
+            // kotlin-ng's call_expression and navigation_expression are
+            // fieldless — the callee is always the first named child
+            // (identifier for a bare call, navigation_expression for a
+            // `recv.method(...)` call, whose own last named child is the
+            // member name).
+            Lang::Kotlin => {
+                if node.kind() != "call_expression" {
+                    return None;
+                }
+                let callee = node.named_child(0)?;
+                match callee.kind() {
+                    "identifier" => Some(text(callee)),
+                    "navigation_expression" => {
+                        let n = u32::try_from(callee.named_child_count())
+                            .ok()?
+                            .checked_sub(1)?;
+                        let last = callee.named_child(n)?;
+                        (last.kind() == "identifier").then(|| text(last))
+                    }
+                    _ => None,
+                }
+            }
+            Lang::Swift => {
+                if node.kind() != "call_expression" {
+                    return None;
+                }
+                let callee = node.named_child(0)?;
+                match callee.kind() {
+                    "simple_identifier" => Some(text(callee)),
+                    // `recv.method(...)` — navigation_expression's `suffix`
+                    // field is a navigation_suffix, itself carrying the
+                    // member name under its own `suffix` field.
+                    "navigation_expression" => {
+                        let suffix = callee.child_by_field_name("suffix")?;
+                        suffix.child_by_field_name("suffix").map(text)
+                    }
+                    _ => None,
+                }
+            }
+            Lang::Php => match node.kind() {
+                "function_call_expression" => node.child_by_field_name("function").map(text),
+                // obj->method(...) — the method name.
+                "member_call_expression" => node.child_by_field_name("name").map(text),
+                // Type::method(...) — a static/scoped call.
+                "scoped_call_expression" => node.child_by_field_name("name").map(text),
+                _ => None,
+            },
         }
     }
 
@@ -513,7 +689,9 @@ impl Lang {
                 let local = source.rsplit('.').next().unwrap_or(&source).to_string();
                 out.push(ImportRef { local, source });
             }
-            Lang::C => {
+            // C's preprocessor grammar is reused verbatim by C++, so one
+            // arm covers both `#include` forms.
+            Lang::C | Lang::Cpp => {
                 // #include "foo.h" / <foo.h> → a file→file edge by path.
                 if node.kind() != "preproc_include" {
                     return;
@@ -566,6 +744,76 @@ impl Lang {
             Lang::Ruby => {}
             // SQL has no import construct.
             Lang::Sql => {}
+            Lang::Kotlin => {
+                if node.kind() != "import" {
+                    return;
+                }
+                let mut cursor = node.walk();
+                let children: Vec<Node> = node.children(&mut cursor).collect();
+                if children.iter().any(|c| c.kind() == "*") {
+                    return; // Wildcard import — no single symbol to bind.
+                }
+                let Some(path) = children.iter().find(|c| c.kind() == "qualified_identifier")
+                else {
+                    return;
+                };
+                let source = text(*path);
+                let local = children
+                    .iter()
+                    .find(|c| c.kind() == "identifier")
+                    .map(|c| text(*c))
+                    .unwrap_or_else(|| {
+                        source.rsplit('.').next().unwrap_or(&source).to_string()
+                    });
+                out.push(ImportRef { local, source });
+            }
+            Lang::Swift => {
+                if node.kind() != "import_declaration" {
+                    return;
+                }
+                let mut cursor = node.walk();
+                let Some(path) = node.children(&mut cursor).find(|c| c.kind() == "identifier")
+                else {
+                    return;
+                };
+                let source = text(path);
+                let local = source.rsplit('.').next().unwrap_or(&source).to_string();
+                out.push(ImportRef { local, source });
+            }
+            Lang::Php => match node.kind() {
+                "namespace_use_clause" => {
+                    let mut cursor = node.walk();
+                    let Some(path) = node
+                        .children(&mut cursor)
+                        .find(|c| matches!(c.kind(), "name" | "qualified_name"))
+                    else {
+                        return;
+                    };
+                    let source = text(path);
+                    let local = node.child_by_field_name("alias").map(text).unwrap_or_else(|| {
+                        source.rsplit('\\').next().unwrap_or(&source).to_string()
+                    });
+                    out.push(ImportRef { local, source });
+                }
+                "require_expression" | "require_once_expression" | "include_expression"
+                | "include_once_expression" => {
+                    let Some(expr) = node.named_child(0) else {
+                        return;
+                    };
+                    if expr.kind() != "string" {
+                        return;
+                    }
+                    let source = text(expr).trim_matches(['\'', '"']).to_string();
+                    let local = source
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&source)
+                        .trim_end_matches(".php")
+                        .to_string();
+                    out.push(ImportRef { local, source });
+                }
+                _ => {}
+            },
         }
     }
 
@@ -599,7 +847,11 @@ impl Lang {
             | Lang::C
             | Lang::CSharp
             | Lang::Ruby
-            | Lang::Sql => {
+            | Lang::Sql
+            | Lang::Cpp
+            | Lang::Kotlin
+            | Lang::Swift
+            | Lang::Php => {
                 // Contiguous comment siblings directly above the node
                 // (a blank line breaks the chain; `//!` belongs to the
                 // module, not this item).
@@ -696,9 +948,27 @@ fn const_name(node: Node, src: &str) -> String {
 /// identifier — `*foo(...)`, `foo(...)`, `(*foo)(...)` all yield "foo".
 fn c_declarator_name(node: Node, src: &str) -> Option<String> {
     match node.kind() {
-        "identifier" => Some(src[node.byte_range()].to_string()),
+        // `field_identifier` is C++-only: an in-class inline method's
+        // declarator (e.g. `std::string greet() { … }` inside a
+        // `class_specifier` body) uses this kind instead of plain
+        // `identifier`, and it's a leaf with no children, so without this
+        // arm the fallback below would walk into nothing and drop the
+        // symbol entirely.
+        "identifier" | "field_identifier" => Some(src[node.byte_range()].to_string()),
         "function_declarator" | "pointer_declarator" | "parenthesized_declarator" => {
             c_declarator_name(node.child_by_field_name("declarator")?, src)
+        }
+        // C++ out-of-line member definition: `Type::method(...)`. Keep the
+        // qualifier so the symbol still nests under its class
+        // ("Type::method"), mirroring Go's receiver-type prefix for the
+        // same reason — without it, the fallback below would walk into
+        // `scope` first and return the class name instead of the method.
+        "qualified_identifier" => {
+            let name = c_declarator_name(node.child_by_field_name("name")?, src)?;
+            match node.child_by_field_name("scope") {
+                Some(scope) => Some(format!("{}::{name}", &src[scope.byte_range()])),
+                None => Some(name),
+            }
         }
         _ => {
             // Fall back to the first identifier descendant.

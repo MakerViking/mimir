@@ -65,10 +65,21 @@ they're a side effect; the point is the links.
   you want maximum precision over speed. No model downloaded? Everything
   still works, BM25-only.
 - **Code graph.** Tree-sitter symbol extraction (Rust, TypeScript/JS,
-  Python, Go, Java, Ruby, C, C#, SQL) with call/import edges: `graph callers`,
-  `impact` (blast radius of a diff), `path`, `hubs` — and code symbols
-  participate in semantic recall. Link memories to functions and they
-  surface together.
+  Python, Go, Java, Ruby, C, C++, C#, Kotlin, Swift, PHP, SQL) with
+  call/import edges: `graph callers`, `impact` (blast radius of a diff),
+  `path`, `hubs` — and code symbols participate in semantic recall. Link
+  memories to functions and they surface together.
+- **Code content search.** `mimir code add <dir>` indexes source files
+  chunked on tree-sitter symbol boundaries, so recall matches function/method
+  *bodies* — inline comments, string literals, implementation details — not
+  just signatures. Same incremental, hash-driven indexer as docs; a tunable
+  `scoring.code_damp` (default 0.85) keeps code's much larger corpus share
+  from drowning out memories. Config/plain-text files a source tree needs
+  but tree-sitter can't parse (`.toml`, `.yaml`/`.yml`, `.json`, `.sh`,
+  `Dockerfile`, `Makefile`, `.env.example`, `.txt`, `.rst`, …) are chunked
+  too; lockfiles (`Cargo.lock`, `package-lock.json`, …) and a real `.env`
+  are never indexed. Idea credit:
+  [@nworks3d](https://github.com/nworks3d)'s THOR fork of Mimir.
 - **Self-learning.** Recall usage strengthens what helps (`mark` for
   explicit feedback); typed half-life decay quiets what doesn't; weekly
   LLM-free consolidation dedups, flags contradictions, distills clusters,
@@ -158,6 +169,10 @@ mimir embed --fetch --rerank                  # one-time reranker download (~150
 mimir recall tricky semantic question --rerank  # cross-encoder rescoring (~1 s CPU, ~0.15 s GPU)
 # config.toml: embedding.model = "bge-base-en-v1.5" — stronger semantic
 # matching at the same query latency (index-time embedding is ~4x slower)
+# config.toml: embedding.model = "granite-embedding-small-r2" — same
+# precision as the default, ~3x faster per-embed (re-embeds the store)
+# config.toml: rerank.model = "jina-reranker-v1-turbo-en-int8" — ~1.2x
+# faster reranking, mild risk of reshuffling a top-3 result
 
 # code graph (the MCP server runs build + docs indexing automatically
 # on session start — these are for manual/CLI use)
@@ -166,6 +181,10 @@ mimir graph callers resolve_ref   # who calls this?
 mimir graph impact $(git diff --name-only)   # blast radius of a change
 mimir graph viz --open            # interactive graph map (self-contained HTML)
 mimir link m:ABC123 my_function --rel about  # decisions ↔ code
+
+# code content (function/method bodies, not just signatures, in recall)
+mimir code add ~/src/myproject --name myproject
+mimir index                       # same incremental indexer as docs
 
 # feedback & hygiene
 mimir mark m:ABC123 --useful      # strengthen future ranking
@@ -180,6 +199,28 @@ mimir export > backup.jsonl       # everything, always yours
 # agents (Claude Code etc.) — register once, works in every repo
 claude mcp add --scope user mimir -- mimir mcp
 ```
+
+### The fast path (recommended setup)
+
+Three commands get you the lowest-latency configuration Mimir has — measured
+on the same machine as the benchmark above:
+
+```bash
+mimir daemon &                        # warm engine: /inject answers in ~7 ms
+mimir init --hooks --auto-recall      # per-prompt recall via the warm path
+mimir doctor                          # confirms "daemon: warm (...)"
+```
+
+- **With the daemon running**, every auto-recall injection is served warm
+  (~7 ms) with full hybrid BM25+vector search.
+- **Without it**, the hook falls back to the cold CLI path, which defaults
+  to `cold_mode = "fast"` — still ~5–6 ms, lexical + identifier matching
+  only (semantic-only matches wait for the daemon).
+- Either way the engine's own warm recall is single-digit ms; there is no
+  configuration in which the hook blocks your prompt for half a second.
+
+To keep the daemon across reboots, install the systemd user unit:
+`cp contrib/mimir-daemon.service ~/.config/systemd/user/ && systemctl --user enable --now mimir-daemon`.
 
 ### Already have a memory system?
 
@@ -269,6 +310,32 @@ dashboard panel and a `/m-savings` command.
   **volume-capped non-lossily** (head + tail + every signal line; the bulky
   middle elided behind a visible marker). `mimir init --hooks` wires this in as
   a PreToolUse hook so it happens automatically.
+- **`mimir init --hooks --auto-recall`** (opt-in, off by default) — injects at
+  most one relevant gotcha/decision memory into each prompt's context via a
+  UserPromptSubmit hook, on top of the static SessionStart rules pack. Errs
+  toward silence: a hit must clear a relevance floor (term overlap, plus
+  lexical+semantic agreement when the embedding model is loaded) before it's
+  ever shown, capped at ~200 tokens. The hook also enriches a thin prompt with
+  up to 8 changed-file stems from `git diff` — it can extend a real overlap,
+  never single-handedly clear the floor on its own. It tries a warm `GET
+  /inject` endpoint first (one process-wide engine kept alive by `mimir mcp
+  --http 127.0.0.1:8077`, ~ms once loaded) and falls back to the cold
+  `mimir recall-inject` CLI path when no daemon answers — same relevance
+  logic either way, only latency differs. That cold fallback defaults to
+  `[hooks] cold_mode = "fast"` (BM25 + identifier legs only, no ONNX load:
+  ~5-6ms) rather than `"full"` hybrid search (~230-240ms) — it narrows which
+  matches clear the floor while cold (no purely-semantic hits) without
+  weakening the silence-beats-wrong-injection contract itself; set `"full"`
+  to trade that latency back for semantic coverage on the cold path. The warm
+  endpoint's address is `[hooks] inject_url` in `config.toml` (default
+  `http://127.0.0.1:8077/inject`), overridable per-invocation with
+  `MIMIR_INJECT_URL`. `mimir daemon` is a
+  short alias for `mimir mcp --http <addr>` that reads that same address, so
+  there's one command and one config key for "start the warm path." Run it
+  as a service with the sample unit at
+  [contrib/mimir-daemon.service](contrib/mimir-daemon.service) (`cp` it to
+  `~/.config/systemd/user/`, then `systemctl --user enable --now
+  mimir-daemon`); `mimir doctor` reports whether it's actually reachable.
 - **Optional API proxy** (`mimir proxy`, off by default) — adds prompt-cache
   breakpoints and lossless repeated-block dedup to Anthropic API traffic. See
   [docs/proxy.md](docs/proxy.md) and [docs/benchmarks.md](docs/benchmarks.md).
@@ -299,6 +366,28 @@ are plain f32 blobs keyed by content hash + model, brute-force scanned
 in-process (exact, single-digit ms at ≤200k items). Search legs are fused
 with RRF (k=60); learned strength only ever acts as a tiebreaker. Concurrent
 CLI + MCP-server access is the normal, supported case.
+
+Ranking has a few tunable knobs in `config.toml`, all sane by default:
+`[scoring] recency_alpha` (default `0.012`) nudges fresher decaying-kind
+memories (gotcha/decision/insight/note/idea); `type_prior_alpha` (default
+`0.12`) nudges gotcha/decision ahead of an equally-matching note/idea;
+`code_damp` (default `0.85`) keeps `mimir code add` content from drowning out
+memories; `impression_alpha` (default `0.0`, off) mildly damps a node that's
+been shown repeatedly but never opened — opt in once you have enough
+`recall_event` history for it to mean something. That history is itself
+bounded by `[learn] event_retention_days` (default `180`, `0` keeps forever):
+a background prune drops older `recall_event` rows on daemon startup and on
+the same idle cadence as the WAL checkpoint, sized so 180 days holds 6 of
+`impression_alpha`'s 30-day decay half-lives — comfortably more than the
+decay ever weights meaningfully; values below a 60-day safety floor are
+clamped up (with a log warning) rather than silently starving the signal.
+`[rerank] auto = "off" |
+"warm" | "always"` (default `"off"`) controls whether a plain `recall`
+auto-reranks without an explicit `--rerank`: off by default because the
+cross-encoder costs ~84ms/candidate (~1.3s at the default 15 candidates) and
+the win isn't measured yet; `"warm"` fires only when the model's already
+loaded in a long-lived process (the MCP server), `"always"` loads it on
+demand too.
 
 State lives in the platform-standard directories
 (`~/.local/share/mimir`, `~/.config/mimir`, `~/.cache/mimir` on Linux);
@@ -331,10 +420,11 @@ v0.4 shipped the complete original blueprint: memories, docs, code graph,
 hybrid + reranked search, self-learning, importers, prebuilt binaries,
 and the crates.io release ([mimir-mem](https://crates.io/crates/mimir-mem)).
 Daily use has driven everything since: the token-savings layer (outline/peek,
-command filters, the optional proxy), opt-in sync with project scoping, C#
-and SQL in the code graph, remote MCP over HTTP, agent-side memory hygiene,
-and concurrency hardening for many simultaneous sessions. Next: more
-languages, and whatever using it daily teaches us — see
+command filters, the optional proxy), opt-in sync with project scoping,
+six more languages in the code graph (C#, SQL, C++, Kotlin, Swift, PHP),
+code content in recall, opt-in per-prompt auto-recall, remote MCP over HTTP,
+agent-side memory hygiene, and concurrency hardening for many simultaneous
+sessions. Next: whatever using it daily teaches us — see
 [CHANGELOG.md](CHANGELOG.md) for the full history.
 
 ## Contributing & security

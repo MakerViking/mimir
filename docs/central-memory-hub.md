@@ -79,10 +79,33 @@ boundary on a bare host. Inside a container the flag is appropriate — bind
 `0.0.0.0` there, but publish the container port to localhost only, as the
 compose example below does.
 
-This exposes a Streamable-HTTP MCP server at `/mcp`. Point it at the **same
-store** as the hub. Running `mimir serve` and `mimir mcp --http` against one
-SQLite DB concurrently is safe (WAL + busy-timeout). A second container that
-mounts the hub's data directory works well:
+This exposes a Streamable-HTTP MCP server at `/mcp`, plus a plain HTTP
+`GET /inject` endpoint on the same bind — **not** an MCP tool, just the warm
+counterpart to the opt-in `mimir init --hooks --auto-recall` hook (see the
+README's Token savings section). Both endpoints share one process-wide
+`Mimir` engine, so `/inject` answers in a few ms once the process is warm,
+versus ~280ms for the cold `mimir recall-inject` CLI fallback the hook uses
+when no `--http` daemon is reachable. `/inject` carries the *same*
+loopback-bind posture as `/mcp` — it's the identical axum server on the
+identical address, so the non-loopback refusal and `--http-allow-remote`
+escape hatch described above apply to it too.
+
+`GET /inject?prompt=<text>&enrich=<stems>` runs the same relevance-floor
+logic as the cold CLI path (`mimir_core::inject::compute`) and returns
+`text/plain`: either one formatted `Relevant memory: ...` line, or an empty
+200 body when nothing clears the floor — silence is the deliberate default,
+not an error. `enrich` is optional, space-separated file-stem hints (the
+hook script derives it from `git diff --name-only`); it can extend a real
+prompt/memory overlap but can never single-handedly clear the floor. Point
+the hook at a remote hub's `/inject` by setting `[hooks] inject_url` in
+`config.toml` (or the `MIMIR_INJECT_URL` env var for a one-off override) to
+`https://<your-host>/inject` — the same auth/tunnel front-end you put in
+front of `/mcp` covers it, since it's the same server.
+
+Point `/mcp` at the **same store** as the hub. Running `mimir serve` and
+`mimir mcp --http` against one SQLite DB concurrently is safe (WAL +
+busy-timeout). A second container that mounts the hub's data directory works
+well:
 
 ```yaml
 services:

@@ -175,10 +175,15 @@ fn render(mimir: &Mimir) -> Result<String> {
     let links =
         q1("SELECT count(*) FROM edge WHERE rel IN ('about','relates','links','mentions')")?;
     let embedded = q1("SELECT count(*) FROM embedding")?;
-    let embeddable = q1(
+    // Kind list mirrors `embed::embed_pending`'s eligibility filter exactly —
+    // drawing from the shared constant means a kind added there (e.g. the
+    // `codechunk` fallback content in index::mod) shows up here too, instead
+    // of silently under-counting against a second, hand-copied list.
+    let embeddable = q1(&format!(
         "SELECT count(*) FROM node WHERE deleted_at IS NULL AND body IS NOT NULL
-         AND kind IN ('memory','chunk','annotation','symbol')",
-    )?;
+         AND kind IN ({})",
+        mimir_core::embed::EMBEDDABLE_KINDS
+    ))?;
     let superseded = q1("SELECT count(*) FROM node WHERE superseded_by IS NOT NULL")?;
     let archived =
         q1("SELECT count(*) FROM node WHERE deleted_at IS NOT NULL AND json_extract(meta,'$.archived')=1")?;

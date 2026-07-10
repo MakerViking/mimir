@@ -88,6 +88,66 @@ pub fn get_node(conn: &Connection, id: i64) -> Result<Node> {
     .ok_or_else(|| Error::NotFound(format!("node #{id}")))
 }
 
+/// Batch fetch, one round-trip instead of one query per id — the fused
+/// hybrid-search candidate list can be up to 200 ids (two 100-cap legs).
+/// Order is unspecified (SQLite's `IN` doesn't preserve list order); callers
+/// that need a particular order must sort themselves. Ids with no matching
+/// live row (e.g. deleted between fusion and fetch) are simply absent, not
+/// an error.
+pub fn get_nodes(conn: &Connection, ids: &[i64]) -> Result<Vec<Node>> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let id_list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} FROM node WHERE id IN ({id_list})"
+    ))?;
+    let nodes = stmt
+        .query_map([], row_to_node)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(nodes)
+}
+
+/// Batch-fetch shown/opened counts (`recall_event`) for `ids`, one round
+/// trip via `GROUP BY` — the impression-damp negative prior (`learn::
+/// impression_damp`) needs this per fused-search candidate, and the score
+/// site is hot, so a per-node query is not an option (see `search_hybrid`'s
+/// call site: this runs alongside [`get_nodes`] over the same id list, and
+/// only when `scoring.impression_alpha > 0.0` — otherwise skipped entirely).
+/// Ids with no `recall_event` rows are simply absent from the result map
+/// (equivalent to `ImpressionStats::default()`), not an error.
+pub fn impression_stats(
+    conn: &Connection,
+    ids: &[i64],
+) -> Result<std::collections::HashMap<i64, crate::learn::ImpressionStats>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let id_list = ids.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT node_id,
+                SUM(CASE WHEN event = 'shown' THEN 1 ELSE 0 END) AS shown,
+                SUM(CASE WHEN event = 'opened' THEN 1 ELSE 0 END) AS opened,
+                MAX(CASE WHEN event = 'shown' THEN at END) AS last_shown_at
+         FROM recall_event
+         WHERE node_id IN ({id_list}) AND event IN ('shown', 'opened')
+         GROUP BY node_id"
+    ))?;
+    let map = stmt
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                crate::learn::ImpressionStats {
+                    shown: r.get(1)?,
+                    opened: r.get(2)?,
+                    last_shown_at: r.get(3)?,
+                },
+            ))
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(map)
+}
+
 pub fn get_node_by_uid(conn: &Connection, uid: &str) -> Result<Node> {
     conn.query_row(
         &format!("SELECT {NODE_COLS} FROM node WHERE uid = ?1"),
@@ -358,6 +418,14 @@ pub fn project_titles(conn: &Connection) -> Result<std::collections::HashMap<i64
     Ok(map)
 }
 
+/// Delete `recall_event` rows older than `cutoff` (unix seconds), one
+/// statement (see `config::LearnConfig::event_retention_days`). Runs off a
+/// background idle timer (`db::spawn_checkpoint_timer`), never on the hot
+/// recall/score path. Returns the row count removed, for logging/tests.
+pub fn prune_old_events(conn: &Connection, cutoff: i64) -> Result<usize> {
+    Ok(conn.execute("DELETE FROM recall_event WHERE at < ?1", params![cutoff])?)
+}
+
 /// Append to the implicit-feedback ledger (shown/opened/useful/not_useful).
 pub fn record_event(
     conn: &Connection,
@@ -490,6 +558,105 @@ mod tests {
         assert_eq!(by_id.uid, node.uid);
         let by_uid = get_node_by_uid(&conn, &node.uid).unwrap();
         assert_eq!(by_uid.id, node.id);
+    }
+
+    #[test]
+    fn get_nodes_batches_and_matches_individual_lookups() {
+        let conn = conn();
+        let a = memory(&conn, "alpha", "x");
+        let b = memory(&conn, "beta", "y");
+        let c = memory(&conn, "gamma", "z");
+        soft_delete(&conn, c.id).unwrap(); // still fetchable by id, just flagged
+
+        let batch = get_nodes(&conn, &[a.id, b.id, c.id, 999_999]).unwrap();
+        // Same set as calling get_node per id (999_999 simply absent, no error).
+        let mut want = vec![
+            get_node(&conn, a.id).unwrap(),
+            get_node(&conn, b.id).unwrap(),
+            get_node(&conn, c.id).unwrap(),
+        ];
+        let mut got = batch;
+        let by_id = |n: &Node| n.id;
+        want.sort_by_key(by_id);
+        got.sort_by_key(by_id);
+        assert_eq!(want.len(), got.len());
+        for (w, g) in want.iter().zip(&got) {
+            assert_eq!(w.id, g.id);
+            assert_eq!(w.title, g.title);
+            assert_eq!(w.deleted_at.is_some(), g.deleted_at.is_some());
+        }
+    }
+
+    #[test]
+    fn get_nodes_empty_ids_is_empty() {
+        let conn = conn();
+        assert!(get_nodes(&conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn impression_stats_batches_and_groups_correctly() {
+        let conn = conn();
+        let a = memory(&conn, "alpha", "x");
+        let b = memory(&conn, "beta", "y");
+        // a: shown twice, opened once. b: shown once, never opened.
+        record_shown(&conn, b"q1", &[(a.id, 0, 1.0), (a.id, 1, 0.5)]).unwrap();
+        record_shown(&conn, b"q1", &[(b.id, 0, 1.0)]).unwrap();
+        record_event(&conn, a.id, "opened", None, None, None).unwrap();
+
+        let stats = impression_stats(&conn, &[a.id, b.id, 999_999]).unwrap();
+        assert_eq!(stats.len(), 2, "absent id must simply be missing, not an error");
+
+        let sa = stats[&a.id];
+        assert_eq!(sa.shown, 2);
+        assert_eq!(sa.opened, 1);
+        assert!(sa.last_shown_at.is_some());
+
+        let sb = stats[&b.id];
+        assert_eq!(sb.shown, 1);
+        assert_eq!(sb.opened, 0);
+    }
+
+    #[test]
+    fn impression_stats_empty_ids_is_empty() {
+        let conn = conn();
+        assert!(impression_stats(&conn, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prune_old_events_removes_only_rows_older_than_cutoff() {
+        let conn = conn();
+        let n = memory(&conn, "gamma", "z");
+        let now = now_unix();
+        // One old row, one recent row, planted with explicit timestamps
+        // (record_event/record_shown always stamp `now_unix()`, so this
+        // needs raw inserts to control `at`).
+        conn.execute(
+            "INSERT INTO recall_event (node_id, event, at) VALUES (?1, 'shown', ?2)",
+            params![n.id, now - 200 * 86_400],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO recall_event (node_id, event, at) VALUES (?1, 'shown', ?2)",
+            params![n.id, now - 10 * 86_400],
+        )
+        .unwrap();
+
+        let removed = prune_old_events(&conn, now - 180 * 86_400).unwrap();
+        assert_eq!(removed, 1, "only the 200-day-old row clears the 180-day cutoff");
+
+        let remaining: i64 = conn
+            .query_row("SELECT count(*) FROM recall_event", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(remaining, 1, "the 10-day-old row must survive");
+    }
+
+    #[test]
+    fn prune_old_events_is_a_noop_when_nothing_is_old_enough() {
+        let conn = conn();
+        let n = memory(&conn, "delta", "w");
+        record_event(&conn, n.id, "shown", None, None, None).unwrap();
+        let removed = prune_old_events(&conn, now_unix() - 180 * 86_400).unwrap();
+        assert_eq!(removed, 0);
     }
 
     #[test]

@@ -213,7 +213,9 @@ impl MimirServer {
                 "all" => vec![],
                 "memory" => vec![Kind::Memory],
                 "doc" => vec![Kind::File, Kind::Chunk, Kind::Annotation],
-                "code" => vec![Kind::Symbol],
+                // Symbol = signature/doc only; CodeChunk = actual body/content
+                // text (see chunker::chunk_source). Both belong under `code`.
+                "code" => vec![Kind::Symbol, Kind::CodeChunk],
                 other => return Err(format!("unknown kind '{other}' (all|memory|doc|code)")),
             };
             let scope = if args.all_projects {
@@ -229,6 +231,8 @@ impl MimirServer {
                 limit: args.limit.unwrap_or(m.config.output.default_limit),
                 strength_alpha: m.config.scoring.strength_alpha,
                 recency_alpha: m.config.scoring.recency_alpha,
+                type_prior_alpha: m.config.scoring.type_prior_alpha,
+                code_damp: m.config.scoring.code_damp,
                 include_superseded: args.include_superseded,
             };
             let hits = m.search_with(&query, args.rerank).map_err(engine_err)?;
@@ -790,7 +794,7 @@ pub fn run(http: Option<String>, http_allow_remote: bool) -> Result<()> {
                 if auto.docs {
                     let name = proj.title.clone().unwrap_or_else(|| "project".into());
                     let indexed =
-                        mimir_core::index::add_collection(&m.conn, &root, &name, Some(pid))
+                        mimir_core::index::add_collection(&m.conn, &root, &name, Some(pid), "docs")
                             .and_then(|c| mimir_core::index::index_collection(&mut m.conn, &c));
                     match indexed {
                         Ok(s) => {
@@ -831,7 +835,12 @@ pub fn run(http: Option<String>, http_allow_remote: bool) -> Result<()> {
 
     // Reclaim the WAL on an idle timer: `mimir mcp` is long-lived, so its read
     // marks can starve PASSIVE autocheckpoints and let the -wal grow unbounded.
-    mimir_core::db::spawn_checkpoint_timer(engine.paths.db_file.clone());
+    // Same timer also prunes old `recall_event` rows (`[learn]
+    // event_retention_days`, clamped/warned if configured unsafely low).
+    mimir_core::db::spawn_checkpoint_timer(
+        engine.paths.db_file.clone(),
+        engine.config.learn.effective_retention_days(),
+    );
 
     // Optional background sync (own connection, non-fatal, WAL-safe). Logs via
     // tracing, never stdout — stdout is the MCP protocol channel. Gated on the
@@ -855,6 +864,12 @@ pub fn run(http: Option<String>, http_allow_remote: bool) -> Result<()> {
         match http {
             Some(bind) => serve_http(project_id, &bind, http_allow_remote).await,
             None => {
+                // Eager-load here, not up front in `run()`: in HTTP mode this
+                // `engine` is only used for the project-detection/background
+                // work above and never actually serves requests, so loading
+                // the reranker onto it would just be a wasted cold load.
+                let mut engine = engine;
+                eager_load_reranker_if_auto(&mut engine);
                 let service = MimirServer::new(engine, project_id)
                     .serve(rmcp::transport::stdio())
                     .await?;
@@ -892,11 +907,51 @@ async fn serve_http(project_id: Option<i64>, bind: &str, allow_remote: bool) -> 
             Mimir::open().map_err(std::io::Error::other)?,
             project_id,
         ))
+    })
+    // `/inject` shares ONE process-wide engine across every request — unlike
+    // `/mcp` above, which pays a fresh `Mimir::open()` (ONNX load + full
+    // vector-matrix rebuild, ~450ms measured) per session. That's fine for
+    // `/mcp`'s long-lived sessions but far too slow for a UserPromptSubmit
+    // hook, which must answer inside the turn. First request still pays the
+    // model-load cost (lazy); every request after that reuses the warm
+    // engine (~26ms measured, vs ~480ms for the cold `recall-inject` CLI
+    // path on the same store).
+    .merge({
+        let mut inject_engine = Mimir::open()?;
+        // Worth eager-loading here specifically: this is the one engine
+        // every prompt-submit hook call actually reranks through, and
+        // there's only one of it for the whole process (unlike the
+        // per-session `/mcp` engines above), so the memory cost doesn't
+        // multiply with concurrent sessions.
+        eager_load_reranker_if_auto(&mut inject_engine);
+        inject_router(InjectState {
+            engine: Arc::new(Mutex::new(inject_engine)),
+            project_id,
+        })
     });
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("mimir MCP (streamable-http) listening on http://{bind}/mcp");
+    println!("mimir warm auto-recall listening on http://{bind}/inject");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Eager-load the cross-encoder reranker at startup when config says
+/// automatic reranking should be able to fire (`[rerank] auto = "warm"` or
+/// `"always"`) — otherwise "warm" mode's first query (and every query,
+/// for a session whose reranker never gets forced on) would never see it
+/// resident and auto-rerank would silently never fire on a long-lived
+/// server. Costs one cold ONNX load (a few hundred ms, plus the model's
+/// resident memory — same footprint an explicit `--rerank` call already
+/// pays) up front instead of a surprise on some later request; failure
+/// degrades the same as any other reranker load (logged, un-reranked
+/// results). Only called on the engines documented below — never on a
+/// per-session HTTP `/mcp` engine, since each of those would eager-load its
+/// own copy and memory would grow with concurrent sessions.
+fn eager_load_reranker_if_auto(m: &mut Mimir) {
+    if matches!(m.config.rerank.auto.as_str(), "warm" | "always") {
+        m.ensure_reranker(false);
+    }
 }
 
 /// True only when every address `bind` resolves to is loopback. Unresolvable
@@ -922,6 +977,12 @@ fn bind_is_loopback(bind: &str) -> bool {
 /// Build the axum router that serves the MCP tools over Streamable-HTTP at
 /// `/mcp`. `make_server` runs once per session (its own engine/connection);
 /// split out so a test can mount it on an ephemeral port with a temp store.
+/// Deliberately does NOT eager-load the reranker (unlike the stdio and
+/// `/inject` engines) — every concurrent session gets its own `Mimir`, so
+/// eager-loading here would multiply the model's resident memory by however
+/// many sessions are open. "warm" auto-rerank simply won't fire on a
+/// session's early queries unless something else in-process already forced
+/// a load; `"always"` still loads it lazily on that session's first query.
 fn mcp_http_router<F>(make_server: F) -> axum::Router
 where
     F: Fn() -> std::result::Result<MimirServer, std::io::Error> + Send + Sync + 'static,
@@ -935,6 +996,56 @@ where
         StreamableHttpServerConfig::default(),
     );
     axum::Router::new().nest_service("/mcp", service)
+}
+
+/// Shared state for the `/inject` endpoint: ONE process-wide engine (see
+/// `serve_http`'s comment for why this can't reuse `/mcp`'s per-session
+/// factory) plus the server's fixed project scope. `Clone` is cheap — it's
+/// just an `Arc` bump and a `Copy` `Option<i64>`.
+#[derive(Clone)]
+struct InjectState {
+    engine: Arc<Mutex<Mimir>>,
+    project_id: Option<i64>,
+}
+
+/// `GET /inject?prompt=...&enrich=...` — the warm counterpart to `mimir
+/// recall-inject`. Read-mostly (the only write is the impression log, same
+/// as a normal recall) and loopback-only (same bind guard as `/mcp`), so no
+/// auth beyond that is added here. Runs the actual work on `spawn_blocking`,
+/// mirroring `MimirServer::blocking`, so a slow SQLite/tokenizer call can't
+/// stall the async runtime. Never errors to the caller: any failure (bad
+/// DB, panic) degrades to an empty body, matching the "silence over a wrong
+/// answer" rule the floor itself already follows.
+///
+/// `enrich` is optional working-tree signal (see `MIMIR_RECALL_SH` in
+/// `commands.rs`) — passed straight through to `inject::compute`, which
+/// never lets it single-handedly clear the relevance floor.
+async fn inject_handler(
+    axum::extract::State(state): axum::extract::State<InjectState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> String {
+    let prompt = params.get("prompt").cloned().unwrap_or_default();
+    let enrich = params.get("enrich").cloned().unwrap_or_default();
+    let scope = state.project_id.map(Scope::Project).unwrap_or(Scope::All);
+    let engine = state.engine.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+        match mimir_core::inject::compute(&mut engine, &prompt, &enrich, scope) {
+            Ok(text) => text.unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!(%err, "inject: compute failed");
+                String::new()
+            }
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn inject_router(state: InjectState) -> axum::Router {
+    axum::Router::new()
+        .route("/inject", axum::routing::get(inject_handler))
+        .with_state(state)
 }
 
 #[cfg(test)]

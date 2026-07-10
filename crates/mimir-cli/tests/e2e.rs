@@ -175,6 +175,85 @@ fn isolated_home_never_touches_user_dirs() {
 }
 
 #[test]
+fn hooks_install_bakes_custom_inject_url_into_recall_script() {
+    // `install_hooks` deliberately early-returns whenever MIMIR_HOME is set
+    // (isolated instances must never touch a real ~/.claude) — so unlike
+    // every other test in this file, this one sets only HOME/USERPROFILE
+    // (the fake-$HOME trick), leaving MIMIR_HOME unset, to actually exercise
+    // the install path while staying fully sandboxed: Paths::standard()
+    // resolves config/db/models under $HOME too (directories::ProjectDirs
+    // honors $HOME on Linux/macOS), so nothing here can reach the real
+    // user's files as long as HOME points at the temp dir.
+    let fake_home = tempfile::tempdir().unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+
+    // A real Claude Code install looks like ~/.claude existing already —
+    // install_hooks skips silently otherwise.
+    std::fs::create_dir_all(fake_home.path().join(".claude")).unwrap();
+
+    // Seed config.toml with a custom inject_url *before* `init` runs, at
+    // the exact path Paths::standard() resolves to under XDG defaults.
+    let config_dir = fake_home.path().join(".config/mimir");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[hooks]\ninject_url = \"http://10.0.0.5:9999/inject\"\n",
+    )
+    .unwrap();
+
+    let out = Command::new(env!("CARGO_BIN_EXE_mimir"))
+        .args(["init", "--no-model", "--hooks", "--auto-recall"])
+        .env("HOME", fake_home.path())
+        .env("USERPROFILE", fake_home.path())
+        .env_remove("MIMIR_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CACHE_HOME")
+        .current_dir(cwd.path())
+        .output()
+        .expect("binary runs");
+    assert!(
+        out.status.success(),
+        "init failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let script = std::fs::read_to_string(fake_home.path().join(".claude/hooks/mimir-recall.sh"))
+        .expect("mimir-recall.sh must have been written");
+    assert!(
+        script.contains(r#"INJECT_URL="${MIMIR_INJECT_URL:-http://10.0.0.5:9999/inject}""#),
+        "custom inject_url not baked into installed script:\n{script}"
+    );
+
+    // Re-running after changing the config must rewrite the script with
+    // the new URL — install_hooks writes unconditionally, no staleness.
+    std::fs::write(
+        config_dir.join("config.toml"),
+        "[hooks]\ninject_url = \"http://192.168.1.1:7000/inject\"\n",
+    )
+    .unwrap();
+    let out2 = Command::new(env!("CARGO_BIN_EXE_mimir"))
+        .args(["init", "--no-model", "--hooks", "--auto-recall"])
+        .env("HOME", fake_home.path())
+        .env("USERPROFILE", fake_home.path())
+        .env_remove("MIMIR_HOME")
+        .env_remove("XDG_CONFIG_HOME")
+        .env_remove("XDG_DATA_HOME")
+        .env_remove("XDG_CACHE_HOME")
+        .current_dir(cwd.path())
+        .output()
+        .expect("binary runs");
+    assert!(out2.status.success());
+    let script2 = std::fs::read_to_string(fake_home.path().join(".claude/hooks/mimir-recall.sh"))
+        .unwrap();
+    assert!(
+        script2.contains(r#"INJECT_URL="${MIMIR_INJECT_URL:-http://192.168.1.1:7000/inject}""#),
+        "re-init did not rewrite the script with the new inject_url:\n{script2}"
+    );
+}
+
+#[test]
 fn concurrent_writers_and_readers_no_sqlite_busy() {
     // CLI + MCP running at once is the normal, supported case. Simulate:
     // one thread writes memories while another searches, both as real

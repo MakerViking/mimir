@@ -25,6 +25,7 @@ pub fn run(
         dedup: pc.dedup && !no_dedup,
         prune: prune || pc.prune,
         db_path: Some(mimir.paths.db_file.clone()),
+        event_retention_days: mimir.config.learn.effective_retention_days(),
     };
 
     let runtime = tokio::runtime::Runtime::new()?;

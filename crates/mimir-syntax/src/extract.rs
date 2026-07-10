@@ -347,6 +347,10 @@ func (s *Server) Start() error { return listen(s.port) }
             Lang::Go,
             Lang::CSharp,
             Lang::Sql,
+            Lang::Cpp,
+            Lang::Kotlin,
+            Lang::Swift,
+            Lang::Php,
         ] {
             extract(lang, "fn class def func ((((");
             extract(lang, "");
@@ -488,6 +492,286 @@ END;
         assert!(calls.contains(&("purge", "orders")), "procedure: {calls:?}");
 
         // SQL has no import construct.
+        assert!(fx.imports.is_empty(), "{:?}", fx.imports);
+    }
+
+    #[test]
+    fn h_extension_maps_to_cpp() {
+        // `.h` is deliberately routed to the C++ grammar (see from_path's
+        // comment); `.c` stays plain C.
+        assert_eq!(Lang::from_path("widget.h"), Some(Lang::Cpp));
+        assert_eq!(Lang::from_path("legacy.c"), Some(Lang::C));
+
+        // A `.h` header with a class (invalid in plain C) still extracts
+        // cleanly under the C++ grammar.
+        let src = r#"
+#ifndef WIDGET_H
+#define WIDGET_H
+
+class Widget {
+public:
+    int size();
+};
+
+#endif
+"#;
+        let fx = extract(Lang::from_path("widget.h").unwrap(), src);
+        let n = names(&fx);
+        assert!(n.contains(&("Widget", "class")), "{n:?}");
+    }
+
+    #[test]
+    fn cpp_extraction() {
+        let src = r#"
+#include "util.h"
+#include <vector>
+
+// Greets people.
+class Greeter {
+public:
+    std::string Format(const std::string& name);
+
+    std::string Greet(const std::string& name) {
+        return Format(name);
+    }
+};
+
+std::string Greeter::Format(const std::string& name) {
+    return normalize(name);
+}
+
+namespace app {
+    struct Point { int x; int y; };
+}
+"#;
+        let fx = extract(Lang::Cpp, src);
+        let n = names(&fx);
+        assert!(n.contains(&("Greeter", "class")), "{n:?}");
+        assert!(n.contains(&("Greeter::Greet", "method")), "{n:?}");
+        assert!(n.contains(&("Greeter::Format", "method")), "{n:?}");
+        assert!(n.contains(&("app::Point", "struct")), "{n:?}");
+
+        let greeter = fx
+            .symbols
+            .iter()
+            .find(|s| s.qualified == "Greeter")
+            .unwrap();
+        assert_eq!(greeter.doc.as_deref(), Some("Greets people."));
+
+        let calls: Vec<(&str, &str)> = fx
+            .calls
+            .iter()
+            .map(|c| (c.caller.as_str(), c.callee.as_str()))
+            .collect();
+        assert!(calls.contains(&("Greeter::Greet", "Format")), "{calls:?}");
+        assert!(
+            calls.contains(&("Greeter::Format", "normalize")),
+            "{calls:?}"
+        );
+
+        let imports: Vec<(&str, &str)> = fx
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i.source.as_str()))
+            .collect();
+        assert!(imports.contains(&("util", "util.h")), "{imports:?}");
+        assert!(imports.contains(&("vector", "vector")), "{imports:?}");
+    }
+
+    #[test]
+    fn kotlin_extraction() {
+        let src = r#"
+package com.example
+
+import java.util.List
+import com.example.util.Formatter as Fmt
+
+// Greets people.
+class Greeter(val name: String) {
+    fun greet(): String {
+        return format(name)
+    }
+
+    fun format(input: String): String {
+        return Fmt.upper(input)
+    }
+}
+
+enum class Mode { On, Off }
+"#;
+        let fx = extract(Lang::Kotlin, src);
+        let n = names(&fx);
+        assert!(n.contains(&("Greeter", "class")), "{n:?}");
+        assert!(n.contains(&("Greeter::greet", "method")), "{n:?}");
+        assert!(n.contains(&("Greeter::format", "method")), "{n:?}");
+        assert!(n.contains(&("Mode", "enum")), "{n:?}");
+
+        let greeter = fx
+            .symbols
+            .iter()
+            .find(|s| s.qualified == "Greeter")
+            .unwrap();
+        assert_eq!(greeter.doc.as_deref(), Some("Greets people."));
+
+        let calls: Vec<(&str, &str)> = fx
+            .calls
+            .iter()
+            .map(|c| (c.caller.as_str(), c.callee.as_str()))
+            .collect();
+        assert!(calls.contains(&("Greeter::greet", "format")), "{calls:?}");
+        assert!(calls.contains(&("Greeter::format", "upper")), "{calls:?}");
+
+        let imports: Vec<(&str, &str)> = fx
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i.source.as_str()))
+            .collect();
+        assert!(imports.contains(&("List", "java.util.List")), "{imports:?}");
+        assert!(
+            imports.contains(&("Fmt", "com.example.util.Formatter")),
+            "{imports:?}"
+        );
+    }
+
+    #[test]
+    fn swift_extraction() {
+        let src = r#"
+import Foundation
+
+// Greets people.
+class Greeter {
+    let name: String
+
+    init(name: String) {
+        self.name = name
+    }
+
+    func greet() -> String {
+        return format(name)
+    }
+
+    func format(_ input: String) -> String {
+        return input.uppercased()
+    }
+}
+
+protocol Runnable {
+    func run()
+}
+"#;
+        let fx = extract(Lang::Swift, src);
+        let n = names(&fx);
+        assert!(n.contains(&("Greeter", "class")), "{n:?}");
+        assert!(n.contains(&("Greeter::init", "constructor")), "{n:?}");
+        assert!(n.contains(&("Greeter::greet", "method")), "{n:?}");
+        assert!(n.contains(&("Greeter::format", "method")), "{n:?}");
+        assert!(n.contains(&("Runnable", "interface")), "{n:?}");
+
+        let greeter = fx
+            .symbols
+            .iter()
+            .find(|s| s.qualified == "Greeter")
+            .unwrap();
+        assert_eq!(greeter.doc.as_deref(), Some("Greets people."));
+
+        let calls: Vec<(&str, &str)> = fx
+            .calls
+            .iter()
+            .map(|c| (c.caller.as_str(), c.callee.as_str()))
+            .collect();
+        assert!(calls.contains(&("Greeter::greet", "format")), "{calls:?}");
+        assert!(
+            calls.contains(&("Greeter::format", "uppercased")),
+            "{calls:?}"
+        );
+
+        let imports: Vec<(&str, &str)> = fx
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i.source.as_str()))
+            .collect();
+        assert!(imports.contains(&("Foundation", "Foundation")), "{imports:?}");
+    }
+
+    #[test]
+    fn php_extraction() {
+        let src = r#"<?php
+
+namespace App {
+    use App\Util\Formatter;
+    require_once 'bootstrap.php';
+
+    // Greets people.
+    class Greeter
+    {
+        public function greet($name)
+        {
+            return $this->format($name);
+        }
+
+        private function format($name)
+        {
+            return Formatter::upper($name);
+        }
+    }
+
+    interface Runnable
+    {
+        public function run();
+    }
+}
+"#;
+        let fx = extract(Lang::Php, src);
+        let n = names(&fx);
+        assert!(n.contains(&("App", "namespace")), "{n:?}");
+        assert!(n.contains(&("App::Greeter", "class")), "{n:?}");
+        assert!(n.contains(&("App::Greeter::greet", "method")), "{n:?}");
+        assert!(n.contains(&("App::Greeter::format", "method")), "{n:?}");
+        assert!(n.contains(&("App::Runnable", "interface")), "{n:?}");
+
+        let greeter = fx
+            .symbols
+            .iter()
+            .find(|s| s.qualified == "App::Greeter")
+            .unwrap();
+        assert_eq!(greeter.doc.as_deref(), Some("Greets people."));
+
+        let calls: Vec<(&str, &str)> = fx
+            .calls
+            .iter()
+            .map(|c| (c.caller.as_str(), c.callee.as_str()))
+            .collect();
+        assert!(
+            calls.contains(&("App::Greeter::greet", "format")),
+            "{calls:?}"
+        );
+        assert!(
+            calls.contains(&("App::Greeter::format", "upper")),
+            "{calls:?}"
+        );
+
+        let imports: Vec<(&str, &str)> = fx
+            .imports
+            .iter()
+            .map(|i| (i.local.as_str(), i.source.as_str()))
+            .collect();
+        assert!(
+            imports.contains(&("Formatter", "App\\Util\\Formatter")),
+            "{imports:?}"
+        );
+        assert!(
+            imports.contains(&("bootstrap", "bootstrap.php")),
+            "{imports:?}"
+        );
+    }
+
+    #[test]
+    fn php_without_tag_extracts_nothing() {
+        // Without a `<?php` tag, the whole file parses as plain HTML/text —
+        // no symbols, calls, or imports.
+        let fx = extract(Lang::Php, "class Foo { function bar() {} }");
+        assert!(fx.symbols.is_empty(), "{:?}", fx.symbols);
+        assert!(fx.calls.is_empty(), "{:?}", fx.calls);
         assert!(fx.imports.is_empty(), "{:?}", fx.imports);
     }
 }

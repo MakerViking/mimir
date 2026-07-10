@@ -1,0 +1,26 @@
+[package]
+name = "mimir-syntax"
+description = "Tree-sitter language adapters and symbol extraction for Mimir (no dependency on mimir-core, so mimir-core and mimir-graph can both consume it without a dependency cycle)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+keywords = ["tree-sitter", "code-graph", "parsing"]
+categories = ["development-tools"]
+
+[dependencies]
+tree-sitter.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-ruby.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-c-sharp.workspace = true
+tree-sitter-sequel-tsql.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-kotlin-ng.workspace = true
+tree-sitter-swift.workspace = true
+tree-sitter-php.workspace = true

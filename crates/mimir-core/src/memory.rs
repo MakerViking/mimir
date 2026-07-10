@@ -89,6 +89,8 @@ fn find_duplicate(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<N
         limit: 5,
         strength_alpha: 0.0,
         recency_alpha: 0.0,
+        type_prior_alpha: 0.0,
+        code_damp: 1.0,
         include_superseded: false,
     };
     for hit in search::search(conn, &query)? {
