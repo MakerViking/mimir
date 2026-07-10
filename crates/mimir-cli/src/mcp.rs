@@ -896,9 +896,22 @@ async fn serve_http(project_id: Option<i64>, bind: &str, allow_remote: bool) -> 
             Mimir::open().map_err(std::io::Error::other)?,
             project_id,
         ))
-    });
+    })
+    // `/inject` shares ONE process-wide engine across every request — unlike
+    // `/mcp` above, which pays a fresh `Mimir::open()` (ONNX load + full
+    // vector-matrix rebuild, ~450ms measured) per session. That's fine for
+    // `/mcp`'s long-lived sessions but far too slow for a UserPromptSubmit
+    // hook, which must answer inside the turn. First request still pays the
+    // model-load cost (lazy); every request after that reuses the warm
+    // engine (~26ms measured, vs ~480ms for the cold `recall-inject` CLI
+    // path on the same store).
+    .merge(inject_router(InjectState {
+        engine: Arc::new(Mutex::new(Mimir::open()?)),
+        project_id,
+    }));
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("mimir MCP (streamable-http) listening on http://{bind}/mcp");
+    println!("mimir warm auto-recall listening on http://{bind}/inject");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -939,6 +952,51 @@ where
         StreamableHttpServerConfig::default(),
     );
     axum::Router::new().nest_service("/mcp", service)
+}
+
+/// Shared state for the `/inject` endpoint: ONE process-wide engine (see
+/// `serve_http`'s comment for why this can't reuse `/mcp`'s per-session
+/// factory) plus the server's fixed project scope. `Clone` is cheap — it's
+/// just an `Arc` bump and a `Copy` `Option<i64>`.
+#[derive(Clone)]
+struct InjectState {
+    engine: Arc<Mutex<Mimir>>,
+    project_id: Option<i64>,
+}
+
+/// `GET /inject?prompt=...` — the warm counterpart to `mimir recall-inject`.
+/// Read-mostly (the only write is the impression log, same as a normal
+/// recall) and loopback-only (same bind guard as `/mcp`), so no auth beyond
+/// that is added here. Runs the actual work on `spawn_blocking`, mirroring
+/// `MimirServer::blocking`, so a slow SQLite/tokenizer call can't stall the
+/// async runtime. Never errors to the caller: any failure (bad DB, panic)
+/// degrades to an empty body, matching the "silence over a wrong answer"
+/// rule the floor itself already follows.
+async fn inject_handler(
+    axum::extract::State(state): axum::extract::State<InjectState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> String {
+    let prompt = params.get("prompt").cloned().unwrap_or_default();
+    let scope = state.project_id.map(Scope::Project).unwrap_or(Scope::All);
+    let engine = state.engine.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+        match mimir_core::inject::compute(&mut engine, &prompt, scope) {
+            Ok(text) => text.unwrap_or_default(),
+            Err(err) => {
+                tracing::warn!(%err, "inject: compute failed");
+                String::new()
+            }
+        }
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn inject_router(state: InjectState) -> axum::Router {
+    axum::Router::new()
+        .route("/inject", axum::routing::get(inject_handler))
+        .with_state(state)
 }
 
 #[cfg(test)]

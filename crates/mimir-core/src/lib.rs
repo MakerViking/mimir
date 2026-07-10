@@ -14,6 +14,7 @@ pub mod error;
 pub mod format;
 pub mod import;
 pub mod index;
+pub mod inject;
 pub mod learn;
 pub mod memory;
 pub mod model;
