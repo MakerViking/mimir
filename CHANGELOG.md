@@ -73,6 +73,157 @@ the `mimir-mem` crate, and the on-disk schema move together.
   (default 0.85) keeps code from drowning out memories given its much
   larger corpus share. Idea credit: [@nworks3d](https://github.com/nworks3d)'s
   THOR fork of Mimir — thanks!
+- **Auto-rerank, gated by warmth: `[rerank] auto = "warm" | "always" | "off"`**
+  (default `"off"`). Previously the cross-encoder only ever ran on an
+  explicit `recall --rerank`, cold-loading the model every time from a
+  one-shot CLI process. With `auto = "warm"`, `mimir mcp` and `mimir mcp
+  --http`'s shared `/inject` engine eager-load the reranker at startup, so
+  once warm, ordinary recalls through the daemon get reranked — a one-shot
+  CLI process still never eats a cold ONNX load just because this is on,
+  since `"warm"` only fires when the model is already resident. Per-session
+  HTTP `/mcp` engines deliberately don't eager-load (memory would multiply
+  per concurrent session). Also gated per-query, independent of warmth: a
+  store under ~1k embeddable nodes, or a single-token/exact-identifier-shaped
+  query, skips reranking — a cross-encoder only adds cost (and can reshuffle
+  a correct exact match) in either case. Ships **off by default** on the
+  branch's own evidence standard: the cost is measured (~84 ms per candidate
+  on realistic code chunks → ~1.3 s per warm recall at the default 15
+  candidates) while the benefit is not — the retrieval eval doesn't exercise
+  reranking yet, and sandbox checks showed it can worsen some queries.
+  Revisit the default once rerank is wired into the eval harness and shows a
+  measured win.
+- **Third RRF leg: exact identifier/entity match.** Queries shaped like
+  code lookups (`MatrixCache::ensure`, `add_saturating`) were getting
+  fuzzed apart by the embedding leg and diluted by the FTS leg's
+  OR-of-every-token match (which lets an unrelated doc rank via a
+  throwaway word like "work" in "how does MatrixCache::ensure work").
+  `search_hybrid` now extracts identifier-shaped fragments (`::` paths,
+  `snake_case`, `camelCase`/`PascalCase`, dotted paths) from the query and
+  runs a cheap, capped exact-phrase FTS match on just those, fused in as a
+  third RRF leg. Empty (zero cost) on ordinary prose queries; acronym-led
+  proper nouns like `SQLite` or `GitHub` are deliberately excluded (an
+  upper-to-lower letter run, not camelCase's defining lower-to-upper
+  transition) so they don't misfire as identifiers.
+- **Auto-recall enrichment: the hook now looks at your working tree.**
+  `mimir-recall.sh` runs a capped `git diff --name-only HEAD` and passes
+  the changed files' stems (up to 8) alongside the prompt — on both the
+  warm `/inject?enrich=` param and the cold `recall-inject --enrich` path.
+  It can extend a real prompt/memory overlap (e.g. a short prompt that
+  wouldn't otherwise clear the floor on its own) but can never
+  single-handedly clear it: at least one raw-prompt-token overlap, or
+  confirmed embedding-leg agreement in a store large enough for that
+  agreement to mean something, must independently hold. Without that
+  guard, any prompt on a branch touching file `X` would auto-inject every
+  gotcha whose title happens to mention `X` — sandbox-verified against
+  exactly that failure mode (a 2-memory store made "agreement" trivially
+  true for every candidate) before landing.
+- **Four more languages for the code graph and `mimir code add`: C++,
+  Kotlin, Swift, PHP.** Same tree-sitter-backed symbol/call/import
+  extraction as the existing languages — classes, methods (nested and
+  out-of-line, e.g. C++'s `Type::method`), calls, and imports all resolve
+  and qualify correctly. Two notable extension-mapping/behavior decisions:
+  `.h` now parses as C++, not C — the C++ grammar reads C-style headers
+  acceptably, but the reverse isn't true (plain C can't parse `class`,
+  `namespace`, or templates at all), and `.c` still always resolves to C.
+  A PHP file without an opening `<?php` tag parses as plain HTML/text and
+  yields zero symbols by design, matching real PHP semantics. Also fixes a
+  gap found while building this: PHP static calls (`Type::method()`, the
+  `scoped_call_expression` node) were previously unrecognized as call
+  edges.
+- **`granite-embedding-small-r2` is now a selectable `embedding.model`**
+  (`ibm-granite/granite-embedding-small-english-r2`, via the
+  `onnx-community` ONNX export) — evaluated as an A/B candidate against
+  the default `bge-small-en-v1.5` (same 384 dims, so the schema doesn't
+  change, but see the caveat below). It isn't in fastembed's built-in
+  registry, so selecting it downloads the ONNX graph + tokenizer files
+  directly from its HF repo (via `hf-hub`, same cache dir/marker-file gate
+  as registry models) and loads via fastembed's user-defined-model path.
+  **The default is unchanged** — this is opt-in only, by setting
+  `embedding.model = "granite-embedding-small-r2"` in `mimir.toml` then
+  `mimir init` (or `mimir embed --fetch`). Verdict from running both
+  through Mimir's own retrieval eval (not IBM's CoIR/BEIR numbers, which
+  don't transfer 1:1 to our corpus/query shapes): precision and recall are
+  identical to bge-small across every category and question set; MRR is
+  marginally higher (0.858 → 0.866 overall) and per-embed latency on short
+  text is roughly 3x lower in a release build (~20ms → ~6ms), but the
+  preventer confusion-matrix eval (the metric that actually matters for
+  drift prevention) is byte-for-byte identical between the two models. Not
+  a case for churning the default: the eval gain is real but small, and
+  switching a running store's default model forces re-embedding
+  everything in it (same dimensionality does not imply a compatible
+  embedding space — nearest-neighbor distances between the two models'
+  vectors aren't meaningfully comparable). Worth having selectable for
+  anyone who wants the latency win or wants to re-run the comparison
+  themselves; not worth flipping unilaterally.
+- **`[hooks] cold_mode = "fast" | "full"`** (default `"fast"`) governs only
+  the cold `mimir recall-inject` CLI fallback (never the warm `/inject`
+  endpoint or a normal `mimir recall`, both of which always do full hybrid
+  search). `"fast"` skips the embedder entirely — BM25 + identifier legs
+  only, no ONNX/matrix load. Measured cold, release build, bge-small-en
+  already cached, 3-memory store: ~5-6ms end to end vs ~230-240ms for
+  `"full"` on the identical prompt/store, both on a firing and a silent
+  prompt. The relevance floor (`inject::clears_floor`) already degrades
+  cleanly with no vector leg — same path a model-less machine takes
+  today — so `"fast"` narrows which real matches clear the floor cold
+  (semantic-only matches won't fire) without weakening the
+  silence-beats-wrong-injection contract itself. Set `"full"` to restore
+  the pre-existing cold-path behavior.
+- **Shown-but-never-opened negative prior: `scoring.impression_alpha`**
+  (default `0.0`, off). A node repeatedly surfaced in results but never
+  opened gets a bounded multiplicative demotion (floor ~0.7x, decaying
+  back toward 1.0 over ~30 days) once it's been shown at least 10 times —
+  opened nodes are always exempt, and impression counts are fetched in one
+  batched query alongside the existing candidate fetch, so the score site
+  stays a single round trip regardless of alpha. Shipped off by default:
+  the eval fixtures have no impression history to measure this against, so
+  turning it on by default would be an unmeasured ranking change — exactly
+  how a prior recency regression made it through review undetected. Opt in
+  via `config.toml` once you have real usage history to tune against.
+- **`mimir daemon`**: a thin, discoverable alias for `mimir mcp --http <addr>`
+  that resolves `<addr>` from `[hooks] inject_url` (scheme and `/inject`
+  path stripped), so the same config key drives both the auto-recall hook's
+  target and the daemon's bind address — no separate "which port did I
+  configure" step. Prints the resolved warm URL on startup. `mimir doctor`
+  gained a matching informational check: a ~1s `GET` against the configured
+  `inject_url` reports warm/cold, never failing `doctor`'s exit code (same
+  precedent as the existing "model" check) — run cold, it just tells you to
+  `mimir daemon`. A sample systemd user unit ships at
+  [contrib/mimir-daemon.service](contrib/mimir-daemon.service). Deliberately
+  scoped to an alias plus a doctor check: no auto-spawn, no process
+  supervision — systemd (or your init of choice) already does that job.
+- **`[learn] event_retention_days`** (default `180`, `0` = keep forever)
+  bounds the previously-unbounded `recall_event` ledger (every recall logs
+  an impression). Pruning is a single batched `DELETE ... WHERE at <
+  cutoff` — backed by a new `recall_event(at)` index (migration v7), since
+  the existing `(node_id, at)` composite index doesn't serve a bare `at`
+  predicate — invoked once at daemon startup and on the same idle
+  WAL-checkpoint cadence the `mcp`/`serve`/`proxy` daemons already run
+  (~every 2 min). Measured on a seeded 5,500-row `recall_event` table
+  (5,000 rows aged past the retention window, 500 within it): one daemon
+  startup prunes it to exactly 500 rows, no more, no less. Configuring
+  below 60 days logs a warning and clamps up to 60 rather than silently
+  truncating `scoring.impression_alpha`'s 30-day decay stats to fewer than
+  ~2 half-lives of history.
+- **`jina-reranker-v1-turbo-en-int8` is now a selectable `rerank.model`**
+  (same `jinaai/jina-reranker-v1-turbo-en` repo, ~38 MB int8 ONNX export vs
+  the default's ~151 MB fp32) — evaluated as a latency candidate against the
+  fp32 default. Not in fastembed's registry (it hardcodes the fp32 file for
+  this repo), so selecting it downloads `onnx/model_int8.onnx` directly via
+  `hf-hub` and loads through fastembed's user-defined-reranker path, same
+  marker-gate convention as the embedding side. **The default is unchanged**
+  — opt-in via `rerank.model = "jina-reranker-v1-turbo-en-int8"` in
+  `mimir.toml`. Measured on this crate's own source (50 candidate code
+  chunks, release build, warm session, 20-run median): int8 is only
+  ~1.2x faster per rerank call (~4.2-4.7s → ~3.6-3.7s at this candidate
+  count), well short of the ~2-3x CPU headroom int8 quantization typically
+  buys — worth knowing before assuming a bigger win. Ordering agreement
+  across 10 diverse queries: the #1 (most-shown) result was identical
+  between fp32 and int8 in all 10; the full top-3 set matched in 8/10, with
+  one case where int8 demoted a genuinely on-topic chunk to the weakest
+  (#3) slot in favor of a less relevant one. Given the modest speedup and
+  that one real (if minor) quality cost, this isn't a case for flipping the
+  default either — shipped selectable for anyone who wants the CPU headroom
+  and can tolerate mild top-3 reshuffling.
 
 ### Internal
 - New `mimir_core::inject` module: the auto-recall relevance floor,
@@ -101,7 +252,23 @@ the `mimir-mem` crate, and the on-disk schema move together.
   with a tuning/holdout split scoring precision@k / recall / MRR in both a
   hermetic synthetic-vector mode and a real-model mode, so ranking changes
   are measured, not asserted. Not shipped on any user surface.
-
+- **The eval harness now scores the actual `inject::select_injection`
+  decision**, not just retrieval rank: a confusion table
+  (injected-correct/wrong, silent-correct/wrong) per fixture, including
+  negative fixtures (a hit exists but must stay silent) and enriched-query
+  variants. `cargo test -p mimir-mem-core eval::tests::eval_inject_baseline_report
+  -- --ignored --nocapture` prints it — the number to compare across floor
+  changes; the product rule enforced on every change is that
+  injected-wrong must never rise, even if the change also fixes an
+  intended case.
+- **Real-model eval is now parameterized by model**: `MIMIR_EVAL_MODEL`
+  overrides the configured default for `run_real_model` /
+  `run_inject_eval_real_model` (dev-only, unset → identical behavior to
+  before). This is what made the granite-vs-bge-small A/B above
+  measurable without touching `mimir.toml` per run. New direct dependency
+  `hf-hub` (already present transitively via fastembed's own default
+  features, so this adds no new transitive surface) does the
+  download+cache for models outside fastembed's registry.
 
 ## [0.13.0] — 2026-07-03
 ### Added
