@@ -1,7 +1,9 @@
 //! Hybrid search: ranked legs fused with reciprocal-rank fusion.
 //!
 //! Legs: FTS5 BM25 (always) + vector dot product (when a query embedding
-//! is supplied). RRF is scale-free, so adding legs never requires re-tuning.
+//! is supplied) + an identifier-exact phrase leg (when the query text
+//! contains code-identifier-shaped fragments, e.g. `Foo::bar`). RRF is
+//! scale-free, so adding legs never requires re-tuning.
 
 pub mod fts;
 pub mod vector;
@@ -66,14 +68,32 @@ pub fn search(conn: &Connection, query: &SearchQuery) -> Result<Vec<Hit>> {
 }
 
 /// Hybrid search. `vector_query` = (model name, L2-normalized query
-/// embedding); pass None to skip the vector leg.
+/// embedding); pass None to skip the vector leg. No impression damp
+/// (`scoring.impression_alpha`) — see [`search_hybrid_scored`] for that.
 pub fn search_hybrid(
     conn: &Connection,
     query: &SearchQuery,
     vector_query: Option<(&str, &[f32])>,
     cache: &mut Option<vector::MatrixCache>,
 ) -> Result<Vec<Hit>> {
-    Ok(search_hybrid_with_legs(conn, query, vector_query, cache)?.0)
+    search_hybrid_scored(conn, query, vector_query, cache, 0.0)
+}
+
+/// Same as [`search_hybrid`], with the shown-but-never-opened negative
+/// prior (`learn::impression_damp`) applied at `impression_alpha`. Split
+/// out as its own function (rather than a `SearchQuery` field) so existing
+/// callers — notably `eval::mod`'s scoring loop, which constructs
+/// `SearchQuery` and calls `search_hybrid`/`search_hybrid_with_legs`
+/// directly and must stay untouched — keep compiling and keep running at
+/// the always-safe `alpha = 0.0` no-op without needing to know this exists.
+pub fn search_hybrid_scored(
+    conn: &Connection,
+    query: &SearchQuery,
+    vector_query: Option<(&str, &[f32])>,
+    cache: &mut Option<vector::MatrixCache>,
+    impression_alpha: f64,
+) -> Result<Vec<Hit>> {
+    Ok(search_hybrid_with_legs_scored(conn, query, vector_query, cache, impression_alpha)?.0)
 }
 
 /// Same as [`search_hybrid`], but also returns the raw per-leg ranked id
@@ -83,11 +103,40 @@ pub fn search_hybrid(
 /// requires lexical+semantic agreement on the top hit before injecting it
 /// unprompted. `search_hybrid` is a thin wrapper over this so the scoring
 /// formula has one source of truth.
+///
+/// A third, identifier-exact leg (see `fts::identifier_leg`) also feeds
+/// RRF fusion below when the query has an identifier-shaped fragment, but
+/// is deliberately NOT added to the returned `legs`: callers index it by
+/// fixed position (`legs[1]` == vector iff requested), and inserting a
+/// third leg would shift that when no vector leg exists. Folding it
+/// straight into `rrf` keeps `legs`'s shape exactly as documented above.
+///
+/// No impression damp — see [`search_hybrid_with_legs_scored`] for that;
+/// this wrapper stays at the always-safe `alpha = 0.0` no-op so existing
+/// direct callers (`eval::mod`) don't need to change.
 pub fn search_hybrid_with_legs(
     conn: &Connection,
     query: &SearchQuery,
     vector_query: Option<(&str, &[f32])>,
     cache: &mut Option<vector::MatrixCache>,
+) -> Result<(Vec<Hit>, Vec<Vec<i64>>)> {
+    search_hybrid_with_legs_scored(conn, query, vector_query, cache, 0.0)
+}
+
+/// The real implementation behind [`search_hybrid_with_legs`] /
+/// [`search_hybrid`] / [`search_hybrid_scored`]: identical fusion + score
+/// formula, plus the shown-but-never-opened negative prior at
+/// `impression_alpha` (config `scoring.impression_alpha`, default 0.0/off
+/// — see `learn::impression_damp`). `Mimir::search_with`/`search_with_legs`
+/// (the only production callers that know the configured alpha) call this
+/// directly; every other caller goes through one of the `0.0`-forwarding
+/// wrappers above.
+pub fn search_hybrid_with_legs_scored(
+    conn: &Connection,
+    query: &SearchQuery,
+    vector_query: Option<(&str, &[f32])>,
+    cache: &mut Option<vector::MatrixCache>,
+    impression_alpha: f64,
 ) -> Result<(Vec<Hit>, Vec<Vec<i64>>)> {
     let t_fts = std::time::Instant::now();
     let mut legs: Vec<Vec<i64>> = vec![fts::leg(conn, query, LEG_CAP)?];
@@ -97,9 +146,12 @@ pub fn search_hybrid_with_legs(
         legs.push(vector::leg(conn, cache, model, qvec, query, LEG_CAP)?);
     }
     let vec_elapsed = t_vec.elapsed();
+    let t_ident = std::time::Instant::now();
+    let ident_leg = fts::identifier_leg(conn, query, LEG_CAP)?;
+    let ident_elapsed = t_ident.elapsed();
 
     let mut rrf: HashMap<i64, f64> = HashMap::new();
-    for leg in &legs {
+    for leg in legs.iter().chain(std::iter::once(&ident_leg)) {
         for (rank, id) in leg.iter().enumerate() {
             *rrf.entry(*id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
         }
@@ -109,6 +161,16 @@ pub fn search_hybrid_with_legs(
     let fused_count = rrf.len();
     let t_getnode = std::time::Instant::now();
     let ids: Vec<i64> = rrf.keys().copied().collect();
+    // Batched alongside get_nodes below (one round trip for the whole
+    // candidate set, never per-node — this is a hot path). Skipped
+    // entirely at the default alpha=0.0: no point paying a query whose
+    // result the damp formula would ignore anyway (impression_damp always
+    // returns 1.0 for alpha<=0.0).
+    let impressions = if impression_alpha > 0.0 {
+        store::impression_stats(conn, &ids)?
+    } else {
+        HashMap::new()
+    };
     let mut hits: Vec<Hit> = store::get_nodes(conn, &ids)?
         .into_iter()
         .filter_map(|node| {
@@ -149,11 +211,18 @@ pub fn search_hybrid_with_legs(
             } else {
                 1.0
             };
+            // Optional shown-but-never-opened negative prior (config
+            // scoring.impression_alpha, default 0.0/off): see
+            // `learn::impression_damp`.
+            let impression_stats = impressions.get(&node.id).copied().unwrap_or_default();
+            let impression_damp =
+                crate::learn::impression_damp(&impression_stats, impression_alpha, now);
             let score = base
                 * (1.0 + query.strength_alpha * (1.0 + effective).ln())
                 * recency_term
                 * (1.0 + query.type_prior_alpha * (prior - 1.0))
-                * code_damp;
+                * code_damp
+                * impression_damp;
             Some(Hit { node, score })
         })
         .collect();
@@ -176,6 +245,7 @@ pub fn search_hybrid_with_legs(
     tracing::debug!(
         ?fts_elapsed,
         ?vec_elapsed,
+        ?ident_elapsed,
         ?getnode_elapsed,
         sort_dedup_elapsed = ?t_rest.elapsed(),
         fused_count,
@@ -366,6 +436,123 @@ mod tests {
             search(&conn, &q(text)).unwrap();
         }
         assert_eq!(search(&conn, &q("weird input")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn identifier_leg_prefers_the_exact_adjacent_identifier() {
+        let conn = db::open_in_memory().unwrap();
+        // Same bag of words in both bodies, only order differs: one has the
+        // identifier's own tokens adjacent (as "MatrixCache::ensure" itself
+        // tokenizes), the other has them scattered. Plain BM25 is a
+        // bag-of-words model — same term frequencies, same document length —
+        // so it scores these two identically. Only the identifier leg's
+        // phrase match (fts::identifier_leg) can tell them apart.
+        let exact = add(
+            &conn,
+            Kind::Memory,
+            None,
+            "notes",
+            "MatrixCache::ensure loads the model",
+        );
+        add(
+            &conn,
+            Kind::Memory,
+            None,
+            "notes",
+            "ensure the model matrixcache loads",
+        );
+        let hits = search(&conn, &q("MatrixCache::ensure")).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].node.id, exact.id,
+            "the doc with the literal adjacent identifier must rank first"
+        );
+        assert!(
+            hits[0].score > hits[1].score,
+            "identifier leg must strictly break the BM25 tie, not just happen to sort first"
+        );
+    }
+
+    #[test]
+    fn impression_alpha_zero_is_byte_identical_noop() {
+        let conn = db::open_in_memory().unwrap();
+        let heavily_shown = add(&conn, Kind::Memory, None, "notes", "zebra pattern alpha");
+        add(&conn, Kind::Memory, None, "notes", "zebra pattern beta");
+        // Pile up well past the impression-damp threshold, never opened —
+        // if alpha=0.0 weren't a true no-op, this would move the ranking.
+        let shown: Vec<(i64, i64, f64)> =
+            (0..20).map(|rank| (heavily_shown.id, rank, 1.0)).collect();
+        store::record_shown(&conn, b"q", &shown).unwrap();
+
+        let with_impressions = search_hybrid(&conn, &q("zebra pattern"), None, &mut None).unwrap();
+        let scores_a: Vec<f64> = with_impressions.iter().map(|h| h.score).collect();
+
+        // Same query, no impression history at all seeded on a fresh store.
+        let clean_conn = db::open_in_memory().unwrap();
+        add(&clean_conn, Kind::Memory, None, "notes", "zebra pattern alpha");
+        add(&clean_conn, Kind::Memory, None, "notes", "zebra pattern beta");
+        let without_impressions =
+            search_hybrid(&clean_conn, &q("zebra pattern"), None, &mut None).unwrap();
+        let scores_b: Vec<f64> = without_impressions.iter().map(|h| h.score).collect();
+
+        assert_eq!(
+            scores_a, scores_b,
+            "alpha=0.0 (the default forwarded by search_hybrid) must be bit-identical \
+             regardless of impression history"
+        );
+    }
+
+    #[test]
+    fn impression_damp_demotes_shown_never_opened_past_threshold() {
+        let conn = db::open_in_memory().unwrap();
+        // Same bag of words, so BM25 alone ties them — only the impression
+        // damp (once alpha > 0) can break the tie.
+        let noisy = add(&conn, Kind::Memory, None, "notes", "zebra pattern alpha");
+        let quiet = add(&conn, Kind::Memory, None, "notes", "zebra pattern beta");
+        let shown: Vec<(i64, i64, f64)> = (0..20).map(|rank| (noisy.id, rank, 1.0)).collect();
+        store::record_shown(&conn, b"q", &shown).unwrap();
+
+        let hits =
+            search_hybrid_scored(&conn, &q("zebra pattern"), None, &mut None, 0.4).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(
+            hits[0].node.id, quiet.id,
+            "the never-shown-heavily node must outrank the shown-but-never-opened one"
+        );
+        assert!(hits[0].score > hits[1].score);
+    }
+
+    #[test]
+    fn impression_damp_exempts_an_opened_node() {
+        // Compares the SAME node's score with the damp off vs on, rather
+        // than comparing two different nodes against each other: SQLite
+        // FTS5's tie-break for exactly-equal bm25() scores is rowid order,
+        // not insertion-independent, so two "identical bag of words" nodes
+        // don't actually get identical RRF base scores (a prior version of
+        // this test asserted hits[0].score == hits[1].score and flaked on
+        // exactly that artifact). Isolating one node's own score at
+        // alpha=0.0 vs alpha=0.4 sidesteps it entirely.
+        let conn = db::open_in_memory().unwrap();
+        let opened = add(&conn, Kind::Memory, None, "notes", "zebra pattern alpha");
+        let shown: Vec<(i64, i64, f64)> = (0..20).map(|rank| (opened.id, rank, 1.0)).collect();
+        store::record_shown(&conn, b"q", &shown).unwrap();
+        crate::learn::record_opened(&conn, opened.id).unwrap();
+
+        let query = q("zebra pattern");
+        let undamped = search_hybrid_scored(&conn, &query, None, &mut None, 0.0).unwrap();
+        let damped = search_hybrid_scored(&conn, &query, None, &mut None, 0.4).unwrap();
+        let score_of = |hits: &[Hit]| {
+            hits.iter()
+                .find(|h| h.node.id == opened.id)
+                .expect("opened node missing from hits")
+                .score
+        };
+        assert_eq!(
+            score_of(&undamped),
+            score_of(&damped),
+            "an opened node's own score must be identical whether or not \
+             the damp is enabled — it's exempt regardless of alpha"
+        );
     }
 }
 
