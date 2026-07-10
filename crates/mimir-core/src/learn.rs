@@ -49,7 +49,12 @@ pub fn effective_strength(node: &Node, now: i64) -> f64 {
 
 /// Time-recency factor in (0, 1]: `2^(-age/half_life)` from CREATION (newer
 /// information wins), using the same type-aware half-lives as decay. Returns
-/// 1.0 for pinned or never-decaying kinds (docs, code, person, summary).
+/// 1.0 for pinned or never-decaying kinds (docs, code, person, summary) —
+/// but 1.0 is the *max* of this range, not a neutral "no boost" value, so
+/// callers MUST gate its use on `half_life_days(kind, subkind).is_some()`
+/// (see the score site in `search/mod.rs`) rather than applying it
+/// unconditionally; otherwise every non-decaying node gets a permanent
+/// boost relative to every aging memory instead of staying recency-neutral.
 /// Independent of learned strength; used as an opt-in ranking boost
 /// (scoring.recency_alpha) so a fresh "it's done" memory can outrank a stale
 /// "in progress" one even on a slightly weaker text match.

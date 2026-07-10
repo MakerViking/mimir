@@ -18,7 +18,7 @@
 //! `Core`) scored MRR 1.0 / recall 1.0 everywhere — every answer was too
 //! cleanly separable from its distractors to show a future ranking change
 //! (recency boost, gotcha/decision type priority, a lower RRF k) moving the
-//! needle. Four scenario families below are deliberately harder, added for
+//! needle. Scenario families below are deliberately harder, added for
 //! that purpose:
 //!
 //! 1. **Recency** (`mem_decision_*_old` / `*_new` pairs) — a superseded
@@ -39,6 +39,14 @@
 //!    test. Ground truth is always the memory: a human asking a behavior
 //!    question wants the curated "why," not a raw function body, even when
 //!    the code matches just as well lexically.
+//! 6. **Cross-kind recency** (`mem_gotcha_wal_autocheckpoint` +
+//!    `chunk_wal_docs_overview` + `code_wal_open_fn`) — a year-old gotcha
+//!    that is still the correct answer, competing against a fresh doc chunk
+//!    and a fresh code chunk on the same topic. Non-decaying kinds
+//!    (Chunk/CodeChunk) must stay recency-neutral against an aging memory,
+//!    not enjoy `recency_alpha` just for being newer — this is the
+//!    regression guard for that gating (see `learn::half_life_days` callers
+//!    in `search/mod.rs`). Ground truth is always the gotcha.
 //!
 //! Labels in every scenario are "what a human would say is the correct
 //! answer," authored before looking at how the current ranking scores it.
@@ -756,6 +764,63 @@ const FIXTURES: &[Fixture] = &[
         topic: "retry_backoff_tie",
         age_days: None,
     },
+    // ---- Scenario family 6: cross-kind recency (recency-gating regression
+    // guard) ----
+    // A year-old gotcha is still the human-correct answer, competing
+    // against a fresh doc chunk and a fresh code chunk on the same topic —
+    // both non-decaying kinds (`learn::half_life_days` returns `None` for
+    // Chunk/CodeChunk) that must NOT get a `recency_alpha` boost just for
+    // being newer than the gotcha. Before the recency-gating fix, this is
+    // exactly the shape that regressed: a permanent boost for every
+    // non-decaying node relative to any aging memory, unrelated to whether
+    // either one actually answers the question. Ground truth is always the
+    // gotcha; the doc/code chunks are topically adjacent but don't explain
+    // the actual cause.
+    Fixture {
+        key: "mem_gotcha_wal_autocheckpoint",
+        kind: Kind::Memory,
+        subkind: Some("gotcha"),
+        title: "Why the WAL file keeps growing and never shrinks back down",
+        body: "A read connection that never closes holds SQLite's WAL file open, so the \
+               default automatic checkpoint (every 1000 pages) never fires: the WAL file \
+               keeps growing and never shrinks back down. Long-lived read connections must \
+               run 'PRAGMA wal_checkpoint(TRUNCATE)' periodically or the -wal sidecar file \
+               balloons.",
+        path: None,
+        lang: None,
+        topic: "wal_growth",
+        age_days: Some(365),
+    },
+    Fixture {
+        key: "chunk_wal_docs_overview",
+        kind: Kind::Chunk,
+        subkind: None,
+        title: "docs/storage.md \u{203a} Write-Ahead Logging",
+        body: "Mimir opens SQLite in WAL mode for concurrent readers and a single writer. \
+               The main db and its -wal/-shm sidecar files must live on the same \
+               filesystem; network filesystems are not supported.",
+        path: Some("docs/storage.md"),
+        lang: None,
+        topic: "wal_growth",
+        age_days: None,
+    },
+    Fixture {
+        key: "code_wal_open_fn",
+        kind: Kind::CodeChunk,
+        subkind: None,
+        title: "crates/mimir-core/src/db.rs \u{203a} open (function) — \
+                pub fn open(path: &Path) -> Result<Connection>",
+        body: "pub fn open(path: &Path) -> Result<Connection> {\n\
+               \x20   let conn = Connection::open(path)?;\n\
+               \x20   conn.pragma_update(None, \"journal_mode\", \"WAL\")?;\n\
+               \x20   conn.pragma_update(None, \"busy_timeout\", 5000)?;\n\
+               \x20   Ok(conn)\n\
+               }",
+        path: Some("crates/mimir-core/src/db.rs"),
+        lang: Some("rust"),
+        topic: "wal_growth",
+        age_days: None,
+    },
     // ---- Background noise: never targeted by any question ----
     // Bulk and realistic messiness for the BM25 leg to compete against;
     // each sits in its own topic so hermetic mode never clusters one near a
@@ -1288,6 +1353,14 @@ const QUESTIONS: &[Question] = &[
         category: Category::CodeVsMemory,
         relevant: &["mem_decision_retry_backoff"],
         topic: "retry_backoff_tie",
+        set: QuestionSet::Tuning,
+    },
+    // ---- Scenario family 6: cross-kind recency (recency-gating guard) ----
+    Question {
+        query: "why does the WAL file keep growing and never shrink back down",
+        category: Category::DriftPreventer,
+        relevant: &["mem_gotcha_wal_autocheckpoint"],
+        topic: "wal_growth",
         set: QuestionSet::Tuning,
     },
 ];

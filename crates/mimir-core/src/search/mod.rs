@@ -123,7 +123,20 @@ pub fn search_hybrid_with_legs(
             let effective = crate::learn::effective_strength(&node, now);
             // Optional recency boost (config scoring.recency_alpha, default 0):
             // capped multiplicative, so it nudges near-ties without burying.
-            let recency = crate::learn::recency_factor(&node, now);
+            // Gated to kinds/subkinds with a defined half-life (the same
+            // decaying memory types `effective_strength` uses) — a
+            // never-decaying node (doc/code chunk, person/summary memory)
+            // gets NO recency term at all, not `recency_factor`'s 1.0. 1.0
+            // is the *max* of that (0,1] range, so applying it unconditionally
+            // would hand every non-decaying kind a permanent boost relative to
+            // every aging memory instead of leaving them recency-neutral.
+            let recency_term = if crate::learn::half_life_days(node.kind, node.subkind.as_deref())
+                .is_some()
+            {
+                1.0 + query.recency_alpha * crate::learn::recency_factor(&node, now)
+            } else {
+                1.0
+            };
             // Optional type-priority boost (config scoring.type_prior_alpha):
             // gotcha/decision nudged over an equally-matching note/idea.
             let prior = crate::learn::type_prior(node.subkind.as_deref());
@@ -138,7 +151,7 @@ pub fn search_hybrid_with_legs(
             };
             let score = base
                 * (1.0 + query.strength_alpha * (1.0 + effective).ln())
-                * (1.0 + query.recency_alpha * recency)
+                * recency_term
                 * (1.0 + query.type_prior_alpha * (prior - 1.0))
                 * code_damp;
             Some(Hit { node, score })

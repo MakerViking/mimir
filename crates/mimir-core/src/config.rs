@@ -54,6 +54,32 @@ pub struct Config {
     pub sync: SyncConfig,
     pub proxy: ProxyConfig,
     pub savings: SavingsConfig,
+    pub hooks: HooksConfig,
+}
+
+/// Settings for the opt-in Claude Code hooks (`mimir init --hooks`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HooksConfig {
+    /// Base URL for the warm `/inject` endpoint the auto-recall
+    /// (`--auto-recall`) UserPromptSubmit hook tries first, falling back to
+    /// the cold `mimir recall-inject` CLI path when unreachable — only live
+    /// while `mimir mcp --http` is running (see `mcp.rs::inject_router`).
+    /// Baked into the generated hook script at install/re-init time; the
+    /// `MIMIR_INJECT_URL` environment variable (read at hook-invocation
+    /// time, not install time) still overrides it as the highest-precedence
+    /// escape hatch — e.g. a per-machine bind without editing config.toml.
+    /// Default matches the port documented in README.md's remote-MCP
+    /// example (`127.0.0.1:8077`).
+    pub inject_url: String,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        HooksConfig {
+            inject_url: "http://127.0.0.1:8077/inject".into(),
+        }
+    }
 }
 
 /// Pricing for the token-savings analytics (`mimir savings`, dashboard).
@@ -205,12 +231,26 @@ pub struct ScoringConfig {
     pub strength_alpha: f64,
     /// Recency boost weight; 0.0 = off. Fresher memories get a small
     /// multiplicative nudge, capped so it never buries a stronger match.
-    /// Time-sensitive types (decision/note/...) feel it most via their
-    /// half-lives; non-decaying kinds (docs, code, person, summary) are
-    /// unaffected (`recency_factor` returns 1.0 for them). Default 0.4:
-    /// enough to move a stale-vs-current pair (e.g. a superseded-in-practice
-    /// decision that nobody marked superseded) without overpowering a
-    /// clearly better text/vector match.
+    /// Applied only to kinds/subkinds with a defined half-life (decision,
+    /// gotcha, insight, note, idea memories — see `learn::half_life_days`);
+    /// non-decaying kinds (docs, code, person/summary memories) get NO
+    /// recency term at all, so they stay recency-neutral relative to aging
+    /// memories instead of enjoying a permanent boost. Default 0.012: at
+    /// this gated formula, a *fresh* decaying-kind memory gets up to a full
+    /// `1+alpha` multiplier while every non-decaying kind sits flat at 1.0 —
+    /// a real, uncancelled edge (unlike the pre-gating bug, where both got
+    /// the same flat boost, so freshness never had to compete against
+    /// symbols/docs/code). 0.4 was tuned against that ungated formula and no
+    /// longer holds once gating is correct: on real embeddings, where
+    /// score gaps are already tight, anything above ~0.015 lets a fresh,
+    /// off-topic memory outrank a symbol/doc/code hit that's the actual
+    /// answer (0.02 alone regressed real-model `core` MRR to 0.94; 0.4
+    /// regressed hermetic `core` to 0.73). 0.012 is eval-tuned to be the
+    /// largest weight that clears `core` at 1.0 on *both* hermetic and
+    /// real-model modes, while still deciding a stale-vs-current Memory
+    /// pair (e.g. a superseded-in-practice decision nobody marked
+    /// superseded) and letting a still-relevant aged gotcha hold its rank
+    /// against fresher, topically-adjacent doc/code noise.
     pub recency_alpha: f64,
     /// Type-priority weight; 0.0 = off. Nudges gotcha/decision memories —
     /// drift-preventers and policy calls — ahead of an equally-matching but
@@ -268,7 +308,7 @@ impl Default for ScoringConfig {
     fn default() -> Self {
         ScoringConfig {
             strength_alpha: 0.15,
-            recency_alpha: 0.4,
+            recency_alpha: 0.012,
             type_prior_alpha: 0.12,
             code_damp: 0.85,
         }
