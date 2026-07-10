@@ -64,6 +64,21 @@ pub fn sanitize_tags(tags: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Normalize author-declared trigger phrases for `meta.fires_when` (see
+/// `inject::clears_floor`'s fires_when path): whitespace-collapsed,
+/// lowercased, capped to 8 phrases of at most 6 words each. An oversized
+/// phrase is dropped rather than truncated — same "reject, don't mangle"
+/// call as `sanitize_tags` makes for markup, since a truncated trigger
+/// could silently mean something the author never wrote.
+pub fn sanitize_fires_when(phrases: Vec<String>) -> Vec<String> {
+    phrases
+        .into_iter()
+        .map(|p| p.split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
+        .filter(|p| !p.is_empty() && p.split_whitespace().count() <= 6)
+        .take(8)
+        .collect()
+}
+
 fn find_duplicate(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<Node>> {
     // Exact (normalized) content match, any scope.
     let exact = conn
@@ -237,6 +252,24 @@ mod tests {
         // markup chars gone, empties dropped, whitespace trimmed
         assert_eq!(got, vec!["img/src=x/onerror=alert(1)", "auth", "postgres"]);
         assert!(got.iter().all(|t| !t.contains('<') && !t.contains('>')));
+    }
+
+    #[test]
+    fn sanitize_fires_when_normalizes_caps_and_drops_oversized() {
+        let got = sanitize_fires_when(vec![
+            "  Release   Checklist  ".into(),
+            "CUTTING a release".into(),
+            "".into(),
+            "   ".into(),
+            "this phrase has way more than six words in it".into(),
+        ]);
+        assert_eq!(got, vec!["release checklist", "cutting a release"]);
+    }
+
+    #[test]
+    fn sanitize_fires_when_caps_at_eight_phrases() {
+        let phrases: Vec<String> = (0..12).map(|i| format!("phrase {i}")).collect();
+        assert_eq!(sanitize_fires_when(phrases).len(), 8);
     }
 
     fn remember_text(conn: &Connection, text: &str) -> RememberOutcome {

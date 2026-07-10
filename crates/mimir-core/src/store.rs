@@ -362,6 +362,21 @@ pub fn set_project_identity(
     Ok(())
 }
 
+/// Set a memory's declared trigger phrases (`meta.fires_when`) — the
+/// author's own "fires when ..." conditions, checked by `inject::
+/// clears_floor` alongside (and as a bypass for) the inferred-relevance
+/// floor. Overwrites any previous list; `phrases` is expected pre-sanitized
+/// (see `memory::sanitize_fires_when`) — this is a raw setter, same
+/// division of labor as `sanitize_tags` vs. `insert_node`.
+pub fn set_fires_when(conn: &Connection, id: i64, phrases: &[String]) -> Result<()> {
+    let json = serde_json::to_string(phrases).unwrap_or_else(|_| "[]".into());
+    conn.execute(
+        "UPDATE node SET meta = json_set(meta, '$.fires_when', json(?2)) WHERE id = ?1",
+        params![id, json],
+    )?;
+    Ok(())
+}
+
 /// Bind an existing keyed (possibly synced-shadow) project to this machine's
 /// local path + display name, clearing the shadow marker. Used when a project
 /// that first arrived via sync is opened locally.
@@ -424,6 +439,49 @@ pub fn project_titles(conn: &Connection) -> Result<std::collections::HashMap<i64
 /// recall/score path. Returns the row count removed, for logging/tests.
 pub fn prune_old_events(conn: &Connection, cutoff: i64) -> Result<usize> {
     Ok(conn.execute("DELETE FROM recall_event WHERE at < ?1", params![cutoff])?)
+}
+
+/// True if `node_id` was already injected in `session_id` (the v8
+/// `injection_log` table — see `inject::select_unseen_injection`, which
+/// treats a read error here as "unseen" so a store hiccup degrades to the
+/// pre-ledger behavior rather than blocking injection).
+pub fn injection_seen(conn: &Connection, session_id: &str, node_id: i64) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM injection_log WHERE session_id = ?1 AND node_id = ?2",
+            params![session_id, node_id],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// Record that `node_id` was just injected in `session_id`, so the same
+/// memory doesn't re-inject on the session's next prompt. Idempotent
+/// (`PRIMARY KEY (session_id, node_id)`): a repeat call just refreshes `at`.
+pub fn record_injection(conn: &Connection, session_id: &str, node_id: i64) -> Result<()> {
+    conn.execute(
+        "INSERT INTO injection_log (session_id, node_id, at) VALUES (?1, ?2, ?3)
+         ON CONFLICT(session_id, node_id) DO UPDATE SET at = excluded.at",
+        params![session_id, node_id, now_unix()],
+    )?;
+    Ok(())
+}
+
+/// Delete `injection_log` and `session_state` rows older than `cutoff`
+/// (unix seconds) — both v8 tables are ephemeral per-session working state,
+/// not knowledge, so they're pruned on the same idle cadence as
+/// `recall_event` (see `prune_old_events`). Returns the total row count
+/// removed across both tables. Exported for the ops-owned prune cadence
+/// (`db::spawn_checkpoint_timer` or its cron equivalent) to wire in; not
+/// called from anywhere in this module.
+pub fn prune_session_state(conn: &Connection, cutoff: i64) -> Result<usize> {
+    let a = conn.execute("DELETE FROM injection_log WHERE at < ?1", params![cutoff])?;
+    let b = conn.execute(
+        "DELETE FROM session_state WHERE updated_at < ?1",
+        params![cutoff],
+    )?;
+    Ok(a + b)
 }
 
 /// Append to the implicit-feedback ledger (shown/opened/useful/not_useful).
@@ -657,6 +715,91 @@ mod tests {
         record_event(&conn, n.id, "shown", None, None, None).unwrap();
         let removed = prune_old_events(&conn, now_unix() - 180 * 86_400).unwrap();
         assert_eq!(removed, 0);
+    }
+
+    #[test]
+    fn set_fires_when_round_trips_through_meta() {
+        let conn = conn();
+        let n = memory(&conn, "release checklist", "bump version, tag, publish");
+        assert!(get_node(&conn, n.id).unwrap().meta.get("fires_when").is_none());
+
+        set_fires_when(
+            &conn,
+            n.id,
+            &["release checklist".into(), "cutting a release".into()],
+        )
+        .unwrap();
+        let got = get_node(&conn, n.id).unwrap();
+        let phrases: Vec<String> = got
+            .meta
+            .get("fires_when")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(phrases, vec!["release checklist", "cutting a release"]);
+
+        // Overwrites, doesn't append.
+        set_fires_when(&conn, n.id, &["only one now".into()]).unwrap();
+        let got = get_node(&conn, n.id).unwrap();
+        assert_eq!(
+            got.meta.get("fires_when").unwrap().as_array().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn injection_ledger_records_and_checks_per_session() {
+        let conn = conn();
+        let n = memory(&conn, "gotcha", "x");
+        assert!(!injection_seen(&conn, "sess-a", n.id).unwrap());
+
+        record_injection(&conn, "sess-a", n.id).unwrap();
+        assert!(injection_seen(&conn, "sess-a", n.id).unwrap());
+        // A different session never saw it.
+        assert!(!injection_seen(&conn, "sess-b", n.id).unwrap());
+
+        // Idempotent: recording again doesn't error or duplicate.
+        record_injection(&conn, "sess-a", n.id).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM injection_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn prune_session_state_removes_only_stale_rows_from_both_tables() {
+        let conn = conn();
+        let n = memory(&conn, "gamma", "z");
+        let now = now_unix();
+        conn.execute(
+            "INSERT INTO injection_log (session_id, node_id, at) VALUES ('old', ?1, ?2)",
+            params![n.id, now - 10 * 86_400],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO injection_log (session_id, node_id, at) VALUES ('fresh', ?1, ?2)",
+            params![n.id, now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_state (session_id, key, value, updated_at) \
+             VALUES ('old', 'k', 'v', ?1)",
+            params![now - 10 * 86_400],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_state (session_id, key, value, updated_at) \
+             VALUES ('fresh', 'k', 'v', ?1)",
+            params![now],
+        )
+        .unwrap();
+
+        let removed = prune_session_state(&conn, now - 7 * 86_400).unwrap();
+        assert_eq!(removed, 2, "one stale row from each table");
+        assert!(injection_seen(&conn, "fresh", n.id).unwrap());
+        assert!(!injection_seen(&conn, "old", n.id).unwrap());
     }
 
     #[test]

@@ -6,6 +6,8 @@
 
 use std::collections::HashSet;
 
+use rusqlite::Connection;
+
 use crate::error::Result;
 use crate::format::agent_line;
 use crate::memory;
@@ -87,8 +89,18 @@ pub const TOP_CANDIDATES: usize = 1;
 /// Without this guard, enrichment would let *any* prompt on a branch that
 /// touches file X auto-inject every gotcha whose title happens to mention
 /// X, regardless of what the prompt actually asked.
+///
+/// **Fires-when bypass:** a candidate carrying author-declared trigger
+/// phrases in `meta.fires_when` (set via `remember`'s `fires_when` arg, see
+/// `memory::sanitize_fires_when`) skips rules 1 and 2 entirely when the
+/// prompt (+ enrich) matches one of its phrases — see `fires_when_matches`.
+/// This is a deliberate, explicit opt-in from whoever wrote the memory, not
+/// an inferred signal, so it's held to a different bar than the rest of the
+/// floor. Rule 3 (vector-leg agreement) still applies when a vector leg
+/// exists: a declared trigger says "this topic matters", not "ignore a
+/// contradicting embedding signal".
 pub fn compute(mimir: &mut Mimir, prompt: &str, enrich: &str, scope: Scope) -> Result<Option<String>> {
-    compute_with_mode(mimir, prompt, enrich, scope, false)
+    compute_with_session(mimir, prompt, enrich, scope, false, None)
 }
 
 /// Same as [`compute`], but when `bm25_only` is true, never touches the
@@ -112,6 +124,32 @@ pub fn compute_with_mode(
     enrich: &str,
     scope: Scope,
     bm25_only: bool,
+) -> Result<Option<String>> {
+    compute_with_session(mimir, prompt, enrich, scope, bm25_only, None)
+}
+
+/// Same as [`compute_with_mode`], plus an optional per-session dedup ledger:
+/// when `session_id` is `Some`, a candidate that already clears the floor is
+/// still skipped if it was already injected earlier in that same session
+/// (`store::injection_seen`) — the search moves on to the next
+/// floor-clearing candidate instead of repeating it (see
+/// `select_unseen_injection`'s doc comment for why this doesn't reopen the
+/// regression `TOP_CANDIDATES` was pinned against). On a fresh pick, the
+/// injection is recorded (`store::record_injection`) so it won't repeat
+/// later in the same session. `session_id: None` reproduces today's
+/// behavior exactly — no ledger read, no ledger write.
+///
+/// Ledger I/O is fail-open: a read or write error is logged at `debug` and
+/// treated as if the ledger were empty/absent, so a store hiccup degrades
+/// to "inject as if this session has no history" rather than blocking an
+/// otherwise-valid injection.
+pub fn compute_with_session(
+    mimir: &mut Mimir,
+    prompt: &str,
+    enrich: &str,
+    scope: Scope,
+    bm25_only: bool,
+    session_id: Option<&str>,
 ) -> Result<Option<String>> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -139,8 +177,17 @@ pub fn compute_with_mode(
     } else {
         mimir.search_with_legs(&query)?
     };
-    let Some(top) = select_injection(&hits, prompt, enrich, &legs) else {
-        return Ok(None);
+    let top = match session_id {
+        Some(session_id) => {
+            match select_unseen_injection(&mimir.conn, session_id, &hits, prompt, enrich, &legs) {
+                Some(hit) => hit,
+                None => return Ok(None),
+            }
+        }
+        None => match select_injection(&hits, prompt, enrich, &legs) {
+            Some(hit) => hit,
+            None => return Ok(None),
+        },
     };
 
     let projects = store::project_titles(&mimir.conn)?;
@@ -169,6 +216,12 @@ pub fn compute_with_mode(
         &[(top.node.id, 0i64, top.score)],
     )?;
 
+    if let Some(session_id) = session_id {
+        if let Err(err) = store::record_injection(&mimir.conn, session_id, top.node.id) {
+            tracing::debug!(%err, "inject: failed to record injection ledger row");
+        }
+    }
+
     Ok(Some(text))
 }
 
@@ -179,15 +232,117 @@ pub fn compute_with_mode(
 /// results without a real `Mimir` engine (ONNX model, on-disk store) —
 /// only `compute`'s I/O shell (the search call, formatting, impression
 /// logging) needs one.
+///
+/// Before that top-1 scan, every returned hit (not just the fused #1 —
+/// `TOP_CANDIDATES` doesn't apply here, see [`fires_when_clears`]) is
+/// checked for an author-declared `fires_when` trigger match; a hit is
+/// what actually got scored least by inferred relevance is exactly the
+/// case a paraphrase-missing-rule-2 trigger exists to rescue.
 pub fn select_injection<'h>(
     hits: &'h [Hit],
     prompt: &str,
     enrich: &str,
     legs: &[Vec<i64>],
 ) -> Option<&'h Hit> {
+    if let Some(hit) = hits.iter().find(|hit| fires_when_clears(hit, prompt, enrich, legs)) {
+        return Some(hit);
+    }
     hits.iter()
         .take(TOP_CANDIDATES)
         .find(|hit| clears_floor(hit, prompt, enrich, legs))
+}
+
+/// Same as [`select_injection`], but skips any candidate already recorded
+/// in the per-session dedup ledger (`store::injection_seen`) and, unlike
+/// `select_injection`'s top-1 fallback scan, keeps scanning past the fused
+/// #1 hit there when it does.
+///
+/// The fallback scan intentionally goes further than [`TOP_CANDIDATES`]
+/// normally allows (see that constant's doc comment for the regression
+/// it's pinned against), but it's not the same relaxation: that regression
+/// came from letting a *lower-quality* hit qualify only because a *better*
+/// hit at rank 1 had already failed [`clears_floor`] — a quality fallback
+/// that let a stale, wrong pick through. Here every candidate this
+/// function returns, at any rank, still has to independently pass the
+/// exact same unrelaxed `clears_floor`; the only reason to move past rank
+/// 1 is that it already qualified and was already shown this session, so
+/// returning `None` for a rank-2 hit that *also* legitimately qualifies
+/// would just mean staying silent for no quality reason. A store read
+/// error on a given candidate is treated as "not seen" (fail-open) rather
+/// than skipping it.
+fn select_unseen_injection<'h>(
+    conn: &Connection,
+    session_id: &str,
+    hits: &'h [Hit],
+    prompt: &str,
+    enrich: &str,
+    legs: &[Vec<i64>],
+) -> Option<&'h Hit> {
+    let unseen = |hit: &&Hit| !store::injection_seen(conn, session_id, hit.node.id).unwrap_or(false);
+    if let Some(hit) = hits
+        .iter()
+        .filter(|hit| fires_when_clears(hit, prompt, enrich, legs))
+        .find(unseen)
+    {
+        return Some(hit);
+    }
+    hits.iter()
+        .filter(|hit| clears_floor(hit, prompt, enrich, legs))
+        .find(unseen)
+}
+
+/// True if `phrase` (one already-lowercased trigger from a candidate's
+/// `meta.fires_when`, see `memory::sanitize_fires_when`) fires against the
+/// prompt: either `phrase` appears as a literal substring of the lowercased
+/// `prompt`+`enrich` text, or every non-stopword word in `phrase` is present
+/// somewhere in `prompt_tokens` (already the union of prompt + enrich
+/// tokens, stopwords stripped) — order-free, so a trigger of "release
+/// checklist" also fires on "checklist for the release".
+fn fires_when_matches(phrase: &str, prompt_lower: &str, prompt_tokens: &HashSet<String>) -> bool {
+    if !phrase.is_empty() && prompt_lower.contains(phrase) {
+        return true;
+    }
+    let mut words = phrase.split_whitespace().filter(|w| !fts::is_stopword(w)).peekable();
+    if words.peek().is_none() {
+        return false;
+    }
+    words.all(|w| prompt_tokens.contains(w))
+}
+
+/// True if `top` carries an author-declared `meta.fires_when` trigger
+/// matching `prompt` (+ `enrich`) — see [`fires_when_matches`] — AND, when
+/// a vector leg exists, `top` still appears in that leg's own top
+/// [`LEG_TOP_K`] (the same rule 3 [`clears_floor`] enforces: a declared
+/// trigger says "this topic matters", not "ignore a contradicting
+/// embedding signal"). Deliberately independent of `clears_floor`'s rules
+/// 1 and 2 (type/pinned gate, min overlap) and of [`TOP_CANDIDATES`] — an
+/// explicit author opt-in is checked against *every* returned candidate,
+/// not just the fused #1 hit, since the whole point is to catch a
+/// paraphrase that inferred relevance ranked low.
+fn fires_when_clears(top: &Hit, prompt: &str, enrich: &str, legs: &[Vec<i64>]) -> bool {
+    let Some(phrases) = top.node.meta.get("fires_when").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if phrases.is_empty() {
+        return false;
+    }
+    let prompt_lower = format!("{} {}", prompt.to_lowercase(), enrich.to_lowercase());
+    let prompt_tokens: HashSet<String> = memory::tokens(prompt)
+        .into_iter()
+        .chain(memory::tokens(enrich))
+        .filter(|t| !fts::is_stopword(t))
+        .collect();
+    let matched = phrases
+        .iter()
+        .filter_map(|p| p.as_str())
+        .any(|phrase| fires_when_matches(phrase, &prompt_lower, &prompt_tokens));
+    if !matched {
+        return false;
+    }
+    match legs.get(1) {
+        Some(vector_leg) => vector_leg.iter().take(LEG_TOP_K).any(|id| *id == top.node.id),
+        None => true,
+    }
 }
 
 fn clears_floor(top: &Hit, prompt: &str, enrich: &str, legs: &[Vec<i64>]) -> bool {
@@ -489,6 +644,105 @@ mod tests {
         assert!(
             out.is_none(),
             "bm25_only mode must not let enrichment-only overlap self-license an injection"
+        );
+    }
+
+    #[test]
+    fn fires_when_bypasses_type_and_overlap_rules() {
+        // A Note (never a preventer type) sharing only one token with the
+        // prompt ("release" — below MIN_OVERLAP) would fail both rule 1 and
+        // rule 2 today. A declared fires_when trigger should let it clear
+        // the floor anyway on a prompt that matches the trigger, even in
+        // paraphrased word order. One shared token is kept so the FTS leg
+        // still surfaces this node as a search candidate in the first
+        // place — the floor rules only ever gate a candidate that search
+        // already returned, they don't influence retrieval itself.
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        let id = seed(
+            &mut mimir,
+            MemoryType::Note,
+            "Release day operational notes",
+            "double check environment variables before shipping",
+            &[],
+        );
+        store::set_fires_when(&mimir.conn, id, &["release checklist".to_string()]).unwrap();
+        let out = compute(
+            &mut mimir,
+            "is there a checklist to run through before we release?",
+            "",
+            Scope::All,
+        )
+        .unwrap();
+        assert!(out.is_some(), "fires_when match must bypass rules 1 and 2");
+    }
+
+    #[test]
+    fn fires_when_present_but_not_matched_stays_silent() {
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        let id = seed(
+            &mut mimir,
+            MemoryType::Note,
+            "Release day operational notes",
+            "double check environment variables before shipping",
+            &[],
+        );
+        store::set_fires_when(&mimir.conn, id, &["release checklist".to_string()]).unwrap();
+        let out = compute(&mut mimir, "why is the CI docs job failing", "", Scope::All).unwrap();
+        assert!(
+            out.is_none(),
+            "an unrelated prompt must not fire an unmatched trigger"
+        );
+    }
+
+    #[test]
+    fn session_ledger_dedups_within_a_session_but_not_across() {
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        let id = seed(
+            &mut mimir,
+            MemoryType::Note,
+            "Release day operational notes",
+            "double check environment variables before shipping",
+            &[],
+        );
+        store::set_fires_when(&mimir.conn, id, &["release checklist".to_string()]).unwrap();
+
+        let first = compute_with_session(
+            &mut mimir,
+            "is there a checklist to run through before we release?",
+            "",
+            Scope::All,
+            false,
+            Some("session-a"),
+        )
+        .unwrap();
+        assert!(first.is_some(), "first call in a session should inject");
+
+        let second = compute_with_session(
+            &mut mimir,
+            "is there a checklist to run through before we release?",
+            "",
+            Scope::All,
+            false,
+            Some("session-a"),
+        )
+        .unwrap();
+        assert!(
+            second.is_none(),
+            "the same session must not re-inject the same memory"
+        );
+
+        let other_session = compute_with_session(
+            &mut mimir,
+            "is there a checklist to run through before we release?",
+            "",
+            Scope::All,
+            false,
+            Some("session-b"),
+        )
+        .unwrap();
+        assert!(
+            other_session.is_some(),
+            "a different session should still inject"
         );
     }
 
