@@ -11,6 +11,7 @@
 //! CHANGELOG.md.
 
 use std::ops::Range;
+use std::path::Path;
 
 use mimir_syntax::{extract::extract, languages::Lang};
 use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
@@ -20,6 +21,79 @@ const TARGET_WORDS: usize = 280;
 const MAX_WORDS: usize = 400;
 const MIN_WORDS: usize = 60;
 const OVERLAP_WORDS: usize = 40;
+
+/// Well-known lockfiles / generated manifests: never indexed even though
+/// their extension would otherwise match the plain-text whitelist (e.g.
+/// `package-lock.json` matches `.json`). Machine-generated, often huge,
+/// and low-signal for recall.
+const LOCKFILE_NAMES: &[&str] = &[
+    "cargo.lock",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "composer.lock",
+    "gemfile.lock",
+    "poetry.lock",
+    "go.sum",
+    "mix.lock",
+    "flake.lock",
+    "pipfile.lock",
+];
+
+/// 256 KiB — generous for hand-written config, well below anything
+/// generated. Lockfiles are blacklisted by name above; this is a backstop
+/// for whatever else slips through (e.g. an oversized fixture.json).
+const PLAIN_TEXT_SIZE_CAP: u64 = 256 * 1024;
+
+/// How a whitelisted plain-text/config file should be chunked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlainTextKind {
+    /// toml, yaml, json, sh, ini, Dockerfile, Makefile, `.env.example`, ...
+    /// — never through `chunk_markdown` (comment lines would misparse as
+    /// headings).
+    Config,
+    /// txt, rst — free-form prose close enough to markdown that
+    /// `chunk_markdown`'s paragraph packing (it just won't find headings)
+    /// is the right tool.
+    Prose,
+}
+
+/// Classify a non-source file (one `Lang::from_path` didn't recognize) for
+/// the plain-text/config fallback. `None` means: skip it, same as before
+/// this fallback existed.
+///
+/// Order matters: secrets and lockfiles are excluded *before* the
+/// extension whitelist runs, so a future whitelist addition can never
+/// accidentally re-admit `.env` or a generated lockfile.
+pub fn plain_text_kind(path: &Path, size: i64) -> Option<PlainTextKind> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+
+    // Never a real .env (secrets) — `.env.example` (a checked-in template)
+    // is fine and explicitly whitelisted below.
+    if name == ".env" || (name.starts_with(".env.") && name != ".env.example") {
+        return None;
+    }
+    if LOCKFILE_NAMES.contains(&name.as_str()) {
+        return None;
+    }
+    if size < 0 || size as u64 > PLAIN_TEXT_SIZE_CAP {
+        return None;
+    }
+
+    if name == "dockerfile" || name == "makefile" || name == ".env.example" {
+        return Some(PlainTextKind::Config);
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "toml" | "yaml" | "yml" | "json" | "sh" | "bash" | "ini" => Some(PlainTextKind::Config),
+        "txt" | "rst" => Some(PlainTextKind::Prose),
+        _ => None,
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct DocChunk {
@@ -188,6 +262,30 @@ fn pack_section(section: &Section, sep: &str, out: &mut Vec<DocChunk>) {
         }
         flush(&cur, out, &section.crumb);
     }
+}
+
+/// Chunk a whitelisted config/plain-text file (toml, yaml, json, sh, ini,
+/// Dockerfile, Makefile, `.env.example`, ...) the same way `chunk_markdown`
+/// packs paragraphs — but skipping markdown parsing entirely. Running these
+/// through `chunk_markdown`'s pulldown_cmark pass would misread comment
+/// lines (`# this is a toml comment`, `# syntax=docker/dockerfile:1`, ...)
+/// as H1 headings and shred the file into garbage sections.
+///
+/// One flat section (no heading tree), blank-line-delimited paragraphs,
+/// packed to the same word budget/overlap as everything else.
+pub fn chunk_plain_text(doc_title: &str, text: &str) -> Vec<DocChunk> {
+    let lines = line_spans(text);
+    let paras = split_paras(&lines, 0, text.len(), &[]);
+    if paras.is_empty() {
+        return Vec::new();
+    }
+    let section = Section {
+        crumb: doc_title.to_string(),
+        paras,
+    };
+    let mut chunks = Vec::new();
+    pack_section(&section, "\n\n", &mut chunks);
+    chunks
 }
 
 /// Chunk source code on tree-sitter symbol boundaries: one section per
@@ -573,5 +671,101 @@ class Widget {
     #[test]
     fn chunk_source_empty_is_empty() {
         assert!(chunk_source(Lang::Rust, "empty.rs", "").is_empty());
+    }
+
+    #[test]
+    fn chunk_plain_text_does_not_treat_comments_as_headings() {
+        // A markdown pass would read `# syntax=...` as an H1 and split the
+        // crumb tree on it; chunk_plain_text must not.
+        let toml = "# syntax=docker/dockerfile:1\nname = \"mimir\"\nversion = \"0.13.0\"\n";
+        let chunks = chunk_plain_text("Cargo.toml", toml);
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(chunks[0].title, "Cargo.toml");
+        assert!(chunks[0].body.contains("# syntax=docker/dockerfile:1"));
+        assert!(chunks[0].body.contains("version = \"0.13.0\""));
+    }
+
+    #[test]
+    fn chunk_plain_text_splits_on_blank_lines_like_markdown() {
+        let ini = "[core]\nrepositoryformatversion = 0\n\n[remote \"origin\"]\nurl = https://example.com\n";
+        let chunks = chunk_plain_text("config", ini);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].body.contains("[core]"));
+        assert!(chunks[0].body.contains("[remote \"origin\"]"));
+    }
+
+    #[test]
+    fn chunk_plain_text_empty_is_empty() {
+        assert!(chunk_plain_text("empty.txt", "").is_empty());
+    }
+
+    #[test]
+    fn plain_text_kind_whitelist() {
+        for name in ["Cargo.toml", "config.yaml", "config.yml", "data.json", "run.sh", "run.bash", "settings.ini"] {
+            assert_eq!(
+                plain_text_kind(Path::new(name), 100),
+                Some(PlainTextKind::Config),
+                "{name} should be Config"
+            );
+        }
+        for name in ["Dockerfile", "Makefile", ".env.example"] {
+            assert_eq!(
+                plain_text_kind(Path::new(name), 100),
+                Some(PlainTextKind::Config),
+                "{name} should be Config"
+            );
+        }
+        for name in ["notes.txt", "readme.rst"] {
+            assert_eq!(
+                plain_text_kind(Path::new(name), 100),
+                Some(PlainTextKind::Prose),
+                "{name} should be Prose"
+            );
+        }
+    }
+
+    #[test]
+    fn plain_text_kind_never_real_env() {
+        assert_eq!(plain_text_kind(Path::new(".env"), 100), None);
+        assert_eq!(plain_text_kind(Path::new(".env.local"), 100), None);
+        assert_eq!(plain_text_kind(Path::new(".env.production"), 100), None);
+        // The template is fine — it's the one meant to be checked in.
+        assert_eq!(
+            plain_text_kind(Path::new(".env.example"), 100),
+            Some(PlainTextKind::Config)
+        );
+    }
+
+    #[test]
+    fn plain_text_kind_blacklists_lockfiles() {
+        for name in [
+            "Cargo.lock",
+            "package-lock.json",
+            "yarn.lock",
+            "pnpm-lock.yaml",
+            "go.sum",
+        ] {
+            assert_eq!(plain_text_kind(Path::new(name), 100), None, "{name} should be excluded");
+        }
+    }
+
+    #[test]
+    fn plain_text_kind_enforces_size_cap() {
+        assert_eq!(
+            plain_text_kind(Path::new("big.json"), (PLAIN_TEXT_SIZE_CAP + 1) as i64),
+            None
+        );
+        assert_eq!(
+            plain_text_kind(Path::new("small.json"), PLAIN_TEXT_SIZE_CAP as i64),
+            Some(PlainTextKind::Config)
+        );
+    }
+
+    #[test]
+    fn plain_text_kind_ignores_unlisted_extensions() {
+        // Binary/unrelated files a tree-sitter adapter also can't parse —
+        // must not be swept up by the fallback either.
+        assert_eq!(plain_text_kind(Path::new("photo.png"), 100), None);
+        assert_eq!(plain_text_kind(Path::new("data.bin"), 100), None);
     }
 }

@@ -63,7 +63,7 @@ fn execution_providers(device: &str) -> Vec<ort::ep::ExecutionProviderDispatch> 
 pub const EMBED_BATCH: usize = 64;
 
 /// Kinds whose body participates in semantic recall.
-const EMBEDDABLE_KINDS: &str = "'memory', 'chunk', 'annotation', 'symbol', 'codechunk'";
+pub const EMBEDDABLE_KINDS: &str = "'memory', 'chunk', 'annotation', 'symbol', 'codechunk'";
 
 pub fn model_from_name(name: &str) -> Result<EmbeddingModel> {
     Ok(match name {
