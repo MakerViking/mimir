@@ -20,3 +20,7 @@ tree-sitter-ruby.workspace = true
 tree-sitter-c.workspace = true
 tree-sitter-c-sharp.workspace = true
 tree-sitter-sequel-tsql.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-kotlin-ng.workspace = true
+tree-sitter-swift.workspace = true
+tree-sitter-php.workspace = true

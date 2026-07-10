@@ -674,6 +674,48 @@ class Widget {
     }
 
     #[test]
+    fn chunk_source_covers_new_languages() {
+        // One marker-in-function-body smoke test per newly added language
+        // (C++, Kotlin, Swift, PHP), mirroring
+        // chunk_source_finds_function_body_and_imports above — proves the
+        // mimir-syntax additions are wired all the way through chunking,
+        // not just through extract().
+        let cases = [
+            (
+                Lang::Cpp,
+                "greeter.cpp",
+                "void greet() {\n    cpp_distinctive_needle_marker();\n}\n",
+                "cpp_distinctive_needle_marker",
+            ),
+            (
+                Lang::Kotlin,
+                "greeter.kt",
+                "fun greet() {\n    kotlinDistinctiveNeedleMarker()\n}\n",
+                "kotlinDistinctiveNeedleMarker",
+            ),
+            (
+                Lang::Swift,
+                "greeter.swift",
+                "func greet() {\n    swiftDistinctiveNeedleMarker()\n}\n",
+                "swiftDistinctiveNeedleMarker",
+            ),
+            (
+                Lang::Php,
+                "greeter.php",
+                "<?php\nfunction greet() {\n    php_distinctive_needle_marker();\n}\n",
+                "php_distinctive_needle_marker",
+            ),
+        ];
+        for (lang, title, src, marker) in cases {
+            let chunks = chunk_source(lang, title, src);
+            assert!(
+                chunks.iter().any(|c| c.body.contains(marker)),
+                "{title}: marker {marker:?} missing from any chunk: {chunks:#?}"
+            );
+        }
+    }
+
+    #[test]
     fn chunk_plain_text_does_not_treat_comments_as_headings() {
         // A markdown pass would read `# syntax=...` as an H1 and split the
         // crumb tree on it; chunk_plain_text must not.
