@@ -3,7 +3,7 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
-## [Unreleased]
+## [0.14.0] - 2026-07-10
 ### Changed
 - **Ranking now favours fresh and preventer-type memories.** Recency is on
   by default (`scoring.recency_alpha` 0.0 → 0.4), so a current fact outranks

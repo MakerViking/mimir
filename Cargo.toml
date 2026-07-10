@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.13.0"
+version = "0.14.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/MakerViking/mimir"
@@ -15,10 +15,10 @@ authors = ["Thomas H"]
 # mimir-syntax holds language-adapter/tree-sitter extraction with no dependency
 # on mimir-core, so mimir-core can use it (for code-chunk indexing) without a
 # cycle back through mimir-graph (which itself depends on mimir-core).
-mimir-core = { path = "crates/mimir-core", package = "mimir-mem-core", version = "0.13.0" }
-mimir-syntax = { path = "crates/mimir-syntax", version = "0.13.0" }
-mimir-graph = { path = "crates/mimir-graph", version = "0.13.0" }
-mimir-proxy = { path = "crates/mimir-proxy", package = "mimir-mem-proxy", version = "0.13.0" }
+mimir-core = { path = "crates/mimir-core", package = "mimir-mem-core", version = "0.14.0" }
+mimir-syntax = { path = "crates/mimir-syntax", version = "0.14.0" }
+mimir-graph = { path = "crates/mimir-graph", version = "0.14.0" }
+mimir-proxy = { path = "crates/mimir-proxy", package = "mimir-mem-proxy", version = "0.14.0" }
 
 rusqlite = { version = "0.40", features = ["bundled", "functions"] }
 serde = { version = "1", features = ["derive"] }
