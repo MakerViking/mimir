@@ -200,6 +200,28 @@ mimir export > backup.jsonl       # everything, always yours
 claude mcp add --scope user mimir -- mimir mcp
 ```
 
+### The fast path (recommended setup)
+
+Three commands get you the lowest-latency configuration Mimir has — measured
+on the same machine as the benchmark above:
+
+```bash
+mimir daemon &                        # warm engine: /inject answers in ~7 ms
+mimir init --hooks --auto-recall      # per-prompt recall via the warm path
+mimir doctor                          # confirms "daemon: warm (...)"
+```
+
+- **With the daemon running**, every auto-recall injection is served warm
+  (~7 ms) with full hybrid BM25+vector search.
+- **Without it**, the hook falls back to the cold CLI path, which defaults
+  to `cold_mode = "fast"` — still ~5–6 ms, lexical + identifier matching
+  only (semantic-only matches wait for the daemon).
+- Either way the engine's own warm recall is single-digit ms; there is no
+  configuration in which the hook blocks your prompt for half a second.
+
+To keep the daemon across reboots, install the systemd user unit:
+`cp contrib/mimir-daemon.service ~/.config/systemd/user/ && systemctl --user enable --now mimir-daemon`.
+
 ### Already have a memory system?
 
 Don't start from zero — migrate, verify, then retire the old one.
