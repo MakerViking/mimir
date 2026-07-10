@@ -8,7 +8,9 @@
 use std::path::PathBuf;
 
 use fastembed::{
-    EmbeddingModel, RerankInitOptions, RerankerModel, TextEmbedding, TextInitOptions, TextRerank,
+    EmbeddingModel, InitOptionsUserDefined, RerankInitOptions, RerankInitOptionsUserDefined,
+    RerankerModel, TextEmbedding, TextInitOptions, TextRerank, TokenizerFiles,
+    UserDefinedEmbeddingModel, UserDefinedRerankingModel,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -65,18 +67,102 @@ pub const EMBED_BATCH: usize = 64;
 /// Kinds whose body participates in semantic recall.
 pub const EMBEDDABLE_KINDS: &str = "'memory', 'chunk', 'annotation', 'symbol', 'codechunk'";
 
-pub fn model_from_name(name: &str) -> Result<EmbeddingModel> {
+/// Where a named model's weights come from. Registry models are covered by
+/// fastembed's own built-in downloader; anything else (e.g. granite, wave-2
+/// item #8's A/B candidate) we fetch and load ourselves via fastembed's
+/// user-defined-model path — see `fetch_granite_files` / `load_granite`.
+enum ModelSource {
+    Registry(EmbeddingModel),
+    Granite,
+}
+
+fn model_from_name(name: &str) -> Result<ModelSource> {
     Ok(match name {
         // Quantized ONNX port: 384-dim, ~34 MB — the default.
-        "bge-small-en-v1.5" | "bge-small-en-v1.5-q" => EmbeddingModel::BGESmallENV15Q,
-        "bge-base-en-v1.5" => EmbeddingModel::BGEBaseENV15,
-        "all-minilm-l6-v2" => EmbeddingModel::AllMiniLML6V2,
+        "bge-small-en-v1.5" | "bge-small-en-v1.5-q" => {
+            ModelSource::Registry(EmbeddingModel::BGESmallENV15Q)
+        }
+        "bge-base-en-v1.5" => ModelSource::Registry(EmbeddingModel::BGEBaseENV15),
+        "all-minilm-l6-v2" => ModelSource::Registry(EmbeddingModel::AllMiniLML6V2),
+        // Not in fastembed's registry (ModernBERT architecture). 384-dim,
+        // same as bge-small — evaluated as a candidate replacement (wave-2
+        // item #8) but NOT the default; selecting it is opt-in via
+        // `mimir.toml`'s `embedding.model`.
+        "granite-embedding-small-r2" => ModelSource::Granite,
         other => {
             return Err(Error::Invalid(format!(
                 "unknown embedding model '{other}' (try bge-small-en-v1.5)"
             )))
         }
     })
+}
+
+const GRANITE_REPO: &str = "onnx-community/granite-embedding-small-english-r2-ONNX";
+const GRANITE_ONNX_FILE: &str = "onnx/model_quantized.onnx";
+const GRANITE_ONNX_DATA_FILE: &str = "onnx/model_quantized.onnx_data";
+// Basename only: this is what the graph in GRANITE_ONNX_FILE references its
+// external-data companion by, not the repo-relative path used to fetch it.
+const GRANITE_ONNX_DATA_BASENAME: &str = "model_quantized.onnx_data";
+const GRANITE_TOKENIZER_FILES: [&str; 4] = [
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+];
+
+/// Fetch (or reuse already-cached) granite files into `paths.models_dir`,
+/// using the same hf-hub cache convention fastembed's own registry
+/// downloads use — so this coexists on disk with registry models rather
+/// than adding a second cache layout. `allow_download = false` is only
+/// reached here once the caller's marker-file gate already passed, mirroring
+/// the registry path's semantics: a silent load still trusts the cache.
+fn fetch_granite_files(
+    paths: &Paths,
+    allow_download: bool,
+) -> Result<(PathBuf, PathBuf, [PathBuf; 4])> {
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_cache_dir(paths.models_dir.clone())
+        .with_progress(allow_download)
+        .build()
+        .map_err(|e| Error::Embed(format!("hf-hub client: {e}")))?;
+    let repo = api.model(GRANITE_REPO.to_string());
+    let get = |file: &str| -> Result<PathBuf> {
+        repo.get(file)
+            .map_err(|e| Error::Embed(format!("downloading {GRANITE_REPO}/{file}: {e}")))
+    };
+    let onnx_file = get(GRANITE_ONNX_FILE)?;
+    let onnx_data_file = get(GRANITE_ONNX_DATA_FILE)?;
+    let tokenizer = [
+        get(GRANITE_TOKENIZER_FILES[0])?,
+        get(GRANITE_TOKENIZER_FILES[1])?,
+        get(GRANITE_TOKENIZER_FILES[2])?,
+        get(GRANITE_TOKENIZER_FILES[3])?,
+    ];
+    Ok((onnx_file, onnx_data_file, tokenizer))
+}
+
+/// Load granite via fastembed's user-defined-model path: unlike the
+/// registry path, fastembed does no downloading/caching for us here, so
+/// `fetch_granite_files` does that part first.
+fn load_granite(paths: &Paths, device: &str, allow_download: bool) -> Result<TextEmbedding> {
+    let (onnx_path, onnx_data_path, tok) = fetch_granite_files(paths, allow_download)?;
+    let read = |p: &PathBuf| -> Result<Vec<u8>> { std::fs::read(p).map_err(|e| Error::io(p, e)) };
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: read(&tok[0])?,
+        config_file: read(&tok[1])?,
+        special_tokens_map_file: read(&tok[2])?,
+        tokenizer_config_file: read(&tok[3])?,
+    };
+    let model = UserDefinedEmbeddingModel::new(read(&onnx_path)?, tokenizer_files)
+        // external-data ONNX: the graph file references its weights buffer
+        // by this basename (onnx-community's export layout).
+        .with_external_initializer(GRANITE_ONNX_DATA_BASENAME.to_string(), read(&onnx_data_path)?);
+    // Pooling: left at fastembed's default (Cls). Granite's own
+    // 1_Pooling/config.json specifies pooling_mode_cls_token, NOT
+    // config.json's unrelated classifier_pooling field — verified against
+    // IBM's original sentence-transformers repo before trusting it.
+    let options = InitOptionsUserDefined::new().with_execution_providers(execution_providers(device));
+    TextEmbedding::try_new_from_user_defined(model, options).map_err(|e| Error::Embed(e.to_string()))
 }
 
 /// Marker written after the first successful model load; its presence is
@@ -107,11 +193,16 @@ impl Embedder {
         }
         let which = model_from_name(name)?;
         std::fs::create_dir_all(&paths.models_dir).map_err(|e| Error::io(&paths.models_dir, e))?;
-        let options = TextInitOptions::new(which)
-            .with_cache_dir(paths.models_dir.clone())
-            .with_execution_providers(execution_providers(device))
-            .with_show_download_progress(allow_download);
-        let mut model = TextEmbedding::try_new(options).map_err(|e| Error::Embed(e.to_string()))?;
+        let mut model = match which {
+            ModelSource::Registry(which) => {
+                let options = TextInitOptions::new(which)
+                    .with_cache_dir(paths.models_dir.clone())
+                    .with_execution_providers(execution_providers(device))
+                    .with_show_download_progress(allow_download);
+                TextEmbedding::try_new(options).map_err(|e| Error::Embed(e.to_string()))?
+            }
+            ModelSource::Granite => load_granite(paths, device, allow_download)?,
+        };
         let probe = model
             .embed(["dimension probe"], None)
             .map_err(|e| Error::Embed(e.to_string()))?;
@@ -141,19 +232,97 @@ impl Embedder {
     }
 }
 
-pub fn reranker_from_name(name: &str) -> Result<RerankerModel> {
+/// Where a named reranker's weights come from. Registry models are covered
+/// by fastembed's own built-in downloader; fastembed hardcodes the fp32
+/// `onnx/model.onnx` for jina-turbo, so the int8 variant of that same repo
+/// (not in the registry) is fetched and loaded ourselves via fastembed's
+/// user-defined-reranker path — see `fetch_jina_turbo_int8_files` /
+/// `load_jina_turbo_int8`.
+enum RerankerSource {
+    Registry(RerankerModel),
+    JinaTurboInt8,
+}
+
+fn reranker_from_name(name: &str) -> Result<RerankerSource> {
     Ok(match name {
         // ~150 MB, English, fast on CPU — the default.
-        "jina-reranker-v1-turbo-en" => RerankerModel::JINARerankerV1TurboEn,
-        "bge-reranker-base" => RerankerModel::BGERerankerBase,
-        "bge-reranker-v2-m3" => RerankerModel::BGERerankerV2M3,
-        "jina-reranker-v2-base-multilingual" => RerankerModel::JINARerankerV2BaseMultiligual,
+        "jina-reranker-v1-turbo-en" => {
+            RerankerSource::Registry(RerankerModel::JINARerankerV1TurboEn)
+        }
+        // Same repo/weights, int8-quantized (~38 MB): evaluated as a latency
+        // candidate against the fp32 default but NOT the default itself;
+        // selecting it is opt-in via `mimir.toml`'s `rerank.model`.
+        "jina-reranker-v1-turbo-en-int8" => RerankerSource::JinaTurboInt8,
+        "bge-reranker-base" => RerankerSource::Registry(RerankerModel::BGERerankerBase),
+        "bge-reranker-v2-m3" => RerankerSource::Registry(RerankerModel::BGERerankerV2M3),
+        "jina-reranker-v2-base-multilingual" => {
+            RerankerSource::Registry(RerankerModel::JINARerankerV2BaseMultiligual)
+        }
         other => {
             return Err(Error::Invalid(format!(
                 "unknown reranker model '{other}' (try jina-reranker-v1-turbo-en)"
             )))
         }
     })
+}
+
+const JINA_TURBO_INT8_REPO: &str = "jinaai/jina-reranker-v1-turbo-en";
+const JINA_TURBO_INT8_ONNX_FILE: &str = "onnx/model_int8.onnx";
+// Same 4 tokenizer files fastembed's own registry path pulls for this repo
+// (see fastembed's `load_tokenizer_hf_hub`) — reused verbatim here.
+const JINA_TOKENIZER_FILES: [&str; 4] = [
+    "tokenizer.json",
+    "config.json",
+    "special_tokens_map.json",
+    "tokenizer_config.json",
+];
+
+/// Fetch (or reuse already-cached) int8 jina-turbo files into
+/// `paths.models_dir`, same hf-hub cache convention as `fetch_granite_files`.
+fn fetch_jina_turbo_int8_files(
+    paths: &Paths,
+    allow_download: bool,
+) -> Result<(PathBuf, [PathBuf; 4])> {
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_cache_dir(paths.models_dir.clone())
+        .with_progress(allow_download)
+        .build()
+        .map_err(|e| Error::Embed(format!("hf-hub client: {e}")))?;
+    let repo = api.model(JINA_TURBO_INT8_REPO.to_string());
+    let get = |file: &str| -> Result<PathBuf> {
+        repo.get(file)
+            .map_err(|e| Error::Embed(format!("downloading {JINA_TURBO_INT8_REPO}/{file}: {e}")))
+    };
+    let onnx_file = get(JINA_TURBO_INT8_ONNX_FILE)?;
+    let tokenizer = [
+        get(JINA_TOKENIZER_FILES[0])?,
+        get(JINA_TOKENIZER_FILES[1])?,
+        get(JINA_TOKENIZER_FILES[2])?,
+        get(JINA_TOKENIZER_FILES[3])?,
+    ];
+    Ok((onnx_file, tokenizer))
+}
+
+/// Load int8 jina-turbo via fastembed's user-defined-reranker path. Unlike
+/// the embedding side's ModernBERT export, this ONNX file is self-contained
+/// (38 MB, well under the 2 GB protobuf external-data threshold) — no
+/// `.onnx_data` companion to fetch.
+fn load_jina_turbo_int8(paths: &Paths, device: &str, allow_download: bool) -> Result<TextRerank> {
+    let (onnx_path, tok) = fetch_jina_turbo_int8_files(paths, allow_download)?;
+    let read = |p: &PathBuf| -> Result<Vec<u8>> { std::fs::read(p).map_err(|e| Error::io(p, e)) };
+    let tokenizer_files = TokenizerFiles {
+        tokenizer_file: read(&tok[0])?,
+        config_file: read(&tok[1])?,
+        special_tokens_map_file: read(&tok[2])?,
+        tokenizer_config_file: read(&tok[3])?,
+    };
+    let model = UserDefinedRerankingModel::new(read(&onnx_path)?, tokenizer_files);
+    // RerankInitOptionsUserDefined is #[non_exhaustive] (no struct-literal
+    // construction outside fastembed) and exposes no `with_execution_providers`
+    // builder — its fields are still `pub`, so mutate the default in place.
+    let mut options = RerankInitOptionsUserDefined::default();
+    options.execution_providers = execution_providers(device);
+    TextRerank::try_new_from_user_defined(model, options).map_err(|e| Error::Embed(e.to_string()))
 }
 
 /// Cross-encoder for `recall --rerank`. Same marker-file download gate
@@ -172,11 +341,16 @@ impl Reranker {
         }
         let which = reranker_from_name(name)?;
         std::fs::create_dir_all(&paths.models_dir).map_err(|e| Error::io(&paths.models_dir, e))?;
-        let options = RerankInitOptions::new(which)
-            .with_cache_dir(paths.models_dir.clone())
-            .with_execution_providers(execution_providers(device))
-            .with_show_download_progress(allow_download);
-        let model = TextRerank::try_new(options).map_err(|e| Error::Embed(e.to_string()))?;
+        let model = match which {
+            RerankerSource::Registry(which) => {
+                let options = RerankInitOptions::new(which)
+                    .with_cache_dir(paths.models_dir.clone())
+                    .with_execution_providers(execution_providers(device))
+                    .with_show_download_progress(allow_download);
+                TextRerank::try_new(options).map_err(|e| Error::Embed(e.to_string()))?
+            }
+            RerankerSource::JinaTurboInt8 => load_jina_turbo_int8(paths, device, allow_download)?,
+        };
         std::fs::write(marker_path(paths, name), b"ok")
             .map_err(|e| Error::io(&paths.models_dir, e))?;
         Ok(Reranker {
@@ -354,6 +528,89 @@ mod tests {
     #[test]
     fn model_names() {
         assert!(model_from_name("bge-small-en-v1.5").is_ok());
+        assert!(model_from_name("granite-embedding-small-r2").is_ok());
         assert!(model_from_name("nonsense").is_err());
     }
+
+    #[test]
+    fn reranker_names() {
+        assert!(reranker_from_name("jina-reranker-v1-turbo-en").is_ok());
+        assert!(reranker_from_name("jina-reranker-v1-turbo-en-int8").is_ok());
+        assert!(reranker_from_name("nonsense").is_err());
+    }
+
+    /// Network test: exercises the actual production path (marker gate +
+    /// hf-hub download/cache + user-defined-model load), not just the raw
+    /// fastembed call the throwaway smoke example proved works. Ignored —
+    /// run explicitly with `cargo test -p mimir-mem-core --lib -- --ignored
+    /// granite_loads_via_production_path`.
+    #[test]
+    #[ignore]
+    fn granite_loads_via_production_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::under_root(tmp.path());
+
+        let t0 = std::time::Instant::now();
+        let mut embedder = Embedder::load(&paths, "granite-embedding-small-r2", "cpu", true)
+            .expect("granite should load via the hf-hub download plumbing");
+        eprintln!("cold load: {:?}", t0.elapsed());
+
+        assert_eq!(embedder.dim, 384);
+        assert!(model_ready(&paths, "granite-embedding-small-r2"));
+
+        let out = embedder
+            .embed(vec!["what does retry_with_backoff do".to_string()])
+            .unwrap();
+        let norm: f32 = out[0].iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-4, "Embedder::embed must L2-normalize");
+
+        // Marker present now — a silent (non-downloading) reload must succeed
+        // purely from the hf-hub cache, same contract as the registry path.
+        let t1 = std::time::Instant::now();
+        Embedder::load(&paths, "granite-embedding-small-r2", "cpu", false)
+            .expect("cached granite should reload without allow_download");
+        eprintln!("warm cache reload: {:?}", t1.elapsed());
+    }
+
+    /// Network test, same shape as `granite_loads_via_production_path` but
+    /// for the int8 jina-turbo reranker: marker gate, hf-hub download/cache,
+    /// and a user-defined-reranker load, then a sanity rerank call. Ignored —
+    /// run explicitly with `cargo test -p mimir-mem-core --lib -- --ignored
+    /// jina_turbo_int8_loads_via_production_path`.
+    #[test]
+    #[ignore]
+    fn jina_turbo_int8_loads_via_production_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = crate::config::Paths::under_root(tmp.path());
+
+        let t0 = std::time::Instant::now();
+        let mut reranker =
+            Reranker::load(&paths, "jina-reranker-v1-turbo-en-int8", "cpu", true)
+                .expect("int8 jina-turbo should load via the hf-hub download plumbing");
+        eprintln!("cold load: {:?}", t0.elapsed());
+        assert!(model_ready(&paths, "jina-reranker-v1-turbo-en-int8"));
+
+        // Obviously-relevant doc must outrank an obviously-irrelevant one.
+        let results = reranker
+            .rerank(
+                "what does retry_with_backoff do",
+                vec![
+                    "retry_with_backoff retries the operation with exponential backoff \
+                     between attempts"
+                        .to_string(),
+                    "the quarterly bake sale raised money for the school".to_string(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(results[0].0, 0, "relevant doc should rank first");
+
+        // Marker present now — a silent (non-downloading) reload must succeed
+        // purely from the hf-hub cache, same contract as the registry path.
+        let t1 = std::time::Instant::now();
+        Reranker::load(&paths, "jina-reranker-v1-turbo-en-int8", "cpu", false)
+            .expect("cached int8 jina-turbo should reload without allow_download");
+        eprintln!("warm cache reload: {:?}", t1.elapsed());
+    }
 }
+
+

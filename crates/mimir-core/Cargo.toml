@@ -37,6 +37,7 @@ directories.workspace = true
 ulid.workspace = true
 blake3.workspace = true
 fastembed.workspace = true
+hf-hub.workspace = true
 ignore.workspace = true
 ort.workspace = true
 rayon.workspace = true
