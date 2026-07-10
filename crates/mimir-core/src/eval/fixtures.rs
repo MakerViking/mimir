@@ -1,11 +1,12 @@
 //! Hand-authored corpus + labeled question set for the eval harness.
 //!
-//! The corpus spans four question categories: code-structure (symbols),
+//! The corpus spans six question categories: code-structure (symbols),
 //! code-behavior (what code/docs say a piece of the system does),
-//! gotcha-decision (a memory documenting a fact or a choice), and
+//! gotcha-decision (a memory documenting a fact or a choice),
 //! drift-preventer (a memory documenting a past mistake and its fix, so an
-//! agent doesn't repeat it). A few fixtures are pure distractors, targeted
-//! by no question, to keep precision meaningful.
+//! agent doesn't repeat it), code-vs-memory (scenario family 5), and
+//! identifier-lookup (scenario family 5b). A few fixtures are pure
+//! distractors, targeted by no question, to keep precision meaningful.
 //!
 //! Fixtures are grouped into `topic` clusters. Real-model mode ignores
 //! `topic` entirely (it embeds the actual text); hermetic mode uses it to
@@ -38,7 +39,17 @@
 //!    has an automated regression guard instead of only a manual smoke
 //!    test. Ground truth is always the memory: a human asking a behavior
 //!    question wants the curated "why," not a raw function body, even when
-//!    the code matches just as well lexically.
+//!    the code matches just as well lexically. The question is phrased
+//!    conceptually (no literal identifier) on purpose — see 5b.
+//!    5b. **Identifier lookup** (same fixtures as 5, different question) — a
+//!    query naming the literal identifier `retry_with_backoff`, regression
+//!    guard for the identifier-exact RRF leg (`search/mod.rs`). Ground
+//!    truth flips to the function body here: an identifier-explicit
+//!    mechanics question ("what does `retry_with_backoff` do with the
+//!    attempt number") has a genuinely different human-correct answer than
+//!    5's conceptual phrasing of the same topic — conflating the two in one
+//!    fixture pair previously made the identifier leg's landing look like a
+//!    5-regression when it was actually working as intended.
 //! 6. **Cross-kind recency** (`mem_gotcha_wal_autocheckpoint` +
 //!    `chunk_wal_docs_overview` + `code_wal_open_fn`) — a year-old gotcha
 //!    that is still the correct answer, competing against a fresh doc chunk
@@ -47,6 +58,12 @@
 //!    not enjoy `recency_alpha` just for being newer — this is the
 //!    regression guard for that gating (see `learn::half_life_days` callers
 //!    in `search/mod.rs`). Ground truth is always the gotcha.
+//!
+//! A separate corpus-reusing question set, [`InjectQuestion`], drives the
+//! preventer end-to-end eval (`eval::mod`'s `run_inject_eval_*`): it scores
+//! the actual `inject::select_injection` decision (inject the right thing,
+//! or correctly stay silent) rather than a raw ranked list. See its docs
+//! for scenario family 7 (client-side git enrichment).
 //!
 //! Labels in every scenario are "what a human would say is the correct
 //! answer," authored before looking at how the current ranking scores it.
@@ -706,8 +723,10 @@ const FIXTURES: &[Fixture] = &[
     // manual smoke test. All three fixtures share one topic (so hermetic
     // mode gives them near-identical synthetic vectors — ranking has to be
     // decided by the BM25 leg + code_damp, not vector distance) and real
-    // vocabulary overlap ("transient", "retry", "backoff", "sync"). Ground
-    // truth is always the memory (see module docs, family 5).
+    // vocabulary overlap ("transient", "retry", "backoff", "sync"). Also
+    // backs family 5b's identifier-lookup question below, where ground
+    // truth flips to `code_retry_backoff_fn` (see module docs, families
+    // 5 & 5b).
     Fixture {
         key: "mem_decision_retry_backoff",
         kind: Kind::Memory,
@@ -1348,10 +1367,29 @@ const QUESTIONS: &[Question] = &[
         set: QuestionSet::Holdout,
     },
     // ---- Scenario family 5: code-vs-memory tie (code_damp regression guard) ----
+    // Conceptual phrasing, deliberately no literal identifier — see module
+    // docs, family 5 vs. 5b. Naming `retry_with_backoff` here would let the
+    // identifier-exact RRF leg promote the code chunks and defeat the
+    // code_damp guard this question exists to exercise.
     Question {
-        query: "what does retry_with_backoff do with the attempt number to compute how long it waits",
+        query: "what's our policy for retrying a sync failure and how long does it wait \
+                between attempts",
         category: Category::CodeVsMemory,
         relevant: &["mem_decision_retry_backoff"],
+        topic: "retry_backoff_tie",
+        set: QuestionSet::Tuning,
+    },
+    // ---- Scenario family 5b: identifier lookup (identifier RRF leg guard) ----
+    // Same fixtures as family 5, but the query DOES name the literal
+    // identifier — ground truth flips to the function body (see module
+    // docs). Guards the identifier leg the same way family 5 guards
+    // code_damp: an identifier-explicit mechanics question is a genuinely
+    // different human-correct answer, not a fixture-tuning trick.
+    Question {
+        query: "what does retry_with_backoff do with the attempt number to compute how long \
+                it waits",
+        category: Category::IdentifierLookup,
+        relevant: &["code_retry_backoff_fn"],
         topic: "retry_backoff_tie",
         set: QuestionSet::Tuning,
     },
@@ -1371,4 +1409,178 @@ pub fn questions() -> &'static [Question] {
 
 pub fn relevant_ids(ids: &FixtureIds, q: &Question) -> HashSet<i64> {
     q.relevant.iter().map(|k| ids[k]).collect()
+}
+
+/// One question for the preventer end-to-end eval (`eval::mod`'s
+/// `run_inject_eval_*`): unlike [`Question`], which scores a raw ranked
+/// list, this scores the actual product decision — does
+/// `inject::select_injection` fire, and on the right node? Reuses the same
+/// corpus (`FIXTURES` above), no new fixture nodes.
+pub struct InjectQuestion {
+    pub query: &'static str,
+    /// Simulated `git diff --name-only HEAD` path-stems for this prompt
+    /// (scenario family 7 only; empty everywhere else). See `inject.rs`'s
+    /// enrichment guard docs — these strengthen the search query and can
+    /// count toward the overlap floor, but must never *alone* clear it.
+    pub enrich: &'static [&'static str],
+    /// `true` = a labeled preventer exists and injecting it is correct;
+    /// `false` = staying silent is correct (either the only relevant hit is
+    /// a non-preventer kind, or nothing in the corpus is relevant at all).
+    pub expects_injection: bool,
+    /// Fixture keys acceptable as the injected node when
+    /// `expects_injection`. Empty when `expects_injection` is false.
+    pub acceptable: &'static [&'static str],
+    /// Same role as [`Question::topic`]: anchors the hermetic synthetic
+    /// query vector. For negative questions this is chosen so the vector
+    /// leg does NOT cluster near any preventer memory, so a false positive
+    /// can only come from a real floor bug, not an accidental hermetic
+    /// vector coincidence.
+    pub topic: &'static str,
+}
+
+const INJECT_QUESTIONS: &[InjectQuestion] = &[
+    // ---- Positive: a labeled gotcha/decision exists; injecting it is
+    // correct. Reuses Core + scenario-family query phrasing so this eval
+    // and the ranking eval stay honest about what "correct" means for the
+    // same prompts.
+    InjectQuestion {
+        query: "why should git hooks never be skipped with no-verify",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_drift_no_verify"],
+        topic: "no_verify_hooks",
+    },
+    InjectQuestion {
+        query: "what should I be careful about when logging request data",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_gotcha_log_redaction"],
+        topic: "log_redaction",
+    },
+    InjectQuestion {
+        query: "how does migration order get decided",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_gotcha_migration_order"],
+        topic: "migration_order",
+    },
+    InjectQuestion {
+        query: "what's our policy on flaky or ignored tests",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_gotcha_test_flake"],
+        topic: "flaky_tests",
+    },
+    InjectQuestion {
+        query: "why does the WAL file keep growing and never shrink back down",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_gotcha_wal_autocheckpoint"],
+        topic: "wal_growth",
+    },
+    InjectQuestion {
+        query: "why was reciprocal rank fusion chosen over a learned reranker",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_decision_rrf"],
+        topic: "rrf_decision",
+    },
+    InjectQuestion {
+        query: "what's our current policy on SQLite connection pooling",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_decision_pool_new"],
+        topic: "pool_decision",
+    },
+    InjectQuestion {
+        query: "anything I should watch out for before I start working in this repo",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_drift_no_verify", "mem_drift_matrix_cache", "mem_drift_force_push"],
+        topic: "force_push_gotcha",
+    },
+    InjectQuestion {
+        query: "what should I know about past mistakes in the search or storage code before I touch it",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_drift_matrix_cache"],
+        topic: "matrix_cache",
+    },
+    // Short prompt (2 non-stopword tokens: "force-push", "risk") — below
+    // MIN_OVERLAP=2 needs BOTH its non-stopword tokens to land in the hay,
+    // which "risk" alone won't (the fixture never uses that word); this is
+    // the honest case scenario-family-7's short-prompt relaxation targets.
+    InjectQuestion {
+        query: "force-push risk?",
+        enrich: &[],
+        expects_injection: true,
+        acceptable: &["mem_drift_force_push"],
+        topic: "force_push_gotcha",
+    },
+    // ---- Negative: the only relevant fixture is a non-preventer kind
+    // (rule 1 correctly blocks it) — staying silent is the correct call.
+    InjectQuestion {
+        query: "how do I make the CLI print JSON instead of a table",
+        enrich: &[],
+        expects_injection: false,
+        acceptable: &[],
+        topic: "cli_json_flag",
+    },
+    InjectQuestion {
+        query: "does the MCP server open a network port",
+        enrich: &[],
+        expects_injection: false,
+        acceptable: &[],
+        topic: "mcp_transport",
+    },
+    InjectQuestion {
+        query: "how do I control whether Mimir uses the GPU for embeddings",
+        enrich: &[],
+        expects_injection: false,
+        acceptable: &[],
+        topic: "device_config",
+    },
+    InjectQuestion {
+        query: "what license is this project released under",
+        enrich: &[],
+        expects_injection: false,
+        acceptable: &[],
+        topic: "license",
+    },
+    // ---- Negative: nothing in the corpus is relevant at all.
+    InjectQuestion {
+        query: "please refactor this function to be more readable",
+        enrich: &[],
+        expects_injection: false,
+        acceptable: &[],
+        topic: "filler_01",
+    },
+    // ---- Scenario family 7: client-side git enrichment ----
+    // "Anchor prompt" is deliberately generic (low/no lexical overlap with
+    // any memory on its own); enrichment stems come from a simulated
+    // `git diff --name-only HEAD` in a repo that's mid-edit on the matrix
+    // cache code. Ground truth is the gotcha that code touches.
+    InjectQuestion {
+        query: "anything I should know before touching this?",
+        enrich: &["vector", "cache"],
+        expects_injection: true,
+        acceptable: &["mem_drift_matrix_cache"],
+        topic: "matrix_cache",
+    },
+    // Guard case: enrichment terms alone reach the overlap floor against a
+    // DIFFERENT, unrelated memory (migration_order) — chosen so the query's
+    // topic anchor keeps the vector leg from ever agreeing with it. Zero
+    // raw-prompt overlap + no vector agreement must mean the enrichment
+    // can't self-license an injection; this must stay silent.
+    InjectQuestion {
+        query: "let's get started",
+        enrich: &["migration", "order"],
+        expects_injection: false,
+        acceptable: &[],
+        topic: "editor_support",
+    },
+];
+
+pub fn inject_questions() -> &'static [InjectQuestion] {
+    INJECT_QUESTIONS
 }

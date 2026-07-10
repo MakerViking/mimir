@@ -33,7 +33,8 @@ use rusqlite::Connection;
 
 use crate::db;
 use crate::error::Result;
-use crate::model::Scope;
+use crate::inject;
+use crate::model::{Kind, Scope};
 use crate::search::{self, SearchQuery};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -46,6 +47,14 @@ pub enum Category {
     /// same topic — regression guard for `scoring.code_damp` (see
     /// `fixtures` docs, scenario family 5).
     CodeVsMemory,
+    /// A query naming a literal identifier (`retry_with_backoff`, not "the
+    /// retry waiting strategy") — regression guard for the identifier-exact
+    /// RRF leg (see `fixtures` docs, scenario family 5b). Ground truth is
+    /// the function body: an identifier-explicit mechanics question has a
+    /// different human-correct answer than `CodeVsMemory`'s conceptual
+    /// phrasing of the same topic, so the two guards must stay separate
+    /// rather than sharing one fixture pair.
+    IdentifierLookup,
 }
 
 impl Category {
@@ -56,16 +65,18 @@ impl Category {
             Category::GotchaDecision => "gotcha-decision",
             Category::DriftPreventer => "drift-preventer",
             Category::CodeVsMemory => "code-vs-memory",
+            Category::IdentifierLookup => "identifier-lookup",
         }
     }
 }
 
-const ALL_CATEGORIES: [Category; 5] = [
+const ALL_CATEGORIES: [Category; 6] = [
     Category::CodeStructure,
     Category::CodeBehavior,
     Category::GotchaDecision,
     Category::DriftPreventer,
     Category::CodeVsMemory,
+    Category::IdentifierLookup,
 ];
 
 /// Which slice of the question set a [`fixtures::Question`] belongs to.
@@ -231,6 +242,166 @@ fn build_result(k: usize, rows: Vec<(Category, QuestionSet, Metrics)>) -> EvalRe
     EvalResult { by_category, by_set }
 }
 
+/// Confusion counts for the **preventer end-to-end eval**: unlike
+/// [`EvalResult`] above (which scores a raw ranked list against a relevant
+/// set), this scores the actual product decision —
+/// `inject::select_injection`'s call to inject or stay silent — against
+/// [`fixtures::InjectQuestion`]'s labels. `injected_wrong` is the cell that
+/// matters most: an injected memory actively misleads the agent, which is
+/// worse than staying silent (see `inject.rs` module docs), so a floor
+/// change that raises `injected_wrong` at all must be backed out regardless
+/// of what it does to the other three cells.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct InjectConfusion {
+    /// A labeled preventer existed and the right one was injected.
+    pub injected_correct: usize,
+    /// No relevant preventer existed (or the only relevant hit was a
+    /// non-preventer kind) and the floor correctly stayed silent.
+    pub silent_correct: usize,
+    /// Something was injected that wasn't the labeled preventer, or nothing
+    /// was labeled relevant at all — the worst cell.
+    pub injected_wrong: usize,
+    /// A labeled preventer existed but the floor stayed silent.
+    pub silent_wrong: usize,
+}
+
+impl InjectConfusion {
+    pub fn print(&self, title: &str) {
+        println!("\n{title}");
+        println!(
+            "  injected-correct: {:>3}    silent-correct: {:>3}",
+            self.injected_correct, self.silent_correct
+        );
+        println!(
+            "  injected-wrong:   {:>3}    silent-wrong:   {:>3}   (injected-wrong must never rise)",
+            self.injected_wrong, self.silent_wrong
+        );
+    }
+}
+
+/// Runs every [`fixtures::InjectQuestion`] through the same search shape
+/// `inject::compute` uses (`kinds: [Memory]`, `limit: 5`, config-default
+/// scoring weights), then hands the raw hits/legs to
+/// `inject::select_injection` — the exact pure decision core the hook uses
+/// in production — and classifies the outcome against the question's
+/// label. Shared by hermetic and real-model modes, same split as
+/// `evaluate_all`.
+fn evaluate_inject_all(
+    conn: &Connection,
+    ids: &fixtures::FixtureIds,
+    model: &str,
+    mut query_vec: impl FnMut(&str) -> Result<Vec<f32>>,
+) -> Result<InjectConfusion> {
+    let scoring = crate::config::ScoringConfig::default();
+    let mut cache = None;
+    let mut confusion = InjectConfusion::default();
+    for q in fixtures::inject_questions() {
+        let qvec = query_vec(q.query)?;
+        let enrich = q.enrich.join(" ");
+        let search_text = if enrich.is_empty() {
+            q.query.to_string()
+        } else {
+            format!("{} {enrich}", q.query)
+        };
+        let query = SearchQuery {
+            text: search_text,
+            scope: Scope::All,
+            kinds: vec![Kind::Memory],
+            since: None,
+            limit: 5,
+            strength_alpha: scoring.strength_alpha,
+            recency_alpha: scoring.recency_alpha,
+            type_prior_alpha: scoring.type_prior_alpha,
+            code_damp: scoring.code_damp,
+            include_superseded: false,
+        };
+        let (hits, legs) =
+            search::search_hybrid_with_legs(conn, &query, Some((model, &qvec)), &mut cache)?;
+        match inject::select_injection(&hits, q.query, &enrich, &legs) {
+            Some(hit) => {
+                let key = fixtures::key_for_id(ids, hit.node.id);
+                if q.expects_injection && q.acceptable.contains(&key) {
+                    confusion.injected_correct += 1;
+                } else {
+                    confusion.injected_wrong += 1;
+                }
+            }
+            None => {
+                if q.expects_injection {
+                    confusion.silent_wrong += 1;
+                } else {
+                    confusion.silent_correct += 1;
+                }
+            }
+        }
+    }
+    Ok(confusion)
+}
+
+/// Hermetic preventer eval: synthetic vectors, keyed off `InjectQuestion::topic`
+/// same as `run_hermetic`. Safe for normal `cargo test`.
+pub fn run_inject_eval_hermetic() -> Result<InjectConfusion> {
+    let conn = db::open_in_memory()?;
+    let ids = fixtures::insert_fixture_nodes(&conn)?;
+    fixtures::seed_synthetic_vectors(&conn, &ids)?;
+    let topic_by_query: std::collections::HashMap<&str, &str> = fixtures::inject_questions()
+        .iter()
+        .map(|q| (q.query, q.topic))
+        .collect();
+    evaluate_inject_all(&conn, &ids, fixtures::SYNTHETIC_MODEL, |query| {
+        Ok(fixtures::synthetic_query_vector(topic_by_query[query], query))
+    })
+}
+
+/// Model name for real-model eval runs: `MIMIR_EVAL_MODEL` overrides the
+/// configured default, so an A/B (e.g. granite vs bge-small, wave-2 item #8)
+/// can run against a second model without touching `mimir.toml`. Unset →
+/// identical behavior to before this existed (the configured default).
+#[cfg(feature = "eval")]
+fn eval_model_name(config: &crate::config::Config) -> String {
+    std::env::var("MIMIR_EVAL_MODEL").unwrap_or_else(|_| config.embedding.model.clone())
+}
+
+/// Real-model counterpart to [`run_inject_eval_hermetic`]: identical
+/// corpus/questions, embedded with the configured default model. `None`
+/// (not an error) when the model isn't downloaded locally.
+#[cfg(feature = "eval")]
+pub fn run_inject_eval_real_model() -> Result<Option<InjectConfusion>> {
+    use rusqlite::params;
+
+    use crate::config::{Config, Paths};
+    use crate::embed::{self, Embedder};
+
+    let paths = Paths::resolve()?;
+    let config = Config::load(&paths.config_file)?;
+    let model_name = eval_model_name(&config);
+    if !embed::model_ready(&paths, &model_name) {
+        println!(
+            "eval: model '{model_name}' not downloaded; set `embedding.model = \"{model_name}\"` \
+             in mimir.toml then run `mimir init` (or `mimir embed --fetch`); skipping \
+             real-model preventer eval"
+        );
+        return Ok(None);
+    }
+    let mut embedder = Embedder::load(&paths, &model_name, &config.embedding.device, false)?;
+
+    let conn = db::open_in_memory()?;
+    let ids = fixtures::insert_fixture_nodes(&conn)?;
+    for (node_id, text) in fixtures::fixture_texts(&ids) {
+        let vec = embedder.embed(vec![text])?.remove(0);
+        conn.execute(
+            "INSERT INTO embedding (node_id, model, dim, vec, content_hash) \
+             VALUES (?1, ?2, ?3, ?4, x'00')",
+            params![node_id, embedder.name, embedder.dim as i64, embed::to_blob(&vec)],
+        )?;
+    }
+    let model_name = embedder.name.clone();
+    let confusion = evaluate_inject_all(&conn, &ids, &model_name, |query| {
+        Ok(embedder.embed(vec![query.to_string()])?.remove(0))
+    })?;
+    Ok(Some(confusion))
+}
+
 /// Hermetic baseline: synthetic vectors, no model, no network. Safe for
 /// normal `cargo test`.
 pub fn run_hermetic(k: usize) -> Result<EvalResult> {
@@ -245,8 +416,9 @@ pub fn run_hermetic(k: usize) -> Result<EvalResult> {
 }
 
 /// Real-model baseline: identical corpus, embedded with the configured
-/// default model. `Ok(None)` (not an error) when the model isn't
-/// downloaded locally — this mode never touches the network itself.
+/// default model (or `MIMIR_EVAL_MODEL`, see [`eval_model_name`]). `Ok(None)`
+/// (not an error) when the model isn't downloaded locally — this mode never
+/// touches the network itself.
 #[cfg(feature = "eval")]
 pub fn run_real_model(k: usize) -> Result<Option<EvalResult>> {
     use rusqlite::params;
@@ -256,15 +428,16 @@ pub fn run_real_model(k: usize) -> Result<Option<EvalResult>> {
 
     let paths = Paths::resolve()?;
     let config = Config::load(&paths.config_file)?;
-    if !embed::model_ready(&paths, &config.embedding.model) {
+    let model_name = eval_model_name(&config);
+    if !embed::model_ready(&paths, &model_name) {
         println!(
-            "eval: model '{}' not downloaded (run `mimir init` first); skipping real-model eval",
-            config.embedding.model
+            "eval: model '{model_name}' not downloaded; set `embedding.model = \"{model_name}\"` \
+             in mimir.toml then run `mimir init` (or `mimir embed --fetch`); skipping \
+             real-model eval"
         );
         return Ok(None);
     }
-    let mut embedder =
-        Embedder::load(&paths, &config.embedding.model, &config.embedding.device, false)?;
+    let mut embedder = Embedder::load(&paths, &model_name, &config.embedding.device, false)?;
 
     let conn = db::open_in_memory()?;
     let ids = fixtures::insert_fixture_nodes(&conn)?;
@@ -284,6 +457,7 @@ pub fn run_real_model(k: usize) -> Result<Option<EvalResult>> {
     Ok(Some(build_result(k, rows)))
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -299,7 +473,7 @@ mod tests {
     #[test]
     fn hermetic_scores_are_well_formed() {
         let result = run_hermetic(5).unwrap();
-        assert_eq!(result.by_category.len(), 6, "5 categories + overall");
+        assert_eq!(result.by_category.len(), 7, "6 categories + overall");
         assert_eq!(result.by_set.len(), 4, "core/tuning/holdout + overall");
         for r in result.by_category.iter().chain(&result.by_set) {
             assert!(r.n > 0, "{} has no questions", r.label);
@@ -313,6 +487,32 @@ mod tests {
             overall.mrr > 0.2,
             "hermetic MRR implausibly low ({}); harness or fixtures likely broken",
             overall.mrr
+        );
+    }
+
+    /// Regression guard for the preventer end-to-end eval itself: every
+    /// question must be accounted for in exactly one confusion cell, and
+    /// `injected_wrong` must be zero on the current (already-landed) floor.
+    /// This is the harness sanity check; `eval_inject_baseline_report`
+    /// below is the number to actually read/compare across floor changes.
+    #[test]
+    fn inject_eval_confusion_is_well_formed() {
+        let c = run_inject_eval_hermetic().unwrap();
+        let total = c.injected_correct + c.silent_correct + c.injected_wrong + c.silent_wrong;
+        assert_eq!(total, fixtures::inject_questions().len());
+        // Known baseline gap, not a floor bug: `mem_decision_pool_old` vs.
+        // `mem_decision_pool_new` (scenario family 1) share type Decision,
+        // topic, and overlap — the floor has no recency logic of its own
+        // (that's `scoring.recency_alpha`, owned by search/mod.rs, not
+        // this module), so an un-superseded stale decision ranked fused
+        // #1 clears the floor just as legitimately as the current one
+        // would. This is the one pre-existing `injected_wrong`; the bound
+        // is a regression guard against a *second* one appearing.
+        assert!(
+            c.injected_wrong <= 1,
+            "landed floor injected {} wrong preventer(s), expected at most the known \
+             recency-ranking gap (1)",
+            c.injected_wrong
         );
     }
 
@@ -331,6 +531,25 @@ mod tests {
         if let Some(result) = run_real_model(5).unwrap() {
             print_report("real model — by category (k=5)", &result.by_category);
             print_report("real model — by question set (k=5)", &result.by_set);
+        }
+    }
+
+    /// The number to actually read/compare across floor changes — run with
+    /// `cargo test -p mimir-mem-core eval:: -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn eval_inject_baseline_report() {
+        run_inject_eval_hermetic()
+            .unwrap()
+            .print("hermetic preventer end-to-end (synthetic vectors)");
+    }
+
+    #[cfg(feature = "eval")]
+    #[test]
+    #[ignore]
+    fn eval_inject_baseline_report_real_model() {
+        if let Some(c) = run_inject_eval_real_model().unwrap() {
+            c.print("real model preventer end-to-end");
         }
     }
 
@@ -401,16 +620,16 @@ mod tests {
 
         let paths = Paths::resolve().unwrap();
         let config = Config::load(&paths.config_file).unwrap();
-        if !embed::model_ready(&paths, &config.embedding.model) {
+        let model_name = eval_model_name(&config);
+        if !embed::model_ready(&paths, &model_name) {
             println!(
-                "eval: model '{}' not downloaded (run `mimir init` first); skipping",
-                config.embedding.model
+                "eval: model '{model_name}' not downloaded; set `embedding.model = \
+                 \"{model_name}\"` in mimir.toml then run `mimir init`; skipping"
             );
             return;
         }
-        let mut embedder =
-            Embedder::load(&paths, &config.embedding.model, &config.embedding.device, false)
-                .unwrap();
+        let mut embedder = Embedder::load(&paths, &model_name, &config.embedding.device, false)
+            .unwrap();
 
         let conn = db::open_in_memory().unwrap();
         let ids = fixtures::insert_fixture_nodes(&conn).unwrap();

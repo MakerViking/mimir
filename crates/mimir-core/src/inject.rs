@@ -22,11 +22,33 @@ pub const TOKEN_BUDGET: usize = 200;
 /// the candidate's title+body+tags. Always enforced — the cheapest,
 /// always-available half of the relevance floor (works with or without an
 /// embedding model).
+///
+/// **Short-prompt relaxation was tried and backed out** (measured on the
+/// hermetic eval, `eval::run_inject_eval_hermetic`): relaxing to a 1-token
+/// overlap for prompts under 4 non-stopword tokens — gated on rule 3
+/// (vector-leg agreement) also holding — fixed the intended case
+/// ("force-push risk?" now injects `mem_drift_force_push`) but also let an
+/// unrelated short prompt ("let's get started") clear the floor on a
+/// single coincidental token plus hermetic-vector agreement, injecting the
+/// wrong gotcha. Net effect on the same fixture snapshot: injected-wrong
+/// rose 1→2. Backed out per the product contract (silence beats wrong
+/// injection). A future attempt should tighten rule 3's bar (e.g. a
+/// vector-rank cutoff, not just top-`LEG_TOP_K` membership) before
+/// relaxing rule 2, rather than relaxing rule 2 alone.
 pub const MIN_OVERLAP: usize = 2;
 
 /// How deep into the vector leg's own ranking (not the fused rank) a hit
 /// must appear to count as "semantically agreed" for rule 3 below.
 pub const LEG_TOP_K: usize = 10;
+
+/// How many of the (fused-ranked) candidate hits `select_injection` scans
+/// before giving up. Measured at 3 (scanning past the fused #1 hit for one
+/// that clears the floor's stricter rules): it flipped one fixture case
+/// from silent-wrong to injected-wrong (a stale `pool_old` decision at rank
+/// 2 cleared the floor once the correct `pool_new` at rank 1 didn't) —
+/// worse per the product contract, so it was backed out. Kept at 1: the
+/// fused #1 hit is what the floor gates, full stop.
+pub const TOP_CANDIDATES: usize = 1;
 
 /// Compute at most one relevant-memory injection for `prompt` in `scope`,
 /// or `None` if nothing clears the relevance floor. Also logs the
@@ -48,19 +70,60 @@ pub const LEG_TOP_K: usize = 10;
 ///      leg ranks on `tags_text` at weight 3.0 — a hit can reach #1
 ///      *because of* its tags, and excluding them from the overlap check
 ///      let such hits clear the floor without actually matching the
-///      prompt's words.
+///      prompt's words. `enrich` (client-side git-diff stems, see
+///      `mimir-cli/src/commands.rs`) tokens count toward this overlap too,
+///      but can't carry it alone — see the `enrich` note on `compute`.
 ///   3. When a vector leg was actually computed (an embedding model is
 ///      loaded), the hit must ALSO appear in that leg's own top
 ///      `LEG_TOP_K` — lexical+semantic agreement, not just a lucky BM25
 ///      match. Skipped (not required) with no model: degrades cleanly to
 ///      rules 1+2 alone rather than refusing to ever fire.
-pub fn compute(mimir: &mut Mimir, prompt: &str, scope: Scope) -> Result<Option<String>> {
+///
+/// `enrich`: space-separated stems from the caller's working tree (e.g. changed
+/// file names from `git diff --name-only`), passed separately from `prompt`.
+/// It strengthens the search query text and can help meet rule 2's overlap —
+/// but a hit may never clear the floor on enrichment terms alone: at least
+/// one raw-prompt-token overlap or rule 3's vector agreement must also hold.
+/// Without this guard, enrichment would let *any* prompt on a branch that
+/// touches file X auto-inject every gotcha whose title happens to mention
+/// X, regardless of what the prompt actually asked.
+pub fn compute(mimir: &mut Mimir, prompt: &str, enrich: &str, scope: Scope) -> Result<Option<String>> {
+    compute_with_mode(mimir, prompt, enrich, scope, false)
+}
+
+/// Same as [`compute`], but when `bm25_only` is true, never touches the
+/// embedder (`Mimir::search_with_legs_bm25_only` instead of
+/// `search_with_legs`) — no `ensure_embedder` call, so a cold process
+/// skips the ONNX-load + matrix-load cost entirely. Used by the cold
+/// `mimir recall-inject` CLI path when config `[hooks] cold_mode = "fast"`
+/// (default). `compute` is a thin `bm25_only = false` wrapper so the warm
+/// `/inject` HTTP endpoint (`mcp.rs`, which stays resident and should
+/// always use the best available signal) keeps calling the unchanged
+/// 4-argument `compute` and behaves identically to before this existed.
+///
+/// With `bm25_only = true`, `legs` never has a `legs[1]` (vector) entry —
+/// the same shape `clears_floor`'s rule 3 and the self-licensing guard
+/// already handle for a model-less machine today (both check
+/// `legs.get(1)`, which is `None` here), so no floor-rule changes were
+/// needed for this mode; only routing which search variant is called.
+pub fn compute_with_mode(
+    mimir: &mut Mimir,
+    prompt: &str,
+    enrich: &str,
+    scope: Scope,
+    bm25_only: bool,
+) -> Result<Option<String>> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
         return Ok(None);
     }
+    let search_text = if enrich.trim().is_empty() {
+        prompt.to_string()
+    } else {
+        format!("{prompt} {enrich}")
+    };
     let query = SearchQuery {
-        text: prompt.to_string(),
+        text: search_text,
         scope,
         kinds: vec![Kind::Memory],
         since: None,
@@ -71,13 +134,14 @@ pub fn compute(mimir: &mut Mimir, prompt: &str, scope: Scope) -> Result<Option<S
         code_damp: mimir.config.scoring.code_damp,
         include_superseded: false,
     };
-    let (hits, legs) = mimir.search_with_legs(&query)?;
-    let Some(top) = hits.first() else {
+    let (hits, legs) = if bm25_only {
+        mimir.search_with_legs_bm25_only(&query)?
+    } else {
+        mimir.search_with_legs(&query)?
+    };
+    let Some(top) = select_injection(&hits, prompt, enrich, &legs) else {
         return Ok(None);
     };
-    if !clears_floor(top, prompt, &legs) {
-        return Ok(None);
-    }
 
     let projects = store::project_titles(&mimir.conn)?;
     let project_name = top
@@ -94,7 +158,11 @@ pub fn compute(mimir: &mut Mimir, prompt: &str, scope: Scope) -> Result<Option<S
 
     // Log the impression like a normal recall, so it feeds future ranking
     // (learn::record_shown / strength decay) same as an explicit recall.
-    let query_hash = blake3::hash(query.text.as_bytes());
+    // Hashed on the raw prompt, not the (possibly enriched) search text —
+    // enrichment is per-invocation working-tree state, not part of what the
+    // user asked, so it shouldn't fragment the impression key for the same
+    // question asked from different working-tree states.
+    let query_hash = blake3::hash(prompt.as_bytes());
     store::record_shown(
         &mimir.conn,
         query_hash.as_bytes(),
@@ -104,7 +172,25 @@ pub fn compute(mimir: &mut Mimir, prompt: &str, scope: Scope) -> Result<Option<S
     Ok(Some(text))
 }
 
-fn clears_floor(top: &Hit, prompt: &str, legs: &[Vec<i64>]) -> bool {
+/// Pure selection core: scans the top [`TOP_CANDIDATES`] fused hits and
+/// returns the first that clears [`clears_floor`], or `None`. Split out of
+/// [`compute`] so the eval harness (`eval::mod`'s preventer end-to-end
+/// scoring) can drive the exact same decision logic over fixture search
+/// results without a real `Mimir` engine (ONNX model, on-disk store) —
+/// only `compute`'s I/O shell (the search call, formatting, impression
+/// logging) needs one.
+pub fn select_injection<'h>(
+    hits: &'h [Hit],
+    prompt: &str,
+    enrich: &str,
+    legs: &[Vec<i64>],
+) -> Option<&'h Hit> {
+    hits.iter()
+        .take(TOP_CANDIDATES)
+        .find(|hit| clears_floor(hit, prompt, enrich, legs))
+}
+
+fn clears_floor(top: &Hit, prompt: &str, enrich: &str, legs: &[Vec<i64>]) -> bool {
     // Rule 1: preventer types, or explicitly pinned.
     let is_preventer = matches!(
         top.node.subkind.as_deref(),
@@ -116,8 +202,13 @@ fn clears_floor(top: &Hit, prompt: &str, legs: &[Vec<i64>]) -> bool {
 
     // Rule 2: minimum term overlap against title+body+tags (case/
     // punctuation-insensitive, via the same tokenizer the near-duplicate
-    // detector uses).
-    let prompt_tokens: HashSet<String> = memory::tokens(prompt)
+    // detector uses). `enrich` tokens are folded into the overlap count
+    // (see the self-licensing guard below, after rule 3).
+    let raw_tokens: HashSet<String> = memory::tokens(prompt)
+        .into_iter()
+        .filter(|t| !fts::is_stopword(t))
+        .collect();
+    let enrich_tokens: HashSet<String> = memory::tokens(enrich)
         .into_iter()
         .filter(|t| !fts::is_stopword(t))
         .collect();
@@ -128,21 +219,48 @@ fn clears_floor(top: &Hit, prompt: &str, legs: &[Vec<i64>]) -> bool {
         top.node.tags_text,
     );
     let hay_tokens: HashSet<String> = memory::tokens(&hay).into_iter().collect();
-    let overlap = prompt_tokens.intersection(&hay_tokens).count();
-    if overlap < MIN_OVERLAP {
+    let raw_overlap = raw_tokens.intersection(&hay_tokens).count();
+    let combined_overlap = raw_tokens
+        .union(&enrich_tokens)
+        .filter(|t| hay_tokens.contains(*t))
+        .count();
+    if combined_overlap < MIN_OVERLAP {
         return false;
     }
 
     // Rule 3: dual-leg agreement, only when a vector leg exists (legs[0] is
     // always FTS, legs[1] is vector iff a model embedded this query).
-    if let Some(vector_leg) = legs.get(1) {
-        let agrees = vector_leg
-            .iter()
-            .take(LEG_TOP_K)
-            .any(|id| *id == top.node.id);
-        if !agrees {
-            return false;
-        }
+    let vector_agrees = match legs.get(1) {
+        Some(vector_leg) => vector_leg.iter().take(LEG_TOP_K).any(|id| *id == top.node.id),
+        None => false,
+    };
+    if legs.get(1).is_some() && !vector_agrees {
+        return false;
+    }
+
+    // Self-licensing guard: if enrichment was load-bearing for rule 2 (raw
+    // prompt tokens alone didn't reach MIN_OVERLAP), enrichment can't also
+    // be the only thing backing up rule 3 — at least one raw-prompt-token
+    // overlap or confirmed vector agreement must independently hold. Silent
+    // beats wrong: a hit shouldn't clear the floor purely because the
+    // caller's working tree happens to touch a file whose name matches an
+    // unrelated gotcha's title.
+    //
+    // "Confirmed" vector agreement requires the vector leg to actually
+    // discriminate: a store small enough that every node fits within the
+    // leg's own top-`LEG_TOP_K` (e.g. a fresh project with a handful of
+    // memories) makes membership there true of *any* candidate, sighted or
+    // not — sandbox-tested (2-memory store): without this check, an
+    // unrelated prompt ("let's get started") on a branch that happened to
+    // touch two files matching an unrelated gotcha's title tokens cleared
+    // the floor purely on that trivial "agreement". Requiring the leg to
+    // be strictly larger than `LEG_TOP_K` before its agreement counts here
+    // closes that gap without touching rule 3's own (pre-existing,
+    // out-of-scope) behavior for the raw_overlap-driven path above.
+    let vector_leg_discriminates = legs.get(1).is_some_and(|l| l.len() > LEG_TOP_K);
+    let enrichment_was_needed = raw_overlap < MIN_OVERLAP;
+    if enrichment_was_needed && raw_overlap == 0 && !(vector_agrees && vector_leg_discriminates) {
+        return false;
     }
 
     true
@@ -201,6 +319,7 @@ mod tests {
         let out = compute(
             &mut mimir,
             "how does scram authentication normalization work",
+            "",
             Scope::All,
         )
         .unwrap();
@@ -221,6 +340,7 @@ mod tests {
         let out = compute(
             &mut mimir,
             "how does scram authentication normalization work",
+            "",
             Scope::All,
         )
         .unwrap();
@@ -241,7 +361,7 @@ mod tests {
             "remember to check this before shipping",
             &["scram", "nfkc", "normalization"],
         );
-        let out = compute(&mut mimir, "scram nfkc normalization", Scope::All).unwrap();
+        let out = compute(&mut mimir, "scram nfkc normalization", "", Scope::All).unwrap();
         assert!(out.is_some(), "tag overlap alone should clear rule 2");
     }
 
@@ -258,10 +378,118 @@ mod tests {
         let out = compute(
             &mut mimir,
             "please refactor this function to be more readable",
+            "",
             Scope::All,
         )
         .unwrap();
         assert!(out.is_none());
+    }
+
+    #[test]
+    fn enrichment_alone_cannot_clear_floor() {
+        // Prompt shares zero tokens with the hit; only the (simulated
+        // git-diff) enrichment terms overlap. Without a real embedding
+        // model (as here) rule 3 never agrees, so the self-licensing guard
+        // must block this — enrichment can strengthen a real match, not
+        // manufacture one on its own.
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        seed(
+            &mut mimir,
+            MemoryType::Gotcha,
+            "WAL autocheckpoint pathological growth",
+            "always run PRAGMA wal_checkpoint before assuming corruption",
+            &[],
+        );
+        let out = compute(
+            &mut mimir,
+            "let's get started",
+            "wal autocheckpoint",
+            Scope::All,
+        )
+        .unwrap();
+        assert!(out.is_none(), "enrichment-only overlap must not self-license an injection");
+    }
+
+    #[test]
+    fn enrichment_extends_a_real_overlap() {
+        // Prompt already shares one real token ("checkpoint") with the
+        // hit; enrichment supplies a second. Since raw overlap is
+        // non-zero, the self-licensing guard doesn't apply — enrichment is
+        // allowed to carry the hit the rest of the way to MIN_OVERLAP.
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        seed(
+            &mut mimir,
+            MemoryType::Gotcha,
+            "WAL checkpoint pathological growth",
+            "always run PRAGMA wal_checkpoint before assuming corruption",
+            &[],
+        );
+        let out = compute(
+            &mut mimir,
+            "why does checkpoint never happen?",
+            "pathological",
+            Scope::All,
+        )
+        .unwrap();
+        assert!(out.is_some(), "enrichment should extend a real single-token overlap");
+    }
+
+    #[test]
+    fn bm25_only_mode_still_injects_on_a_clean_lexical_match() {
+        // `search_with_legs_bm25_only` never computes a vector leg, so
+        // `legs.get(1)` is always None here — the same shape rule 3 and the
+        // self-licensing guard already handle for a model-less machine
+        // (both degrade to skipping when there's no vector leg). This
+        // confirms `cold_mode = "fast"` still fires on a real, unambiguous
+        // lexical match once rules 1+2 alone are asked to carry the floor —
+        // same fixture as `tags_count_toward_overlap` (exact tag overlap,
+        // no ambiguity about whether MIN_OVERLAP is cleared).
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        seed(
+            &mut mimir,
+            MemoryType::Gotcha,
+            "auth edge case",
+            "remember to check this before shipping",
+            &["scram", "nfkc", "normalization"],
+        );
+        let out =
+            compute_with_mode(&mut mimir, "scram nfkc normalization", "", Scope::All, true)
+                .unwrap();
+        assert!(
+            out.is_some(),
+            "bm25_only mode must still inject on a clean lexical match \
+             (no vector leg to require agreement from)"
+        );
+    }
+
+    #[test]
+    fn bm25_only_mode_still_blocks_enrichment_only_self_licensing() {
+        // Same enrichment-only scenario as `enrichment_alone_cannot_clear_floor`,
+        // run through the bm25_only path: with no vector leg at all,
+        // `vector_leg_discriminates` is false and `vector_agrees` is false,
+        // so the self-licensing guard's `!(vector_agrees &&
+        // vector_leg_discriminates)` term is true regardless — the guard
+        // must still block, exactly as it does with a real absent model.
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        seed(
+            &mut mimir,
+            MemoryType::Gotcha,
+            "WAL autocheckpoint pathological growth",
+            "always run PRAGMA wal_checkpoint before assuming corruption",
+            &[],
+        );
+        let out = compute_with_mode(
+            &mut mimir,
+            "let's get started",
+            "wal autocheckpoint",
+            Scope::All,
+            true,
+        )
+        .unwrap();
+        assert!(
+            out.is_none(),
+            "bm25_only mode must not let enrichment-only overlap self-license an injection"
+        );
     }
 
     #[test]
