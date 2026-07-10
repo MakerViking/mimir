@@ -628,7 +628,7 @@ mod tests {
 
         let batch = get_nodes(&conn, &[a.id, b.id, c.id, 999_999]).unwrap();
         // Same set as calling get_node per id (999_999 simply absent, no error).
-        let mut want = vec![
+        let mut want = [
             get_node(&conn, a.id).unwrap(),
             get_node(&conn, b.id).unwrap(),
             get_node(&conn, c.id).unwrap(),
