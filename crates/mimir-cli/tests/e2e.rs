@@ -174,6 +174,12 @@ fn isolated_home_never_touches_user_dirs() {
     assert!(Path::new(env!("CARGO_BIN_EXE_mimir")).exists());
 }
 
+// The fake-$HOME sandbox below can't work on Windows: `directories` resolves
+// paths through the Known Folder API, which ignores HOME/USERPROFILE env
+// overrides — the subprocess would either fail to resolve a home or escape
+// the sandbox into the real profile. Hook installation logic is identical
+// across platforms, so Linux/macOS coverage is sufficient.
+#[cfg(not(windows))]
 #[test]
 fn hooks_install_bakes_custom_inject_url_into_recall_script() {
     // `install_hooks` deliberately early-returns whenever MIMIR_HOME is set
@@ -192,8 +198,14 @@ fn hooks_install_bakes_custom_inject_url_into_recall_script() {
     std::fs::create_dir_all(fake_home.path().join(".claude")).unwrap();
 
     // Seed config.toml with a custom inject_url *before* `init` runs, at
-    // the exact path Paths::standard() resolves to under XDG defaults.
-    let config_dir = fake_home.path().join(".config/mimir");
+    // the exact path Paths::standard() resolves to under the fake $HOME —
+    // which differs per platform (ProjectDirs: XDG on Linux, Application
+    // Support on macOS).
+    let config_dir = if cfg!(target_os = "macos") {
+        fake_home.path().join("Library/Application Support/mimir")
+    } else {
+        fake_home.path().join(".config/mimir")
+    };
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::write(
         config_dir.join("config.toml"),
@@ -253,6 +265,8 @@ fn hooks_install_bakes_custom_inject_url_into_recall_script() {
     );
 }
 
+// Windows: see the cfg note on hooks_install_bakes_custom_inject_url_….
+#[cfg(not(windows))]
 #[test]
 fn context_guard_hooks_install_and_are_idempotent() {
     // Same fake-$HOME trick as the recall-hook test above: install_hooks
@@ -329,6 +343,8 @@ fn context_guard_hooks_install_and_are_idempotent() {
     assert_eq!(hooks2["SessionStart"].as_array().unwrap().len(), 2);
 }
 
+// Windows: see the cfg note on hooks_install_bakes_custom_inject_url_….
+#[cfg(not(windows))]
 #[test]
 fn context_guard_off_by_default_adds_no_new_hook_entries() {
     // The default (`mimir init --hooks`, no --context-guard) must be
