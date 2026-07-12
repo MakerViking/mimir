@@ -1,0 +1,9 @@
+[Unit]
+Description=Mimir store health watchdog (mimir doctor --check)
+
+[Service]
+Type=oneshot
+# `doctor --check` is silent and exits 0 when healthy; on failure it prints
+# the failing checks and exits non-zero, which triggers the notification.
+# Swap notify-send for mail/ntfy/etc. on headless machines.
+ExecStart=/bin/sh -c 'msg="$(%h/.cargo/bin/mimir doctor --check 2>&1)" || { notify-send -u critical "Mimir watchdog" "$msg"; exit 1; }'

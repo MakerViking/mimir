@@ -795,16 +795,23 @@ pub fn status(json: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn doctor() -> Result<()> {
+pub fn doctor(check_only: bool) -> Result<()> {
     let paths = Paths::resolve()?;
     let mut failures = 0;
 
     let check = |name: &str, ok: bool, detail: String, failures: &mut i32| {
-        let mark = if ok { "ok " } else { "FAIL" };
         if !ok {
             *failures += 1;
         }
-        println!("{mark}  {name}: {detail}");
+        if check_only {
+            // Watchdog mode: silent when healthy, failures only, on stderr.
+            if !ok {
+                eprintln!("FAIL {name}: {detail}");
+            }
+        } else {
+            let mark = if ok { "ok " } else { "FAIL" };
+            println!("{mark}  {name}: {detail}");
+        }
     };
 
     match db::open(&paths.db_file) {
@@ -829,56 +836,85 @@ pub fn doctor() -> Result<()> {
                     .unwrap_or_else(|e| e.to_string()),
                 &mut failures,
             );
+            // node_fts is an external-content table, so PRAGMA integrity_check
+            // can pass while the index has drifted from `node` — the state
+            // where recall silently returns nothing. Only the two-argument
+            // form of FTS5's own command compares the index against the
+            // content table (the one-argument form checks internal structure
+            // only and passes on drift — verified). Needs SQLite ≥3.42;
+            // guaranteed by the bundled rusqlite build.
+            let fts_index = conn.execute(
+                "INSERT INTO node_fts(node_fts, rank) VALUES('integrity-check', 1)",
+                [],
+            );
+            check(
+                "fts5 index",
+                fts_index.is_ok(),
+                fts_index
+                    .map(|_| "consistent with node table".into())
+                    .unwrap_or_else(|e| {
+                        format!(
+                            "out of sync with node table ({e}) — rebuild with: sqlite3 {} \
+                             \"INSERT INTO node_fts(node_fts) VALUES('rebuild')\"",
+                            paths.db_file.display()
+                        )
+                    }),
+                &mut failures,
+            );
         }
         Err(e) => check("db", false, e.to_string(), &mut failures),
     }
 
-    println!(
-        "ok   gpu: {}",
-        mimir_core::embed::gpu_backend()
-            .unwrap_or("not compiled in (CPU; rebuild with --features gpu-webgpu or gpu-cuda)")
-    );
+    // Everything below is informational (can never fail the exit code), so
+    // watchdog mode skips it — including the daemon probe's network wait.
+    if !check_only {
+        println!(
+            "ok   gpu: {}",
+            mimir_core::embed::gpu_backend()
+                .unwrap_or("not compiled in (CPU; rebuild with --features gpu-webgpu or gpu-cuda)")
+        );
 
-    let model_present = paths.models_dir.exists()
-        && std::fs::read_dir(&paths.models_dir)
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-    check(
-        "model",
-        true, // informational until embeddings land; BM25-only is a valid state
-        if model_present {
-            format!("present at {}", paths.models_dir.display())
-        } else {
-            "not downloaded (search is BM25-only until `mimir init` fetches it)".into()
-        },
-        &mut failures,
-    );
+        let model_present = paths.models_dir.exists()
+            && std::fs::read_dir(&paths.models_dir)
+                .map(|mut d| d.next().is_some())
+                .unwrap_or(false);
+        check(
+            "model",
+            true, // informational until embeddings land; BM25-only is a valid state
+            if model_present {
+                format!("present at {}", paths.models_dir.display())
+            } else {
+                "not downloaded (search is BM25-only until `mimir init` fetches it)".into()
+            },
+            &mut failures,
+        );
 
-    // Informational only (ok=true regardless): whether `mimir daemon` /
-    // `mimir mcp --http` is actually up. Absence is a normal, supported
-    // state — the hooks fall back to the cold `mimir recall-inject` path —
-    // so this must never fail `doctor`'s exit code, same precedent as the
-    // "model" check above.
-    let inject_url = Config::load(&paths.config_file)
-        .map(|c| c.hooks.inject_url)
-        .unwrap_or_else(|_| mimir_core::config::HooksConfig::default().inject_url);
-    let warm = ureq::get(&inject_url)
-        .timeout(std::time::Duration::from_secs(1))
-        .call()
-        .is_ok();
-    check(
-        "daemon",
-        true,
-        if warm {
-            format!("warm ({inject_url} reachable — hooks use the fast HTTP path)")
-        } else {
-            format!(
-                "cold ({inject_url} not reachable — hooks fall back to `mimir recall-inject`; \
-                 run `mimir daemon` for the warm path)"
-            )
-        },
-        &mut failures,
-    );
+        // Informational only (ok=true regardless): whether `mimir daemon` /
+        // `mimir mcp --http` is actually up. Absence is a normal, supported
+        // state — the hooks fall back to the cold `mimir recall-inject` path —
+        // so this must never fail `doctor`'s exit code, same precedent as the
+        // "model" check above.
+        let inject_url = Config::load(&paths.config_file)
+            .map(|c| c.hooks.inject_url)
+            .unwrap_or_else(|_| mimir_core::config::HooksConfig::default().inject_url);
+        let warm = ureq::get(&inject_url)
+            .timeout(std::time::Duration::from_secs(1))
+            .call()
+            .is_ok();
+        check(
+            "daemon",
+            true,
+            if warm {
+                format!("warm ({inject_url} reachable — hooks use the fast HTTP path)")
+            } else {
+                format!(
+                    "cold ({inject_url} not reachable — hooks fall back to `mimir recall-inject`; \
+                     run `mimir daemon` for the warm path)"
+                )
+            },
+            &mut failures,
+        );
+    }
 
     if failures > 0 {
         anyhow::bail!("{failures} check(s) failed");

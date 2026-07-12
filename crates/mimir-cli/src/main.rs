@@ -95,7 +95,12 @@ enum Command {
         text: Vec<String>,
     },
     /// Health checks: database integrity, FTS availability, model presence.
-    Doctor,
+    Doctor {
+        /// Watchdog mode: silent when healthy, prints only failures and
+        /// exits non-zero (for timers/cron; see contrib/mimir-watchdog.timer).
+        #[arg(long)]
+        check: bool,
+    },
     /// Capture a memory (refuses near-duplicates unless --force).
     Remember {
         /// Text to remember.
@@ -601,7 +606,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             prompt,
         } => commands::recall_inject(prompt.join(" "), enrich, session),
         Command::Status => commands::status(cli.json),
-        Command::Doctor => commands::doctor(),
+        Command::Doctor { check } => commands::doctor(check),
         Command::Remember {
             text,
             mtype,

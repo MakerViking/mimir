@@ -1,0 +1,14 @@
+# Hourly health check of the Mimir store. Install as a user unit:
+#   cp contrib/mimir-watchdog.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now mimir-watchdog.timer
+[Unit]
+Description=Run the Mimir store health watchdog hourly
+
+[Timer]
+OnCalendar=hourly
+RandomizedDelaySec=5m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

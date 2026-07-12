@@ -147,6 +147,58 @@ fn full_phase1_flow() {
     let out = h.ok(&["status"]);
     assert!(out.contains("memory"), "status: {out}");
     h.ok(&["doctor"]);
+
+    // watchdog mode: healthy = completely silent, exit 0
+    let out = h.run(&["doctor", "--check"]);
+    assert!(
+        out.status.success(),
+        "doctor --check failed on healthy store"
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "doctor --check must be silent when healthy"
+    );
+}
+
+#[test]
+fn doctor_check_fails_on_corrupt_store() {
+    let h = Harness::new();
+    h.ok(&["init", "--no-model"]);
+    h.ok(&["doctor", "--check"]);
+
+    std::fs::write(h.home.path().join("mimir.db"), "not a sqlite database").unwrap();
+    let out = h.run(&["doctor", "--check"]);
+    assert!(!out.status.success(), "doctor --check passed on garbage db");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("FAIL db"), "expected FAIL db line, got: {err}");
+}
+
+#[test]
+fn doctor_check_detects_fts_index_drift() {
+    // The silent-recall failure mode: node_fts (external content) drifts
+    // from node, PRAGMA integrity_check stays green, searches return
+    // nothing. Reproduce by deleting a node with the sync trigger dropped.
+    let h = Harness::new();
+    h.ok(&["init", "--no-model"]);
+    h.ok(&["remember", "fts drift canary", "-t", "note"]);
+    h.ok(&["doctor", "--check"]);
+
+    let conn = rusqlite::Connection::open(h.home.path().join("mimir.db")).unwrap();
+    conn.execute_batch("DROP TRIGGER node_ad; DELETE FROM node WHERE kind = 'memory';")
+        .unwrap();
+    drop(conn);
+
+    let out = h.run(&["doctor", "--check"]);
+    assert!(
+        !out.status.success(),
+        "doctor --check passed on drifted FTS index"
+    );
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("FAIL fts5 index"),
+        "expected FAIL fts5 index, got: {err}"
+    );
+    assert!(err.contains("rebuild"), "remedy hint missing: {err}");
 }
 
 #[test]

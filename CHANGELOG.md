@@ -3,6 +3,24 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [Unreleased]
+### Added
+- **`mimir doctor --check` watchdog mode** — silent and exit 0 when healthy;
+  prints only the failing checks (stderr) and exits non-zero otherwise, so a
+  timer/cron can alert on store breakage with zero cost while things are fine.
+  Runs the hard checks only (db open, `PRAGMA integrity_check`, FTS5 query),
+  skipping the informational gpu/model/daemon lines and the daemon probe's
+  network wait.
+- **FTS5 index consistency check in `doctor`** (both modes). `node_fts` is an
+  external-content table, so `PRAGMA integrity_check` can pass while the
+  search index has silently drifted from the `node` table — the state where
+  recall returns nothing. Doctor now runs FTS5's two-argument
+  `('integrity-check', 1)` command, which compares the index against the
+  content table (the one-argument form passes on drift), and on failure
+  prints the one-line rebuild remedy.
+- **`contrib/mimir-watchdog.{service,timer}`** — hourly systemd user units
+  wiring `doctor --check` to a desktop notification on failure.
+
 ## [0.14.0] - 2026-07-10
 ### Changed
 - **Ranking now favours fresh and preventer-type memories.** Recency is on
