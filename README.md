@@ -430,11 +430,24 @@ decay ever weights meaningfully; values below a 60-day safety floor are
 clamped up (with a log warning) rather than silently starving the signal.
 `[rerank] auto = "off" |
 "warm" | "always"` (default `"off"`) controls whether a plain `recall`
-auto-reranks without an explicit `--rerank`: off by default because the
-cross-encoder costs ~84ms/candidate (~1.3s at the default 15 candidates) and
-the win isn't measured yet; `"warm"` fires only when the model's already
-loaded in a long-lived process (the MCP server), `"always"` loads it on
-demand too.
+auto-reranks without an explicit `--rerank`. The trade-off, measured on a
+graded retrieval eval over this repo's own docs + source (837 dual-judged
+labels, 60 queries): reranking the top 15 fused candidates raises nDCG@10
+by ~0.03 and puts the first relevant hit at rank 1 almost always — but the
+cross-encoder costs ~84 ms/candidate on CPU (~1.3 s per recall at the
+default 15) vs ~12 ms/candidate on a GPU build (~0.18 s per recall). So:
+- **GPU build + long-lived process** (MCP server, daemon): `"warm"` is a
+  measured win at interactive latency. `"warm"` only fires when the model
+  is already resident, so one-shot CLI calls never pay a cold model load.
+- **CPU-only machine**: leave it `"off"` — ~1.3 s per recall buys the same
+  ~0.03 nDCG. Explicit `--rerank` is always available when it's worth the
+  wait. The config is per-machine; don't copy a `"warm"` setting onto CPU
+  boxes.
+- Keep `candidates = 15`: 25+ measured *worse* (the reranker overrides
+  correct fusion ranks more often than it rescues deep candidates).
+`"always"` additionally cold-loads the model on demand (same cost as an
+explicit `--rerank`, just automatic). Per-prompt auto-recall injection
+never reranks regardless — only explicit `recall` calls are affected.
 
 State lives in the platform-standard directories
 (`~/.local/share/mimir`, `~/.config/mimir`, `~/.cache/mimir` on Linux);
