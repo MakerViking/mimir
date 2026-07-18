@@ -337,6 +337,13 @@ impl Mimir {
     /// A large batch (bulk import/reindex) still drops it: patching would
     /// cost about as much as a rebuild, for no benefit.
     pub fn embed_pending(&mut self) -> Result<usize> {
+        // Probe before touching the model: background callers (auto-sync,
+        // startup maintenance) call this speculatively every few minutes,
+        // and on GPU builds a no-op load would still create (and tear down)
+        // a GPU device each time — measured to leak driver memory.
+        if !embed::has_pending(&self.conn, &self.config.embedding.model)? {
+            return Ok(0);
+        }
         self.ensure_embedder(false);
         let Mimir {
             conn,

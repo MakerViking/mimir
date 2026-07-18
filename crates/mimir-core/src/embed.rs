@@ -407,6 +407,32 @@ pub fn from_blob(blob: &[u8]) -> Vec<f32> {
 ///
 /// Returns the ids of every node embedded (fresh inference or dedup copy),
 /// so callers can patch a live vector-matrix cache instead of dropping it.
+/// WHERE clause selecting nodes that still need (re-)embedding for model ?1,
+/// against `node n LEFT JOIN embedding e ON e.node_id = n.id`. Shared by
+/// `embed_pending` and `has_pending` so the probe can never drift from the
+/// real selection.
+fn pending_where() -> String {
+    format!(
+        "n.deleted_at IS NULL AND n.body IS NOT NULL
+           AND n.kind IN ({EMBEDDABLE_KINDS})
+           AND (e.node_id IS NULL OR e.model <> ?1
+                OR n.content_hash IS NULL OR e.content_hash <> n.content_hash)"
+    )
+}
+
+/// Cheap existence probe for embeddable work. Callers that would otherwise
+/// load the embedder speculatively (background sync, startup maintenance)
+/// gate on this first — on GPU builds a model load creates a whole GPU
+/// device, so a speculative load that finds nothing to do is far from free.
+pub fn has_pending(conn: &Connection, model: &str) -> Result<bool> {
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM node n
+             LEFT JOIN embedding e ON e.node_id = n.id WHERE {})",
+        pending_where()
+    );
+    Ok(conn.query_row(&sql, [model], |r| r.get(0))?)
+}
+
 pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<Vec<i64>> {
     struct Pending {
         id: i64,
@@ -416,10 +442,8 @@ pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<Vec<i
     let mut stmt = conn.prepare(&format!(
         "SELECT n.id, n.title, n.body, n.content_hash
          FROM node n LEFT JOIN embedding e ON e.node_id = n.id
-         WHERE n.deleted_at IS NULL AND n.body IS NOT NULL
-           AND n.kind IN ({EMBEDDABLE_KINDS})
-           AND (e.node_id IS NULL OR e.model <> ?1
-                OR n.content_hash IS NULL OR e.content_hash <> n.content_hash)"
+         WHERE {}",
+        pending_where()
     ))?;
     let pending: Vec<Pending> = stmt
         .query_map([&embedder.name], |r| {
@@ -528,6 +552,56 @@ mod tests {
         let mut zero = vec![0.0f32, 0.0];
         l2_normalize(&mut zero); // must not NaN
         assert_eq!(zero, vec![0.0, 0.0]);
+    }
+
+    #[test]
+    fn has_pending_gates_on_real_work() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let model = "bge-small-en-v1.5";
+        assert!(!has_pending(&conn, model).unwrap(), "empty store");
+
+        let node = match crate::memory::remember(
+            &conn,
+            crate::memory::Remember {
+                text: "SCRAM auth rejects non-ASCII passwords".into(),
+                mtype: crate::model::MemoryType::Note,
+                tags: vec![],
+                project_id: None,
+                force: false,
+            },
+        )
+        .unwrap()
+        {
+            crate::memory::RememberOutcome::Created(n) => n,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        assert!(has_pending(&conn, model).unwrap(), "one unembedded memory");
+
+        let hash: Vec<u8> = conn
+            .query_row(
+                "SELECT content_hash FROM node WHERE id = ?1",
+                [node.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        upsert(&conn, node.id, model, 4, &to_blob(&[0.5; 4]), &hash).unwrap();
+        assert!(
+            !has_pending(&conn, model).unwrap(),
+            "embedded at current hash"
+        );
+        assert!(
+            has_pending(&conn, "some-other-model").unwrap(),
+            "same row is still pending for a different model"
+        );
+    }
+
+    #[test]
+    fn embed_pending_skips_model_load_when_nothing_pending() {
+        let mut m = crate::Mimir::open_in_memory().unwrap();
+        assert_eq!(m.embed_pending().unwrap(), 0);
+        // The probe must return before `ensure_embedder` runs — a speculative
+        // load would create a GPU device on GPU builds just to do nothing.
+        assert!(!m.embedder_tried, "embedder load was attempted on a no-op");
     }
 
     #[test]
