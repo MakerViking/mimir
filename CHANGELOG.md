@@ -5,6 +5,44 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **Secrets guard on `remember`** — capture now refuses text, tags, or
+  `fires_when` phrases that look like they contain an actual credential: private-key blocks, AWS access
+  key ids, GitHub tokens/PATs, Slack tokens, JWTs. High-precision structural
+  patterns only (no entropy heuristics), so ordinary prose *about* keys,
+  tokens and passwords is never blocked; the refusal message names what was
+  matched so an agent can redact and retry. Applies to the CLI `remember`
+  command and the MCP `remember` tool — and `mimir edit`, which rewrites the
+  same fields — while `mimir import` and sync replication are deliberately
+  unguarded (restoring your own backup is not a capture). Matching runs once
+  per write via lazily-compiled regexes; recall and inject hot paths are
+  untouched.
+- **MCP schema diet** — the tool and parameter descriptions the MCP server
+  ships to every client session were compressed ~34% (4.5k → 3.0k chars)
+  without renaming or behaviorally changing any tool or parameter; norms that
+  were repeated per-tool now live only in the server instructions.
+- **`mimir reproject <ref> --project <name> | --global`** — move a memory to
+  another project, or to global scope, after the fact. A memory's project is
+  fixed at `remember` time from the session's working directory, so a session
+  started in the wrong directory files it under the wrong project with no way
+  to correct it (`edit` changes text/title/type/tags, not the project). The
+  target is resolved by name, preferring a locally-bound project over a synced
+  shadow of the same name; the change bumps `updated_at` so it rides the
+  existing last-write-wins sync when the target is sync-enabled — moving into
+  a plain local project prints a note that the memory will stop syncing.
+  Only memories can be reprojected
+  (files/symbols/doc-chunks derive their project from their source). Thanks to
+  @nworks3d for the report and reference implementation (#12).
+- **Optional bearer-token auth for `mimir mcp --http`** — `--http-token
+  <token>` or the `MIMIR_HTTP_TOKEN` env var (preferred, so the token stays
+  out of process lists; the flag wins if both are set) requires an
+  `Authorization: Bearer <token>` header on the HTTP transport, validated with
+  a constant-time compare. Defense-in-depth on top of the loopback-bind gate:
+  a misconfigured fronting proxy or an exposed port no longer means instant
+  full read/write access to the store. No token configured = unchanged
+  behavior. The non-loopback bind refusal stays regardless. `mimir daemon`
+  (the alias for `mimir mcp --http`) honors the env var too, and an empty
+  token — flag or env — is treated as unset rather than enabling an
+  unsatisfiable gate (#11).
 - **`mimir doctor --check` watchdog mode** — silent and exit 0 when healthy;
   prints only the failing checks (stderr) and exits non-zero otherwise, so a
   timer/cron can alert on store breakage with zero cost while things are fine.
@@ -20,6 +58,27 @@ the `mimir-mem` crate, and the on-disk schema move together.
   prints the one-line rebuild remedy.
 - **`contrib/mimir-watchdog.{service,timer}`** — hourly systemd user units
   wiring `doctor --check` to a desktop notification on failure.
+
+### Fixed
+- **Sync: client push watermark could be poisoned by another peer's clock
+  skew.** `sync push` advanced the client's `last_push` cursor from the hub's
+  post-apply *global* high-watermark instead of the local batch it actually
+  sent. If any peer's clock ran ahead (or a backdated write inflated the hub
+  watermark), a client's own subsequent edits could silently fail the
+  changes-since filter and never be pushed again — no error, permanent skip.
+  `last_push` now advances from the local batch watermark (same clock domain
+  as the query it gates); the wire format is unchanged. Additionally, both
+  sync cursors (`last_push`, `last_pull`) are clamped to the local wall
+  clock, so a single future-dated row — your own past clock skew, or a skewed
+  peer's row relayed by the hub — can no longer pin a cursor into the future
+  and silently stop that client from sending or receiving later changes; the
+  worst case is now the skewed row re-transferring each round, which the
+  idempotent apply makes free. Regression tests cover the skew scenario,
+  push-retry idempotency, and both cursor-clamp failure modes.
+- **Sync: batch apply is now transactional.** `apply_changes` wraps the
+  node+edge apply loop in a single immediate transaction, so a crash
+  mid-batch can no longer leave a partially applied sync (previously harmless
+  only because retries are idempotent; now it can't happen at all).
 
 ## [0.14.0] - 2026-07-10
 ### Changed

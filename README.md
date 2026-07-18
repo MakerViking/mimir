@@ -307,7 +307,8 @@ configured via JSON, the entry is simply:
 Clients that can't launch a local process (claude.ai web/mobile, agents on
 another machine) can reach a store over the network instead:
 `mimir mcp --http 127.0.0.1:8077` serves the same tools via Streamable-HTTP —
-bind to localhost and front it with TLS + an auth gate; see
+bind to localhost and front it with TLS + an auth gate, and optionally require
+a bearer token (`MIMIR_HTTP_TOKEN` / `--http-token`) as defense-in-depth; see
 [docs/central-memory-hub.md](docs/central-memory-hub.md).
 
 The project is detected from the directory the client launches the server

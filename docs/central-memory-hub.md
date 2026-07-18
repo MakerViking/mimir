@@ -54,7 +54,9 @@ auto = true            # sync automatically
 interval_mins = 30     # how often
 ```
 
-Sync is last-write-wins. You can also sync on demand:
+Sync is last-write-wins on a second-resolution timestamp — if the same memory
+is edited on two machines within the same second, whichever edit reaches the
+hub first is kept. You can also sync on demand:
 
 ```sh
 mimir sync push     # send local changes to the hub
@@ -78,6 +80,14 @@ transport has no auth of its own, so the loopback bind is the security
 boundary on a bare host. Inside a container the flag is appropriate — bind
 `0.0.0.0` there, but publish the container port to localhost only, as the
 compose example below does.
+
+For defense-in-depth on a remote deployment you can also require a bearer
+token — set `MIMIR_HTTP_TOKEN` (preferred; keeps the token out of process
+lists) or pass `--http-token <token>`, and every `/mcp` and `/inject` request
+must then carry `Authorization: Bearer <token>` (constant-time compare). This
+does **not** replace the fronting proxy or the loopback-bind refusal — it's a
+second lock so a misconfigured proxy or an accidentally-exposed port no longer
+means instant full store access. With no token set, behavior is unchanged.
 
 This exposes a Streamable-HTTP MCP server at `/mcp`, plus a plain HTTP
 `GET /inject` endpoint on the same bind — **not** an MCP tool, just the warm
@@ -120,9 +130,11 @@ services:
 
 ## 4. Exposing it safely
 
-The `--http` endpoint has **no authentication of its own** - put an
+The `--http` endpoint has no strong authentication of its own — put an
 authenticating reverse proxy or tunnel in front of it (Cloudflare Tunnel +
-Access, an OAuth-aware proxy, a VPN, etc.).
+Access, an OAuth-aware proxy, a VPN, etc.). The optional `MIMIR_HTTP_TOKEN` /
+`--http-token` bearer gate (above) is defense-in-depth behind that front
+door, not a replacement for it.
 
 Two gotchas:
 
