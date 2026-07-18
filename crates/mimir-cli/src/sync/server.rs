@@ -91,10 +91,8 @@ fn process(mimir: &mut Mimir, req: &mut tiny_http::Request, token: &str) -> Resu
 /// Token resolution: env wins; else a stable token persisted in the hub's meta
 /// (generated + printed on first run) so restarts keep the same token.
 fn resolve_token(mimir: &Mimir) -> Result<String> {
-    if let Ok(t) = std::env::var("MIMIR_SYNC_TOKEN") {
-        if !t.is_empty() {
-            return Ok(t);
-        }
+    if let Some(t) = crate::sync::env_nonempty("MIMIR_SYNC_TOKEN") {
+        return Ok(t);
     }
     if let Some(t) = replicate::get_str_meta(&mimir.conn, "server_token")? {
         eprintln!("using stored hub token (set MIMIR_SYNC_TOKEN to override)");
@@ -106,7 +104,10 @@ fn resolve_token(mimir: &Mimir) -> Result<String> {
     Ok(t)
 }
 
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+/// Constant-time byte-slice equality — no early return on the first differing
+/// byte, so a comparison can't leak the token via timing. Reused by the MCP
+/// HTTP transport's optional bearer gate (`crate::mcp`).
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

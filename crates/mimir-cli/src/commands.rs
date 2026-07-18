@@ -943,6 +943,9 @@ pub fn remember(
     } else {
         mimir.project_for_cwd(&std::env::current_dir()?)?
     };
+    if let Some(kind) = mimir_core::secrets::scan_capture(&text, &tags, &fires_when) {
+        bail!(mimir_core::error::Error::Secret(kind));
+    }
     let outcome = memory::remember(
         &mimir.conn,
         Remember {
@@ -1160,7 +1163,9 @@ pub fn daemon() -> Result<()> {
         "mimir daemon: warm path at http://{addr}/inject — the auto-recall hook will use \
          this instead of the cold `mimir recall-inject` fallback"
     );
-    crate::mcp::run(Some(addr), false)
+    // Same HTTP surface as `mimir mcp --http`, so honor the same env-var
+    // bearer gate (there is no --http-token flag on daemon by design).
+    crate::mcp::run(Some(addr), false, crate::mcp::http_token_from_env())
 }
 
 /// Strip `config.hooks.inject_url` (e.g. `"http://127.0.0.1:8077/inject"`)
@@ -1304,6 +1309,13 @@ pub fn edit(
     let mimir = Mimir::open()?;
     let node = store::resolve_ref(&mimir.conn, reference)?;
     let mtype = mtype.map(|t| t.parse::<MemoryType>()).transpose()?;
+    // Same guard as `remember`: an edited body/tags is a capture too
+    // (memory::Edit has no fires_when field, hence the empty slice).
+    if let Some(kind) =
+        mimir_core::secrets::scan_capture(&text, tags.as_deref().unwrap_or(&[]), &[])
+    {
+        bail!(mimir_core::error::Error::Secret(kind));
+    }
     let edit = memory::Edit {
         text: if text.is_empty() { None } else { Some(text) },
         title,
@@ -1322,6 +1334,45 @@ pub fn edit(
         store::set_pinned(&mimir.conn, node.id, pin)?;
     }
     let updated = memory::edit(&mimir.conn, node.id, edit)?;
+    let projects = store::project_titles(&mimir.conn)?;
+    if json {
+        println!("{}", node_json(&updated, &projects));
+    } else {
+        println!(
+            "{}",
+            line(&updated, &projects, mimir.config.output.snippet_chars)
+        );
+    }
+    Ok(())
+}
+
+pub fn reproject(json: bool, reference: &str, project: Option<String>, global: bool) -> Result<()> {
+    if !global && project.is_none() {
+        bail!("pass --project <name> to move it to a project, or --global for global scope");
+    }
+    let mimir = Mimir::open()?;
+    let node = store::resolve_ref(&mimir.conn, reference)?;
+    let target: Option<i64> = match project {
+        Some(name) => {
+            let proj = store::find_project_by_title(&mimir.conn, &name)?.ok_or_else(|| {
+                anyhow::anyhow!("no project named '{name}' (titles match exactly)")
+            })?;
+            // A memory only rides sync while global or in a sync-enabled
+            // project; moving it into a plain local project silently takes it
+            // out of that set, so say so instead of letting peers diverge
+            // quietly.
+            if !mimir_core::replicate::project_is_syncable(&proj.meta) {
+                eprintln!(
+                    "note: project '{name}' is not sync-enabled — this memory will stop \
+                     syncing; peers that already pulled it keep their current copy"
+                );
+            }
+            Some(proj.id)
+        }
+        None => None, // --global
+    };
+    store::reproject(&mimir.conn, &node, target)?;
+    let updated = store::get_node(&mimir.conn, node.id)?;
     let projects = store::project_titles(&mimir.conn)?;
     if json {
         println!("{}", node_json(&updated, &projects));

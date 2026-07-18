@@ -202,6 +202,38 @@ fn doctor_check_detects_fts_index_drift() {
 }
 
 #[test]
+fn remember_refuses_secret_smuggled_in_tags() {
+    // The secrets guard scans `text`, but a real secret can be smuggled
+    // through `--tags` just as easily — `tags_text` is indexed and
+    // searched the same as the body, so an unscanned tag would leak the
+    // secret into recall in plain text.
+    let h = Harness::new();
+    h.ok(&["init", "--no-model"]);
+
+    let out = h.run(&[
+        "remember",
+        "harmless note about a deploy",
+        "-t",
+        "note",
+        "--tags",
+        "AKIAABCDEFGHIJKLMNOP,deploy",
+        "-g",
+    ]);
+    assert!(!out.status.success(), "secret-in-tags must be refused");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.contains("AWS access key"),
+        "expected secret refusal, got: {err}"
+    );
+
+    let hits = h.ok(&["recall", "AKIAABCDEFGHIJKLMNOP", "-g"]);
+    assert!(
+        !hits.contains("AKIAABCDEFGHIJKLMNOP"),
+        "secret must not be stored/recallable: {hits}"
+    );
+}
+
+#[test]
 fn status_works_outside_any_project() {
     let h = Harness::new();
     h.ok(&["init", "--no-model"]);
@@ -568,70 +600,24 @@ fn multiple_concurrent_writers_never_lock() {
 
 #[test]
 fn server_mode_sync_roundtrip_and_auth() {
-    use std::process::Stdio;
-    let bin = env!("CARGO_BIN_EXE_mimir");
     // Per-test-binary port to avoid collisions with parallel test binaries.
     let port: u16 = 40000 + (std::process::id() % 2000) as u16;
     let endpoint = format!("http://127.0.0.1:{port}");
     let token = "test-token-xyz";
 
     let hub = tempfile::tempdir().unwrap();
+    init_server_home(hub.path());
+    let _hub = spawn_hub(hub.path(), port, token);
+    wait_for_hub(port);
+
     let c1 = tempfile::tempdir().unwrap();
     let c2 = tempfile::tempdir().unwrap();
-
-    let init = |home: &Path| {
-        let out = Command::new(bin)
-            .args(["init", "--no-model"])
-            .env("MIMIR_HOME", home)
-            .env("HOME", home)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
-    };
-    init(hub.path());
-    init(c1.path());
-    init(c2.path());
-    // Minimal config puts the clients in server mode (other sections default).
     for c in [c1.path(), c2.path()] {
-        std::fs::write(
-            c.join("config.toml"),
-            format!("[sync]\nmode = \"server\"\nendpoint = \"{endpoint}\"\n"),
-        )
-        .unwrap();
+        init_server_home(c);
+        write_server_config(c, &endpoint);
     }
 
-    let mut hubproc = Command::new(bin)
-        .args(["serve", "--bind", &format!("127.0.0.1:{port}")])
-        .env("MIMIR_HOME", hub.path())
-        .env("HOME", hub.path())
-        .env("MIMIR_SYNC_TOKEN", token)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-
-    let client = |home: &Path, tok: &str, args: &[&str]| -> Output {
-        Command::new(bin)
-            .args(args)
-            .env("MIMIR_HOME", home)
-            .env("HOME", home)
-            .env("MIMIR_SYNC_TOKEN", tok)
-            .output()
-            .unwrap()
-    };
-
-    // Wait for the hub to accept connections.
-    let mut ready = false;
-    for _ in 0..50 {
-        std::thread::sleep(std::time::Duration::from_millis(100));
-        if client(c1.path(), token, &["sync", "pull"]).status.success() {
-            ready = true;
-            break;
-        }
-    }
-    assert!(ready, "hub did not become ready");
-
-    client(
+    sync_client_ok(
         c1.path(),
         token,
         &[
@@ -642,19 +628,367 @@ fn server_mode_sync_roundtrip_and_auth() {
             "-g",
         ],
     );
-    assert!(client(c1.path(), token, &["sync"]).status.success());
-    assert!(client(c2.path(), token, &["sync"]).status.success());
-    let recall = client(c2.path(), token, &["recall", "gearbox oil"]);
-    let stdout = String::from_utf8_lossy(&recall.stdout);
+    sync_client_ok(c1.path(), token, &["sync"]);
+    sync_client_ok(c2.path(), token, &["sync"]);
+    let stdout = sync_client_ok(c2.path(), token, &["recall", "gearbox oil"]);
     assert!(
         stdout.contains("gearbox"),
         "c2 recalled the synced memory: {stdout}"
     );
 
     // Wrong token is rejected.
-    let bad = client(c2.path(), "wrong-token", &["sync"]);
+    let bad = sync_client(c2.path(), "wrong-token", &["sync"]);
     assert!(!bad.status.success(), "wrong token must fail");
+}
 
-    let _ = hubproc.kill();
-    let _ = hubproc.wait();
+// ---- shared plumbing for the server-mode sync tests ----
+
+fn init_server_home(home: &Path) {
+    let bin = env!("CARGO_BIN_EXE_mimir");
+    let out = Command::new(bin)
+        .args(["init", "--no-model"])
+        .env("MIMIR_HOME", home)
+        .env("HOME", home)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+}
+
+fn write_server_config(home: &Path, endpoint: &str) {
+    std::fs::write(
+        home.join("config.toml"),
+        format!("[sync]\nmode = \"server\"\nendpoint = \"{endpoint}\"\n"),
+    )
+    .unwrap();
+}
+
+/// Hub process wrapper that kills the child on drop, so a panicking test
+/// can't leak a live `mimir serve` holding its port.
+struct HubGuard(std::process::Child);
+
+impl Drop for HubGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn spawn_hub(home: &Path, port: u16, token: &str) -> HubGuard {
+    let bin = env!("CARGO_BIN_EXE_mimir");
+    HubGuard(
+        Command::new(bin)
+            .args(["serve", "--bind", &format!("127.0.0.1:{port}")])
+            .env("MIMIR_HOME", home)
+            .env("HOME", home)
+            .env("MIMIR_SYNC_TOKEN", token)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    )
+}
+
+/// Poll the hub's listening port instead of round-tripping a full client
+/// process, since we only need to know the socket is accepting connections.
+fn wait_for_hub(port: u16) {
+    for _ in 0..50 {
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("hub did not become ready on port {port}");
+}
+
+fn sync_client(home: &Path, token: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_mimir"))
+        .args(args)
+        .env("MIMIR_HOME", home)
+        .env("HOME", home)
+        .env("MIMIR_SYNC_TOKEN", token)
+        .output()
+        .unwrap()
+}
+
+fn sync_client_ok(home: &Path, token: &str, args: &[&str]) -> String {
+    let out = sync_client(home, token, args);
+    assert!(
+        out.status.success(),
+        "mimir {args:?} failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Rewind a client's own `sync.last_push` watermark by writing straight into
+/// its sqlite db — simulating a retried push after the client crashed (or the
+/// response was lost) between the hub applying a batch and the client
+/// persisting its advanced watermark.
+fn rewind_last_push(db_file: &Path) {
+    let conn = rusqlite::Connection::open(db_file).unwrap();
+    mimir_core::replicate::set_watermark(&conn, "last_push", 0).unwrap();
+}
+
+/// Directly doctor a record's `updated_at`, bypassing the real system
+/// clock — used to simulate a peer with a badly skewed clock, and to step
+/// deterministically past the 1-second timestamp resolution instead of
+/// sleeping.
+fn skew_updated_at(db_file: &Path, body_needle: &str, future_updated_at: i64) {
+    let conn = rusqlite::Connection::open(db_file).unwrap();
+    let changed = conn
+        .execute(
+            "UPDATE node SET updated_at = ?1 WHERE body LIKE ?2",
+            rusqlite::params![future_updated_at, format!("%{body_needle}%")],
+        )
+        .unwrap();
+    assert_eq!(changed, 1, "expected exactly one node to skew");
+}
+
+/// Regression for the watermark clock-domain bug: retrying an already-applied
+/// push (e.g. after the client crashed before persisting its advanced
+/// watermark) must be a hub-side no-op, not a duplicate.
+#[test]
+fn server_sync_push_retry_is_idempotent() {
+    // Own port range so this doesn't collide with the other server-mode tests
+    // running concurrently in the same test binary.
+    let port: u16 = 45000 + (std::process::id() % 2000) as u16;
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let token = "test-token-repush";
+
+    let hub = tempfile::tempdir().unwrap();
+    init_server_home(hub.path());
+    let _hub = spawn_hub(hub.path(), port, token);
+    wait_for_hub(port);
+
+    let x = tempfile::tempdir().unwrap();
+    let y = tempfile::tempdir().unwrap();
+    for home in [x.path(), y.path()] {
+        init_server_home(home);
+        write_server_config(home, &endpoint);
+    }
+
+    sync_client_ok(
+        x.path(),
+        token,
+        &[
+            "remember",
+            "gasket torque spec is 45 Nm",
+            "-t",
+            "note",
+            "-g",
+        ],
+    );
+
+    let push1 = sync_client_ok(x.path(), token, &["sync", "push"]);
+    assert!(
+        push1.contains("hub applied 1"),
+        "first push must apply the new memory: {push1}"
+    );
+
+    rewind_last_push(&x.path().join("mimir.db"));
+    let push2 = sync_client_ok(x.path(), token, &["sync", "push"]);
+    assert!(
+        push2.contains("hub applied 0"),
+        "retried push of the same batch must be a no-op on the hub, not a duplicate: {push2}"
+    );
+
+    // A fresh peer sees exactly one copy — no duplicate landed on the hub.
+    sync_client_ok(y.path(), token, &["sync"]);
+    let listing = sync_client_ok(y.path(), token, &["list", "-g", "--json"]);
+    let n = listing
+        .lines()
+        .filter(|l| l.contains("gasket torque"))
+        .count();
+    assert_eq!(n, 1, "exactly one copy after a retried push: {listing}");
+}
+
+/// Regression for cursor clamping (`cursor_advance` in sync/mod.rs): one
+/// future-dated row must not let a client's own push cursor (self-poisoning)
+/// or a reader's pull cursor (receive-blindness) jump past normally-
+/// timestamped later changes. Both asserts fail on unclamped cursors.
+#[test]
+fn server_sync_cursor_clamped_to_local_clock() {
+    let port: u16 = 55000 + (std::process::id() % 2000) as u16;
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let token = "test-token-clamp";
+
+    let hub = tempfile::tempdir().unwrap();
+    init_server_home(hub.path());
+    let _hub = spawn_hub(hub.path(), port, token);
+    wait_for_hub(port);
+
+    let x = tempfile::tempdir().unwrap();
+    let y = tempfile::tempdir().unwrap();
+    for home in [x.path(), y.path()] {
+        init_server_home(home);
+        write_server_config(home, &endpoint);
+    }
+
+    // X's own store ends up holding a future-dated row (its clock was briefly
+    // wrong), and the row reaches the hub.
+    sync_client_ok(
+        x.path(),
+        token,
+        &["remember", "clamp skew marker", "-t", "note", "-g"],
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    skew_updated_at(
+        &x.path().join("mimir.db"),
+        "clamp skew marker",
+        now + 10 * 365 * 24 * 3600,
+    );
+    sync_client_ok(x.path(), token, &["sync", "push"]);
+
+    // Y pulls the poisoned row; its pull cursor must stay clamped to Y's own
+    // clock instead of jumping ten years ahead.
+    sync_client_ok(y.path(), token, &["sync", "pull"]);
+
+    // Self-poisoning check: X's OWN next memory must still reach the hub even
+    // though X's table contains the future-dated row.
+    sync_client_ok(
+        x.path(),
+        token,
+        &[
+            "remember",
+            "x normal memory about camshafts",
+            "-t",
+            "note",
+            "-g",
+        ],
+    );
+    let push = sync_client_ok(x.path(), token, &["sync", "push"]);
+    assert!(
+        push.contains("hub applied 1"),
+        "X's own later memory must survive X's own skewed row: {push}"
+    );
+
+    // Receive-blindness check: Y's next pull must deliver X's new memory.
+    sync_client_ok(y.path(), token, &["sync", "pull"]);
+    let list_y = sync_client_ok(y.path(), token, &["list", "-g", "--json"]);
+    assert!(
+        list_y.contains("camshafts"),
+        "Y must keep receiving new changes after pulling a poisoned row: {list_y}"
+    );
+}
+
+/// Regression for the srv_push watermark bug: `last_push` must come from the
+/// pushing client's OWN local clock domain (`batch.watermark`), not from the
+/// hub's post-apply GLOBAL watermark. A peer with a badly skewed clock must
+/// not be able to silently blind another, well-behaved peer to its own future
+/// pushes.
+#[test]
+fn server_sync_survives_peer_clock_skew() {
+    let port: u16 = 50000 + (std::process::id() % 2000) as u16;
+    let endpoint = format!("http://127.0.0.1:{port}");
+    let token = "test-token-skew";
+
+    let hub = tempfile::tempdir().unwrap();
+    init_server_home(hub.path());
+    let _hub = spawn_hub(hub.path(), port, token);
+    wait_for_hub(port);
+
+    let x = tempfile::tempdir().unwrap();
+    let y = tempfile::tempdir().unwrap();
+    for home in [x.path(), y.path()] {
+        init_server_home(home);
+        write_server_config(home, &endpoint);
+    }
+    // A fresh reader peer to check the hub's state: a first-ever pull
+    // (since = 0) returns everything, keeping the observer independent of
+    // any cursor behavior. Pull-side cursor poisoning is real too — it is
+    // covered by `server_sync_cursor_clamped_to_local_clock` below — so each
+    // check uses a NEW temp home rather than leaning on the clamp under test.
+    let hub_state = || -> String {
+        let reader = tempfile::tempdir().unwrap();
+        init_server_home(reader.path());
+        write_server_config(reader.path(), &endpoint);
+        sync_client_ok(reader.path(), token, &["sync"]);
+        sync_client_ok(reader.path(), token, &["list", "-g", "--json"])
+    };
+
+    // X writes a memory, then we doctor its updated_at ~10 years into the
+    // future (simulating a peer with a badly wrong clock) before pushing.
+    // This pushes the hub's GLOBAL high watermark years ahead.
+    sync_client_ok(
+        x.path(),
+        token,
+        &["remember", "skew marker record", "-t", "note", "-g"],
+    );
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    skew_updated_at(
+        &x.path().join("mimir.db"),
+        "skew marker record",
+        now + 10 * 365 * 24 * 3600,
+    );
+    sync_client_ok(x.path(), token, &["sync", "push"]);
+
+    // Y observes the hub's now-inflated global watermark via an otherwise
+    // empty push (Y has nothing local to send yet). Under the old code this
+    // alone would poison Y's last_push, since it was taken from the hub's
+    // global watermark instead of Y's own local batch.
+    sync_client_ok(y.path(), token, &["sync", "push"]);
+
+    // Y does real work and pushes it — it must reach the hub despite the
+    // hub's watermark being years in the future.
+    sync_client_ok(
+        y.path(),
+        token,
+        &[
+            "remember",
+            "y's real memory about bearings",
+            "-t",
+            "note",
+            "-g",
+        ],
+    );
+    let push = sync_client_ok(y.path(), token, &["sync", "push"]);
+    assert!(
+        push.contains("hub applied 1"),
+        "Y's memory must reach the hub despite peer clock skew: {push}"
+    );
+
+    let listing = hub_state();
+    assert!(
+        listing.contains("bearings"),
+        "Y's memory landed on the hub: {listing}"
+    );
+
+    // Y edits the memory and pushes again — the edit must land too.
+    let list_y = sync_client_ok(y.path(), token, &["list", "-g"]);
+    let id = list_y
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap();
+    sync_client_ok(
+        y.path(),
+        token,
+        &["edit", id, "y's real memory about bearings, revised torque"],
+    );
+    // `updated_at` is second-resolution and last-write-wins overwrites only
+    // on a STRICTLY newer timestamp, so a same-second edit would spuriously
+    // fail for reasons unrelated to the watermark fix under test. Step the
+    // edited row 2s ahead deterministically instead of sleeping past the
+    // second boundary.
+    skew_updated_at(&y.path().join("mimir.db"), "revised torque", now + 2);
+    let push2 = sync_client_ok(y.path(), token, &["sync", "push"]);
+    assert!(
+        push2.contains("hub applied 1"),
+        "Y's edit must also reach the hub: {push2}"
+    );
+
+    let listing2 = hub_state();
+    assert!(
+        listing2.contains("revised torque"),
+        "Y's edit landed on the hub: {listing2}"
+    );
 }

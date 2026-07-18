@@ -220,6 +220,23 @@ enum Command {
         #[arg(long)]
         unpin: bool,
     },
+    /// Move a memory to another project, or to global scope.
+    ///
+    /// A memory's project is fixed at `remember` time from the session's
+    /// working directory, so a session started in the wrong directory files it
+    /// under the wrong project. This re-files it after the fact; the change
+    /// replicates across a sync hub like any edit.
+    Reproject {
+        /// The memory to move.
+        reference: String,
+        /// Target project by name. Prefers a local project over a synced
+        /// shadow of the same name.
+        #[arg(long, conflicts_with = "global")]
+        project: Option<String>,
+        /// Move to global scope (no project).
+        #[arg(long)]
+        global: bool,
+    },
     /// Create an edge between two nodes.
     Link {
         a: Option<String>,
@@ -310,6 +327,14 @@ enum Command {
         /// is published to 127.0.0.1 only) or an auth gate fronts it.
         #[arg(long, requires = "http")]
         http_allow_remote: bool,
+        /// Require this bearer token on the HTTP transport (checked as
+        /// `Authorization: Bearer <token>`). Defense-in-depth on top of the
+        /// loopback bind — a misconfigured proxy or exposed port no longer
+        /// means instant full store access. Prefer the `MIMIR_HTTP_TOKEN` env
+        /// var over this flag so the token stays out of process lists; the
+        /// flag wins if both are set. Omit both to keep the prior behavior.
+        #[arg(long, requires = "http")]
+        http_token: Option<String>,
     },
     /// Run the warm daemon: a thin alias for `mimir mcp --http <addr>`
     /// where <addr> comes from `[hooks] inject_url` (host:port only, scheme
@@ -686,6 +711,11 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None
             },
         ),
+        Command::Reproject {
+            reference,
+            project,
+            global,
+        } => commands::reproject(cli.json, &reference, project, global),
         Command::Link {
             a,
             b,
@@ -735,7 +765,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Mcp {
             http,
             http_allow_remote,
-        } => mcp::run(http, http_allow_remote),
+            http_token,
+        } => {
+            // Flag wins over MIMIR_HTTP_TOKEN; empty flag or env = unset (an
+            // unset shell var in `--http-token "$TOKEN"` must not enable an
+            // unsatisfiable gate).
+            let token = http_token
+                .filter(|t| !t.is_empty())
+                .or_else(mcp::http_token_from_env);
+            mcp::run(http, http_allow_remote, token)
+        }
         Command::Daemon => commands::daemon(),
         Command::Proxy {
             bind,

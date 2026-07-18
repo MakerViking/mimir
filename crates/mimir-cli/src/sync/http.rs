@@ -7,7 +7,10 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 pub struct PushResult {
     pub applied: ApplyStats,
-    pub watermark: i64,
+    // The hub also sends `watermark` (its post-apply global high watermark);
+    // there is deliberately no field for it — serde drops it — because a
+    // client must never advance its own last_push from the hub's clock
+    // domain (see srv_push).
 }
 
 fn auth(token: &str) -> String {
@@ -27,7 +30,7 @@ pub fn pull(endpoint: &str, token: &str, since: i64) -> Result<SyncBatch> {
     }
 }
 
-/// `POST /sync/push` with a batch body → the hub's apply stats + watermark.
+/// `POST /sync/push` with a batch body → the hub's apply stats.
 pub fn push(endpoint: &str, token: &str, batch: &SyncBatch) -> Result<PushResult> {
     let url = format!("{}/sync/push", endpoint.trim_end_matches('/'));
     match ureq::post(&url)

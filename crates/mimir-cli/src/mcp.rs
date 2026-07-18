@@ -43,7 +43,7 @@ fn engine_err(e: impl std::fmt::Display) -> String {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct RecallArgs {
-    /// What to search for (natural language or keywords).
+    /// Search text (natural language or keywords).
     pub query: String,
     /// Filter: all | memory | doc | code (default all).
     #[serde(default)]
@@ -51,14 +51,13 @@ pub struct RecallArgs {
     /// Max results (default 8).
     #[serde(default)]
     pub limit: Option<usize>,
-    /// true = search every project, not just the current one + global.
+    /// true = search every project (default: current + global).
     #[serde(default)]
     pub all_projects: bool,
-    /// true = rescore candidates with the cross-encoder reranker
-    /// (slower, better ordering; needs the reranker model downloaded).
+    /// true = cross-encoder rerank (slower, more accurate; needs model on disk).
     #[serde(default)]
     pub rerank: bool,
-    /// true = also include superseded memories (default false hides them).
+    /// true = include superseded memories (hidden by default).
     #[serde(default)]
     pub include_superseded: bool,
 }
@@ -73,18 +72,15 @@ pub struct RememberArgs {
     /// Topic tags.
     #[serde(default)]
     pub tags: Vec<String>,
-    /// true = cross-project (global) instead of current-project scope.
+    /// true = global (cross-project), not current-project scope.
     #[serde(default)]
     pub global: bool,
-    /// Optional: the code symbol or node this memory is about (name or id).
-    /// Link at capture time so the memory and the code surface together.
+    /// Code symbol or node this memory is about (name or id).
     #[serde(default)]
     pub link: Option<String>,
-    /// Optional "fires when ..." trigger phrases (short topic markers, e.g.
-    /// "release checklist"): a later prompt that matches one of these
-    /// still auto-injects this memory even if it doesn't share enough
-    /// words to clear the normal relevance floor. Max 8 phrases, 6 words
-    /// each; oversized phrases are dropped, not truncated.
+    /// Trigger phrases (e.g. "release checklist"); a matching future prompt
+    /// auto-injects this memory even without keyword overlap. Max 8, 6 words
+    /// each; oversized ones are dropped (not truncated).
     #[serde(default)]
     pub fires_when: Vec<String>,
 }
@@ -107,7 +103,7 @@ pub struct MarkArgs {
 pub struct GraphArgs {
     /// callers | calls | impact | node | path | hubs
     pub op: String,
-    /// Symbol reference (name, qualified name, or id) for callers/calls/node/path.
+    /// Symbol (name, qualified name, or id); for callers/calls/node/path.
     #[serde(default)]
     pub symbol: Option<String>,
     /// Second symbol for path.
@@ -156,10 +152,7 @@ pub struct ForgetArgs {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct ConsolidateArgs {
-    /// true (default) = report only, change nothing. false = run the passes for
-    /// real (dedup -> supersede, distill, decay-archive). Contradictions are only
-    /// ever reported for human review, never auto-resolved. Take a backup before
-    /// a real run.
+    /// true (default) = report only. false = apply for real — take a backup first.
     #[serde(default = "default_true")]
     pub dry_run: bool,
 }
@@ -170,7 +163,7 @@ fn default_true() -> bool {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 pub struct SupersedeArgs {
-    /// The OLD node reference to retire (it stops surfacing in recall).
+    /// The OLD node reference to retire.
     pub old: String,
     /// The NEW node reference that replaces it.
     pub by: String,
@@ -211,7 +204,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Search the user's memories, docs and code in one ranked list (hybrid BM25 + semantic). One ~25-token line per hit; use `get` for full bodies."
+        description = "Search memories, docs and code in one ranked list (hybrid BM25+semantic). ~25-token line per hit."
     )]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let project_id = self.project_id;
@@ -273,7 +266,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Store a typed memory (gotcha/decision/insight/idea/note/person). Search first with recall; near-duplicates are refused with the existing entry. When the fact is about specific code, pass `link` with the symbol or file so memory and code surface together. Pass `fires_when` to declare trigger phrases that force auto-injection on a matching future prompt even without normal keyword overlap."
+        description = "Store a typed memory. Pass `link` to attach it to a code symbol/file. Pass `fires_when` to force-inject on trigger phrases without keyword overlap."
     )]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         let project_id = self.project_id;
@@ -284,6 +277,11 @@ impl MimirServer {
                 .unwrap_or("note")
                 .parse()
                 .map_err(engine_err)?;
+            if let Some(kind) =
+                mimir_core::secrets::scan_capture(&args.text, &args.tags, &args.fires_when)
+            {
+                return Err(engine_err(mimir_core::error::Error::Secret(kind)));
+            }
             let outcome = memory::remember(
                 &m.conn,
                 memory::Remember {
@@ -349,7 +347,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Read the full record behind a recall hit: complete body, tags, links. Also accepts indexed doc paths (file.md:10-40) to read file lines."
+        description = "Full record for a recall hit (body, tags, links); or an indexed doc path for a line range."
     )]
     async fn get(&self, Parameters(args): Parameters<GetArgs>) -> String {
         self.blocking(move |m| {
@@ -366,9 +364,7 @@ impl MimirServer {
         .await
     }
 
-    #[tool(
-        description = "Link two nodes (memory↔memory, memory↔doc, memory↔code) so context surfaces together later."
-    )]
+    #[tool(description = "Link two nodes (memory/doc/code) so context surfaces together.")]
     async fn link(&self, Parameters(args): Parameters<LinkArgs>) -> String {
         self.blocking(move |m| {
             let rel: Rel = args
@@ -390,7 +386,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Code-graph queries for the current project: callers/calls of a symbol, impact (blast radius of changed files — pass git diff --name-only), node (full symbol record), path between symbols, hubs (most-called). Build the graph first with `mimir graph build`."
+        description = "Code-graph queries: callers/calls, impact (blast radius from files, e.g. git diff --name-only), node (record), path (between symbols), hubs (most-called). Run `mimir graph build` first."
     )]
     async fn graph(&self, Parameters(args): Parameters<GraphArgs>) -> String {
         let project_id = self.project_id;
@@ -523,7 +519,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Dense signature map of a file or directory: one line per symbol (signature + first doc line), no bodies. Prefer this over reading a whole file when you only need its structure — it costs a fraction of the tokens."
+        description = "Dense signature map of a file or directory: one line per symbol (signature + first doc line), no bodies."
     )]
     async fn outline(&self, Parameters(args): Parameters<OutlineArgs>) -> String {
         let project_id = self.project_id;
@@ -547,7 +543,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Print one symbol's body by name (resolved via the project's code graph), instead of reading the whole file. Build the graph first with `mimir graph build`."
+        description = "Print one symbol's body by name via the code graph. Run `mimir graph build` first."
     )]
     async fn peek(&self, Parameters(args): Parameters<PeekArgs>) -> String {
         let project_id = self.project_id;
@@ -574,7 +570,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Explicit feedback on a recalled node: useful strengthens its future ranking, noise weakens it. Use after a memory actually helped (or misled)."
+        description = "Feedback on a recalled node: useful strengthens ranking, noise weakens it."
     )]
     async fn mark(&self, Parameters(args): Parameters<MarkArgs>) -> String {
         self.blocking(move |m| {
@@ -655,7 +651,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Delete a memory by reference. Always a reversible SOFT delete (a replicating tombstone: recall hides it and it stays deleted across synced machines). Permanent physical deletion is deliberately not exposed over MCP - a human can run `mimir forget --hard` on the CLI. Use this to prune stale or wrong memories."
+        description = "Soft-delete (reversible tombstone: hidden from recall, synced across machines). No hard delete over MCP — use `mimir forget --hard` on the CLI."
     )]
     async fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> String {
         self.blocking(move |m| {
@@ -671,7 +667,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Mark OLD as superseded by NEW: OLD stops surfacing in recall (kept as history) and a `supersedes` edge is recorded. The clean way to replace a stale memory with its corrected version - prefer this over deleting when the new memory replaces the old."
+        description = "Mark OLD superseded by NEW (stops surfacing in recall, kept as history) via a `supersedes` edge. Prefer over `forget` when NEW replaces OLD."
     )]
     async fn supersede(&self, Parameters(args): Parameters<SupersedeArgs>) -> String {
         self.blocking(move |m| {
@@ -689,7 +685,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Run the consolidation passes (dedup -> supersede near-duplicates, distill clusters, archive decayed memories; contradictions are only reported for human review, never auto-resolved). Defaults to dry_run=true (report only). Pass dry_run=false to apply - take a backup first."
+        description = "Run consolidation: dedup -> supersede near-duplicates, distill clusters, archive decayed memories. Contradictions are reported only, never auto-resolved."
     )]
     async fn consolidate(&self, Parameters(args): Parameters<ConsolidateArgs>) -> String {
         self.blocking(move |m| {
@@ -748,9 +744,22 @@ fn server_cwd() -> Option<std::path::PathBuf> {
         .or_else(|| std::env::current_dir().ok())
 }
 
+/// Read `MIMIR_HTTP_TOKEN`, treating empty-but-set as unset. One definition
+/// shared by `mimir mcp` and `mimir daemon` so the two entry points to the
+/// same HTTP surface can't drift on auth.
+pub fn http_token_from_env() -> Option<String> {
+    crate::sync::env_nonempty("MIMIR_HTTP_TOKEN")
+}
+
 /// Entry point for `mimir mcp` (blocking; owns the tokio runtime).
-/// `http = Some(addr)` serves Streamable-HTTP instead of stdio.
-pub fn run(http: Option<String>, http_allow_remote: bool) -> Result<()> {
+/// `http = Some(addr)` serves Streamable-HTTP instead of stdio. `http_token`,
+/// when set, requires an `Authorization: Bearer <token>` header on the HTTP
+/// transport (defense-in-depth on top of the loopback bind; ignored for stdio).
+pub fn run(
+    http: Option<String>,
+    http_allow_remote: bool,
+    http_token: Option<String>,
+) -> Result<()> {
     let engine = Mimir::open()?;
     let project_id = match server_cwd() {
         Some(d) => match engine.detect_project(&d) {
@@ -876,7 +885,7 @@ pub fn run(http: Option<String>, http_allow_remote: bool) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         match http {
-            Some(bind) => serve_http(project_id, &bind, http_allow_remote).await,
+            Some(bind) => serve_http(project_id, &bind, http_allow_remote, http_token).await,
             None => {
                 // Eager-load here, not up front in `run()`: in HTTP mode this
                 // `engine` is only used for the project-detection/background
@@ -896,10 +905,19 @@ pub fn run(http: Option<String>, http_allow_remote: bool) -> Result<()> {
 
 /// Serve the same MCP tools over Streamable-HTTP for remote clients reached
 /// through a tunnel / reverse proxy. Each session gets its own engine (its own
-/// SQLite connection; WAL handles the concurrency). This transport carries NO
-/// auth — the loopback bind is the security boundary, so non-loopback binds
-/// are refused unless `--http-allow-remote` says the exposure is deliberate.
-async fn serve_http(project_id: Option<i64>, bind: &str, allow_remote: bool) -> Result<()> {
+/// SQLite connection; WAL handles the concurrency). The loopback bind is the
+/// primary security boundary, so non-loopback binds are refused unless
+/// `--http-allow-remote` says the exposure is deliberate. `token`, when set,
+/// adds an in-tree `Authorization: Bearer` gate (constant-time compare) as
+/// defense-in-depth — a misconfigured fronting proxy or an exposed port no
+/// longer means instant full read/write access to the store. No token = the
+/// prior behavior (loopback gate + fronting proxy only).
+async fn serve_http(
+    project_id: Option<i64>,
+    bind: &str,
+    allow_remote: bool,
+    token: Option<String>,
+) -> Result<()> {
     if !bind_is_loopback(bind) {
         if !allow_remote {
             anyhow::bail!(
@@ -910,11 +928,19 @@ async fn serve_http(project_id: Option<i64>, bind: &str, allow_remote: bool) -> 
                  unreachable (e.g. a container port published to 127.0.0.1 only)."
             );
         }
-        tracing::warn!(
-            %bind,
-            "serving unauthenticated MCP on a non-loopback address (--http-allow-remote); \
-             make sure an auth gate fronts this port"
-        );
+        if token.is_some() {
+            tracing::warn!(
+                %bind,
+                "serving MCP on a non-loopback address (--http-allow-remote); the bearer-token \
+                 gate is active, but still front this port with TLS + an auth proxy"
+            );
+        } else {
+            tracing::warn!(
+                %bind,
+                "serving unauthenticated MCP on a non-loopback address (--http-allow-remote); \
+                 make sure an auth gate fronts this port"
+            );
+        }
     }
     let app = mcp_http_router(move || {
         Ok(MimirServer::new(
@@ -943,11 +969,44 @@ async fn serve_http(project_id: Option<i64>, bind: &str, allow_remote: bool) -> 
             project_id,
         })
     });
+    let app = with_bearer_auth(app, token);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     println!("mimir MCP (streamable-http) listening on http://{bind}/mcp");
     println!("mimir warm auto-recall listening on http://{bind}/inject");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Wrap `app` in an optional `Authorization: Bearer <token>` gate (#11).
+/// `None` returns the router unchanged (prior behavior — loopback bind + any
+/// fronting proxy are the only gates). `Some` requires the header on EVERY
+/// route (`/mcp` and `/inject` both reach the store); the compare is
+/// constant-time so a wrong token can't be recovered by timing (a length
+/// mismatch short-circuits, leaking only length — same as the sync gate).
+fn with_bearer_auth(app: axum::Router, token: Option<String>) -> axum::Router {
+    let Some(token) = token else { return app };
+    use axum::response::IntoResponse;
+    // Arc<str>: the per-request clone below is a refcount bump, not a heap
+    // copy — /inject sits on the warm auto-recall path.
+    let expected: Arc<str> = format!("Bearer {token}").into();
+    tracing::info!("MCP HTTP: bearer-token auth enabled");
+    app.layer(axum::middleware::from_fn(
+        move |req: axum::extract::Request, next: axum::middleware::Next| {
+            let expected = Arc::clone(&expected);
+            async move {
+                let ok = req
+                    .headers()
+                    .get(axum::http::header::AUTHORIZATION)
+                    .map(|h| crate::sync::ct_eq(h.as_bytes(), expected.as_bytes()))
+                    .unwrap_or(false);
+                if ok {
+                    next.run(req).await
+                } else {
+                    axum::http::StatusCode::UNAUTHORIZED.into_response()
+                }
+            }
+        },
+    ))
 }
 
 /// Eager-load the cross-encoder reranker at startup when config says
@@ -1173,6 +1232,86 @@ mod tests {
         );
     }
 
+    /// The optional bearer gate (#11): with a token set, `/mcp` rejects a
+    /// missing or wrong `Authorization` header (401) and admits the correct
+    /// one. Drives real HTTP against an ephemeral port + temp store.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn http_bearer_token_gates_requests() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let paths = Paths::under_root(dir.path());
+        let inject_paths = paths.clone();
+        let router = mcp_http_router(move || {
+            Ok(MimirServer::new(
+                Mimir::open_at(paths.clone()).map_err(std::io::Error::other)?,
+                None,
+            ))
+        });
+        // Merge the inject router like production `serve_http` does, so the
+        // gate is verified on BOTH routes — a refactor that layers auth
+        // before the merge would leave /inject open and only this catches it.
+        let router = router.merge(inject_router(InjectState {
+            engine: Arc::new(Mutex::new(Mimir::open_at(inject_paths).unwrap())),
+            project_id: None,
+        }));
+        let router = with_bearer_auth(router, Some("s3cret".into()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let url = format!("http://{addr}/mcp");
+        let inject_url = format!("http://{addr}/inject?prompt=hello");
+
+        const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
+        let (no_auth, wrong, right, inj_no_auth, inj_right) =
+            tokio::task::spawn_blocking(move || {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout_read(Duration::from_secs(10))
+                    .build();
+                // One sender for both routes: POST with a body (MCP) when
+                // `body` is Some, plain GET (/inject) when None.
+                let send = |req: ureq::Request, auth: Option<&str>, body: Option<&str>| -> u16 {
+                    let req = match auth {
+                        Some(a) => req.set("Authorization", a),
+                        None => req,
+                    };
+                    let res = match body {
+                        Some(b) => req.send_string(b),
+                        None => req.call(),
+                    };
+                    match res {
+                        Ok(r) => r.status(),
+                        Err(ureq::Error::Status(code, _)) => code,
+                        Err(_) => 0,
+                    }
+                };
+                let mcp_req = || {
+                    agent
+                        .post(&url)
+                        .set("Content-Type", "application/json")
+                        .set("Accept", "application/json, text/event-stream")
+                };
+                (
+                    send(mcp_req(), None, Some(INIT)),
+                    send(mcp_req(), Some("Bearer nope"), Some(INIT)),
+                    send(mcp_req(), Some("Bearer s3cret"), Some(INIT)),
+                    send(agent.get(&inject_url), None, None),
+                    send(agent.get(&inject_url), Some("Bearer s3cret"), None),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(no_auth, 401, "missing header must be rejected");
+        assert_eq!(wrong, 401, "wrong token must be rejected");
+        assert_eq!(right, 200, "correct token must pass, got {right}");
+        assert_eq!(inj_no_auth, 401, "/inject without token must be rejected");
+        assert_eq!(
+            inj_right, 200,
+            "/inject with token must pass, got {inj_right}"
+        );
+    }
+
     fn remember_args(text: &str, ty: &str) -> RememberArgs {
         RememberArgs {
             text: text.into(),
@@ -1210,6 +1349,48 @@ mod tests {
 
         let body = s.get(Parameters(GetArgs { r#ref: id })).await;
         assert!(body.contains("SCRAM"), "get: {body}");
+    }
+
+    /// The secrets guard (mimir_core::secrets::scan) is wired into the MCP
+    /// `remember` tool, not just the CLI command: a real AWS key never
+    /// reaches `memory::remember` and the store stays empty.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remember_refuses_secret_looking_text() {
+        let (_dir, s) = server();
+        let refused = s
+            .remember(Parameters(remember_args(
+                "aws_access_key_id = AKIAABCDEFGHIJKLMNOP",
+                "note",
+            )))
+            .await;
+        assert!(
+            refused.contains("AWS access key"),
+            "expected secret refusal: {refused}"
+        );
+        assert!(!refused.starts_with("stored"), "must not store: {refused}");
+    }
+
+    /// The secrets guard must also cover `tags`, not just `text` — a secret
+    /// smuggled into a tag would otherwise be stored and recalled in plain
+    /// text via `tags_text`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remember_refuses_secret_looking_tag() {
+        let (_dir, s) = server();
+        let refused = s
+            .remember(Parameters(RememberArgs {
+                text: "harmless note about a deploy".into(),
+                r#type: Some("note".into()),
+                tags: vec!["AKIAABCDEFGHIJKLMNOP".into(), "deploy".into()],
+                global: true,
+                link: None,
+                fires_when: Vec::new(),
+            }))
+            .await;
+        assert!(
+            refused.contains("AWS access key"),
+            "expected secret refusal: {refused}"
+        );
+        assert!(!refused.starts_with("stored"), "must not store: {refused}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

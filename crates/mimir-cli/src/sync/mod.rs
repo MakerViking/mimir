@@ -12,6 +12,8 @@ mod file;
 mod http;
 mod server;
 
+pub(crate) use server::ct_eq;
+
 use anyhow::{bail, Context, Result};
 use mimir_core::replicate::{self, ApplyStats};
 use mimir_core::Mimir;
@@ -20,6 +22,24 @@ use mimir_core::Mimir;
 /// a sync round (clock skew / same-second) re-delivers next time; idempotent
 /// last-write-wins apply makes the re-delivery free.
 const GRACE_SECS: i64 = 60;
+
+/// Read an env var, treating empty-but-set as unset — an unset shell variable
+/// interpolated into a flag or env assignment must not count as configuration.
+pub(crate) fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|t| !t.is_empty())
+}
+
+/// Cursor advancement for a sync watermark: the batch's high watermark,
+/// clamped to the local wall clock (then minus [`GRACE_SECS`], floored at 0).
+/// A single future-dated row — our own past clock skew, or a skewed peer's
+/// row relayed by the hub — inflates the batch max arbitrarily; unclamped,
+/// the cursor would jump past every normally-timestamped later change and
+/// this client would silently stop sending (push) or receiving (pull) them.
+/// Clamped, the worst case is the skewed row re-transferring each round,
+/// which the idempotent apply makes free.
+fn cursor_advance(batch_watermark: i64) -> i64 {
+    (batch_watermark.min(mimir_core::model::now_unix()) - GRACE_SECS).max(0)
+}
 
 fn require_enabled(m: &Mimir) -> Result<()> {
     if !m.config.sync.enabled() {
@@ -127,10 +147,7 @@ pub fn status() -> Result<()> {
             println!("endpoint  {}", sc.endpoint);
             println!(
                 "token     {}",
-                if std::env::var("MIMIR_SYNC_TOKEN")
-                    .map(|t| !t.is_empty())
-                    .unwrap_or(false)
-                {
+                if env_nonempty("MIMIR_SYNC_TOKEN").is_some() {
                     "set (MIMIR_SYNC_TOKEN)"
                 } else {
                     "MISSING — set MIMIR_SYNC_TOKEN"
@@ -156,10 +173,7 @@ pub fn serve(bind: String) -> Result<()> {
 /// mode). The token goes to stdout (scriptable, e.g. `mimir sync token`); the
 /// provenance note goes to stderr.
 pub fn token() -> Result<()> {
-    if let Some(t) = std::env::var("MIMIR_SYNC_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
-    {
+    if let Some(t) = env_nonempty("MIMIR_SYNC_TOKEN") {
         println!("{t}");
         eprintln!("(from MIMIR_SYNC_TOKEN in the environment)");
         return Ok(());
@@ -195,9 +209,7 @@ fn expand_tilde(p: &str) -> String {
 }
 
 fn server_token() -> Result<String> {
-    std::env::var("MIMIR_SYNC_TOKEN")
-        .ok()
-        .filter(|t| !t.is_empty())
+    env_nonempty("MIMIR_SYNC_TOKEN")
         .context("server-mode sync needs MIMIR_SYNC_TOKEN in the environment")
 }
 
@@ -215,7 +227,13 @@ fn srv_push(m: &mut Mimir) -> Result<(usize, http::PushResult)> {
     let batch = replicate::changes_since(&m.conn, since)?;
     let sent = batch.nodes.len();
     let res = http::push(&endpoint, &token, &batch)?;
-    replicate::set_watermark(&m.conn, "last_push", (res.watermark - GRACE_SECS).max(0))?;
+    // Advance last_push from OUR batch's high watermark (local clock domain,
+    // clamped to the local clock — see `cursor_advance`), never the hub's
+    // post-apply global watermark: that one is a cross-peer clock domain a
+    // skewed peer can inflate (see e2e `server_sync_survives_peer_clock_skew`).
+    // The hub still sends its watermark on the wire; the client-side
+    // `PushResult` deliberately has no field for it.
+    replicate::set_watermark(&m.conn, "last_push", cursor_advance(batch.watermark))?;
     Ok((sent, res))
 }
 
@@ -226,7 +244,7 @@ fn srv_pull(m: &mut Mimir) -> Result<ApplyStats> {
     let since = replicate::get_watermark(&m.conn, "last_pull")?;
     let batch = http::pull(&endpoint, &token, since)?;
     let applied = replicate::apply_changes(&m.conn, &batch)?;
-    replicate::set_watermark(&m.conn, "last_pull", (batch.watermark - GRACE_SECS).max(0))?;
+    replicate::set_watermark(&m.conn, "last_pull", cursor_advance(batch.watermark))?;
     let _ = m.embed_pending();
     Ok(applied)
 }
