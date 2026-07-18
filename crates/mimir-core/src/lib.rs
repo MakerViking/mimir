@@ -50,6 +50,19 @@ const QUERY_CACHE_CAP: usize = 256;
 /// than a config knob — nobody has needed to tune it yet.
 const RERANK_MIN_STORE_NODES: i64 = 1000;
 
+/// Out-of-process inference — a running `mimir daemon` that already holds
+/// the models. Implemented in mimir-cli (core stays HTTP/async-free); every
+/// method is fallible and every caller falls back to the local path, so a
+/// remote can degrade latency but never break recall.
+pub trait RemoteInference: Send {
+    /// Cheap liveness gate (last-known state + dead-timer, no I/O).
+    fn available(&self) -> bool;
+    /// L2-normalized vectors, one per text, same model/dim as local config.
+    fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>>;
+    /// Relevance scores aligned with `docs` order.
+    fn rerank(&self, query: &str, docs: &[String]) -> Result<Vec<f32>>;
+}
+
 /// Engine facade. Owns one writer connection; cheap to open.
 /// The embedding model loads lazily on first semantic use and is cached
 /// for the process lifetime (long-lived in the MCP server).
@@ -63,6 +76,8 @@ pub struct Mimir {
     reranker_tried: bool,
     matrix: Option<MatrixCache>,
     query_cache: std::collections::HashMap<String, Vec<f32>>,
+    remote: Option<Box<dyn RemoteInference>>,
+    embedder_device: Option<String>,
 }
 
 impl Mimir {
@@ -84,6 +99,8 @@ impl Mimir {
             reranker_tried: false,
             matrix: None,
             query_cache: std::collections::HashMap::new(),
+            remote: None,
+            embedder_device: None,
         })
     }
 
@@ -99,7 +116,28 @@ impl Mimir {
             reranker_tried: false,
             matrix: None,
             query_cache: std::collections::HashMap::new(),
+            remote: None,
+            embedder_device: None,
         })
+    }
+
+    /// Attach an out-of-process inference backend (a running daemon).
+    /// Callers that never attach one get the pure-local behavior.
+    pub fn set_remote_inference(&mut self, remote: Box<dyn RemoteInference>) {
+        self.remote = Some(remote);
+    }
+
+    /// Override the device the *embedder* loads on, without touching config.
+    /// MCP sessions pass "cpu": batch-1 query embeds measured faster on CPU
+    /// than GPU, and a session-local GPU embedder is exactly the per-session
+    /// VRAM cost the daemon exists to remove. Deliberately does not affect
+    /// the reranker — a local-fallback reranker keeps the configured device.
+    pub fn set_embedder_device(&mut self, device: &str) {
+        self.embedder_device = Some(device.to_string());
+    }
+
+    fn remote_alive(&self) -> bool {
+        self.remote.as_ref().is_some_and(|r| r.available())
     }
 
     /// Lazily load the embedding model. Never downloads unless asked;
@@ -109,10 +147,14 @@ impl Mimir {
             allow_download || embed::model_ready(&self.paths, &self.config.embedding.model);
         if self.embedder.is_none() && !self.embedder_tried && downloadable {
             self.embedder_tried = true;
+            let device = self
+                .embedder_device
+                .as_deref()
+                .unwrap_or(&self.config.embedding.device);
             match embed::Embedder::load(
                 &self.paths,
                 &self.config.embedding.model,
-                &self.config.embedding.device,
+                device,
                 allow_download,
             ) {
                 Ok(e) => self.embedder = Some(e),
@@ -155,16 +197,18 @@ impl Mimir {
     /// governs the *default* — an explicit `rerank: true` argument to
     /// `search_with` always reranks regardless of this.
     fn should_auto_rerank(&mut self, query: &SearchQuery) -> bool {
-        let resident = match self.config.rerank.auto.as_str() {
+        let available = match self.config.rerank.auto.as_str() {
             "off" => return false,
-            "warm" => self.reranker_loaded(),
-            "always" => self.ensure_reranker(false).is_some(),
+            // "warm" = rerank only when it's free right now: a resident
+            // local model, or a daemon that already holds one.
+            "warm" => self.reranker_loaded() || self.remote_alive(),
+            "always" => self.remote_alive() || self.ensure_reranker(false).is_some(),
             other => {
                 tracing::warn!(auto = other, "unknown [rerank] auto value; treating as off");
                 return false;
             }
         };
-        resident && rerank_query_gates_pass(&self.conn, query)
+        available && rerank_query_gates_pass(&self.conn, query)
     }
 
     /// Hybrid search when the model is available locally, BM25-only otherwise.
@@ -261,6 +305,7 @@ impl Mimir {
     /// `[rerank] auto` and the per-query gates say it should — see
     /// `should_auto_rerank`.
     pub fn search_with(&mut self, query: &SearchQuery, rerank: bool) -> Result<Vec<Hit>> {
+        let explicit = rerank;
         let rerank = rerank || self.should_auto_rerank(query);
         let mut fetch_query = query.clone();
         if rerank {
@@ -295,38 +340,82 @@ impl Mimir {
         };
 
         if rerank && hits.len() > 1 {
-            if let Some(rr) = self.ensure_reranker(false) {
-                let docs: Vec<String> = hits
-                    .iter()
-                    .map(|h| {
-                        let title = h.node.title.as_deref().unwrap_or("");
-                        let body = h.node.body.as_deref().unwrap_or("");
-                        // Cross-encoders cap at ~512 tokens; keep pairs cheap.
-                        format!("{title}\n{body}").chars().take(1500).collect()
-                    })
-                    .collect();
-                match rr.rerank(&query.text, docs) {
-                    Ok(ranked) => {
-                        let mut slots: Vec<Option<Hit>> = hits.into_iter().map(Some).collect();
-                        let mut reordered = Vec::with_capacity(slots.len());
-                        for (idx, score) in ranked {
-                            if let Some(mut hit) = slots.get_mut(idx).and_then(Option::take) {
-                                hit.score = score as f64;
-                                reordered.push(hit);
-                            }
-                        }
-                        // Anything the reranker didn't score keeps fused order.
-                        reordered.extend(slots.into_iter().flatten());
-                        hits = reordered;
-                    }
-                    Err(err) => {
-                        tracing::warn!(%err, "rerank failed; keeping fused order");
+            let docs: Vec<String> = hits
+                .iter()
+                .map(|h| {
+                    let title = h.node.title.as_deref().unwrap_or("");
+                    let body = h.node.body.as_deref().unwrap_or("");
+                    // Cross-encoders cap at ~512 tokens; keep pairs cheap.
+                    format!("{title}\n{body}").chars().take(1500).collect()
+                })
+                .collect();
+            if let Some(ranked) = self.rerank_docs(&query.text, docs, explicit) {
+                let mut slots: Vec<Option<Hit>> = hits.into_iter().map(Some).collect();
+                let mut reordered = Vec::with_capacity(slots.len());
+                for (idx, score) in ranked {
+                    if let Some(mut hit) = slots.get_mut(idx).and_then(Option::take) {
+                        hit.score = score as f64;
+                        reordered.push(hit);
                     }
                 }
+                // Anything the reranker didn't score keeps fused order.
+                reordered.extend(slots.into_iter().flatten());
+                hits = reordered;
             }
         }
         hits.truncate(query.limit);
         Ok(hits)
+    }
+
+    /// Rank `docs` against `text`, best-first `(doc_index, score)`. Priority:
+    /// locally-resident reranker (same GPU, zero hop) → live daemon → cold
+    /// local load — the last only when the caller explicitly asked to rerank
+    /// or config says "always"; auto-"warm" never forces a model into this
+    /// process. `None` = keep fused order (every failure degrades, none fail).
+    fn rerank_docs(
+        &mut self,
+        text: &str,
+        docs: Vec<String>,
+        explicit: bool,
+    ) -> Option<Vec<(usize, f32)>> {
+        if self.reranker_loaded() {
+            return self.local_rerank(text, docs);
+        }
+        if let Some(remote) = self.remote.as_ref().filter(|r| r.available()) {
+            match remote.rerank(text, &docs) {
+                Ok(scores) if scores.len() == docs.len() => {
+                    let mut ranked: Vec<(usize, f32)> = scores.into_iter().enumerate().collect();
+                    ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    return Some(ranked);
+                }
+                Ok(scores) => tracing::warn!(
+                    got = scores.len(),
+                    want = docs.len(),
+                    "daemon rerank score count mismatch; keeping fused order"
+                ),
+                Err(err) => tracing::warn!(%err, "daemon rerank failed; keeping fused order"),
+            }
+            // A live-but-failing daemon doesn't justify pulling a local
+            // model into memory unless the caller demanded a rerank.
+            if !explicit {
+                return None;
+            }
+        }
+        if explicit || self.config.rerank.auto == "always" {
+            return self.local_rerank(text, docs);
+        }
+        None
+    }
+
+    fn local_rerank(&mut self, text: &str, docs: Vec<String>) -> Option<Vec<(usize, f32)>> {
+        let rr = self.ensure_reranker(false)?;
+        match rr.rerank(text, docs) {
+            Ok(ranked) => Some(ranked),
+            Err(err) => {
+                tracing::warn!(%err, "rerank failed; keeping fused order");
+                None
+            }
+        }
     }
 
     /// Embed all new/changed content. No-op (0) when no model is present.
@@ -344,17 +433,30 @@ impl Mimir {
         if !embed::has_pending(&self.conn, &self.config.embedding.model)? {
             return Ok(0);
         }
-        self.ensure_embedder(false);
-        let Mimir {
-            conn,
-            embedder,
-            matrix,
-            config,
-            ..
-        } = self;
-        let ids = match embedder.as_mut() {
-            Some(e) => embed::embed_pending(conn, e)?,
-            None => Vec::new(),
+        let model = self.config.embedding.model.clone();
+        // Daemon first (its GPU is faster for bulk batches); local on any
+        // failure. Safe to rerun after a partial remote run: work commits
+        // per batch and the pending selection is idempotent, so the local
+        // pass just picks up whatever the remote didn't finish.
+        let mut ids = None;
+        if let Some(remote) = self.remote.as_ref().filter(|r| r.available()) {
+            match embed::embed_pending(&self.conn, &model, &mut |texts| remote.embed(&texts)) {
+                Ok(v) => ids = Some(v),
+                Err(err) => {
+                    tracing::warn!(%err, "daemon embed failed; falling back to local embedder")
+                }
+            }
+        }
+        let ids = match ids {
+            Some(v) => v,
+            None => {
+                self.ensure_embedder(false);
+                let Mimir { conn, embedder, .. } = self;
+                match embedder.as_mut() {
+                    Some(e) => embed::embed_pending(conn, &model, &mut |texts| e.embed(texts))?,
+                    None => Vec::new(),
+                }
+            }
         };
         // Above this, a linear-scan patch (see MatrixCache::upsert) approaches
         // the cost of just rebuilding; bulk operations aren't latency-sensitive
@@ -362,9 +464,9 @@ impl Mimir {
         const PATCH_THRESHOLD: usize = 200;
         if !ids.is_empty() {
             if ids.len() <= PATCH_THRESHOLD {
-                MatrixCache::upsert(conn, &config.embedding.model, &ids, matrix)?;
+                MatrixCache::upsert(&self.conn, &model, &ids, &mut self.matrix)?;
             } else {
-                *matrix = None;
+                self.matrix = None;
             }
         }
         Ok(ids.len())
@@ -534,5 +636,170 @@ mod tests {
             &conn,
             &q("a real multi word query")
         ));
+    }
+
+    /// Canned out-of-process backend: embeds everything to a dim-4 vector,
+    /// scores rerank docs by marker words (gamma > beta > rest), and can be
+    /// switched into down/failing modes to exercise every fallback edge.
+    struct FakeRemote {
+        up: bool,
+        fail: bool,
+    }
+
+    impl RemoteInference for FakeRemote {
+        fn available(&self) -> bool {
+            self.up
+        }
+        fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+            if self.fail {
+                return Err(crate::error::Error::Embed("fake remote failure".into()));
+            }
+            Ok(texts.iter().map(|_| vec![0.5, 0.5, 0.5, 0.5]).collect())
+        }
+        fn rerank(&self, _query: &str, docs: &[String]) -> Result<Vec<f32>> {
+            if self.fail {
+                return Err(crate::error::Error::Embed("fake remote failure".into()));
+            }
+            Ok(docs
+                .iter()
+                .map(|d| {
+                    if d.contains("gamma") {
+                        0.9
+                    } else if d.contains("beta") {
+                        0.5
+                    } else {
+                        0.1
+                    }
+                })
+                .collect())
+        }
+    }
+
+    fn remember_one(m: &Mimir, text: &str) -> i64 {
+        match memory::remember(
+            &m.conn,
+            memory::Remember {
+                text: text.into(),
+                mtype: crate::model::MemoryType::Note,
+                tags: vec![],
+                project_id: None,
+                force: false,
+            },
+        )
+        .unwrap()
+        {
+            memory::RememberOutcome::Created(n) => n.id,
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn embed_pending_persists_remote_vectors() {
+        let mut m = open();
+        let id = remember_one(&m, "SCRAM auth rejects non-ASCII passwords");
+        m.set_remote_inference(Box::new(FakeRemote {
+            up: true,
+            fail: false,
+        }));
+        assert_eq!(m.embed_pending().unwrap(), 1);
+        let (model, dim): (String, i64) = m
+            .conn
+            .query_row(
+                "SELECT model, dim FROM embedding WHERE node_id = ?1",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(model, m.config.embedding.model);
+        assert_eq!(dim, 4);
+        assert!(!embed::has_pending(&m.conn, &m.config.embedding.model).unwrap());
+    }
+
+    #[test]
+    fn embed_pending_remote_failure_leaves_rows_pending() {
+        let mut m = open();
+        remember_one(&m, "SCRAM auth rejects non-ASCII passwords");
+        m.set_remote_inference(Box::new(FakeRemote {
+            up: true,
+            fail: true,
+        }));
+        // Remote errs; the local fallback has no model in this test env, so
+        // the run is a clean no-op — nothing persisted, nothing poisoned.
+        assert_eq!(m.embed_pending().unwrap(), 0);
+        assert!(embed::has_pending(&m.conn, &m.config.embedding.model).unwrap());
+    }
+
+    /// Seed enough embeddable nodes to clear RERANK_MIN_STORE_NODES, plus
+    /// three recall targets distinguished by marker words.
+    fn seed_rerankable_store(m: &Mimir) {
+        for i in 0..(RERANK_MIN_STORE_NODES as usize + 1) {
+            let mut n = NewNode::new(Kind::Memory);
+            n.title = Some(format!("seed {i}"));
+            n.body = Some("filler".into());
+            store::insert_node(&m.conn, n).unwrap();
+        }
+        for marker in ["gamma", "beta", "plain"] {
+            let mut n = NewNode::new(Kind::Memory);
+            n.title = Some(format!("target {marker}"));
+            n.body = Some(format!("alpha topic {marker}"));
+            store::insert_node(&m.conn, n).unwrap();
+        }
+    }
+
+    #[test]
+    fn warm_auto_rerank_fires_via_remote_and_reorders() {
+        let mut m = open();
+        m.config.rerank.auto = "warm".into();
+        seed_rerankable_store(&m);
+
+        let query = q("alpha topic");
+        // Warm + nothing resident + no remote: never fires.
+        assert!(!m.should_auto_rerank(&query));
+        // A down remote changes nothing.
+        m.set_remote_inference(Box::new(FakeRemote {
+            up: false,
+            fail: false,
+        }));
+        assert!(!m.should_auto_rerank(&query));
+        let fused: Vec<i64> = m
+            .search_with(&query, false)
+            .unwrap()
+            .iter()
+            .map(|h| h.node.id)
+            .collect();
+        assert!(fused.len() >= 3);
+
+        // Live remote: warm fires and the fake's scores dictate the order.
+        m.set_remote_inference(Box::new(FakeRemote {
+            up: true,
+            fail: false,
+        }));
+        assert!(m.should_auto_rerank(&query));
+        let hits = m.search_with(&query, false).unwrap();
+        let bodies: Vec<&str> = hits
+            .iter()
+            .take(2)
+            .map(|h| h.node.body.as_deref().unwrap())
+            .collect();
+        assert!(bodies[0].contains("gamma"), "got {bodies:?}");
+        assert!(bodies[1].contains("beta"), "got {bodies:?}");
+
+        // Failing remote: warm still gates true, but the rerank degrades to
+        // the fused order instead of cold-loading a local model.
+        m.set_remote_inference(Box::new(FakeRemote {
+            up: true,
+            fail: true,
+        }));
+        let degraded: Vec<i64> = m
+            .search_with(&query, false)
+            .unwrap()
+            .iter()
+            .map(|h| h.node.id)
+            .collect();
+        assert_eq!(degraded, fused, "remote failure must keep fused order");
+        assert!(
+            !m.reranker_loaded(),
+            "auto-warm must never pull a local model into the process"
+        );
     }
 }

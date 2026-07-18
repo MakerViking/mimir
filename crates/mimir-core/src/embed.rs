@@ -433,7 +433,11 @@ pub fn has_pending(conn: &Connection, model: &str) -> Result<bool> {
     Ok(conn.query_row(&sql, [model], |r| r.get(0))?)
 }
 
-pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<Vec<i64>> {
+pub fn embed_pending(
+    conn: &Connection,
+    model: &str,
+    embed: &mut dyn FnMut(Vec<String>) -> Result<Vec<Vec<f32>>>,
+) -> Result<Vec<i64>> {
     struct Pending {
         id: i64,
         text: String,
@@ -446,7 +450,7 @@ pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<Vec<i
         pending_where()
     ))?;
     let pending: Vec<Pending> = stmt
-        .query_map([&embedder.name], |r| {
+        .query_map([model], |r| {
             let title: Option<String> = r.get(1)?;
             let body: String = r.get(2)?;
             let hash: Option<Vec<u8>> = r.get(3)?;
@@ -480,7 +484,7 @@ pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<Vec<i
                 .query_row(
                     "SELECT dim, vec FROM embedding
                      WHERE model = ?1 AND content_hash = ?2 AND node_id <> ?3 LIMIT 1",
-                    params![embedder.name, p.hash, p.id],
+                    params![model, p.hash, p.id],
                     |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .optional()?;
@@ -494,20 +498,20 @@ pub fn embed_pending(conn: &Connection, embedder: &mut Embedder) -> Result<Vec<i
         let vectors = if to_embed.is_empty() {
             Vec::new()
         } else {
-            embedder.embed(to_embed.iter().map(|p| p.text.clone()).collect())?
+            embed(to_embed.iter().map(|p| p.text.clone()).collect())?
         };
 
         // Phase 3: take the writer lock just long enough to persist this batch.
         // IMMEDIATE so a concurrent writer waits (busy_timeout) instead of
         // erroring on a DEFERRED read→write upgrade. new_unchecked because we
-        // only hold &Connection (the caller keeps the embedder borrow).
+        // only hold &Connection (the caller keeps the inference borrow).
         let tx =
             rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
         for (p, dim, vec) in &copies {
-            upsert(&tx, p.id, &embedder.name, *dim as usize, vec, &p.hash)?;
+            upsert(&tx, p.id, model, *dim as usize, vec, &p.hash)?;
         }
         for (p, vec) in to_embed.iter().zip(&vectors) {
-            upsert(&tx, p.id, &embedder.name, vec.len(), &to_blob(vec), &p.hash)?;
+            upsert(&tx, p.id, model, vec.len(), &to_blob(vec), &p.hash)?;
         }
         tx.commit()?;
     }
