@@ -56,6 +56,40 @@ pub struct Config {
     pub savings: SavingsConfig,
     pub hooks: HooksConfig,
     pub learn: LearnConfig,
+    pub daemon: DaemonConfig,
+}
+
+/// Settings for `mimir daemon` inference delegation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DaemonConfig {
+    /// Whether per-session MCP servers delegate GPU inference (bulk
+    /// embedding + reranking) to a running `mimir daemon`, reached at the
+    /// same address as `hooks.inject_url` (one setting decides where the
+    /// daemon lives; bearer token from MIMIR_HTTP_TOKEN, same as the
+    /// daemon itself reads).
+    /// - "auto" (default): delegate when the daemon answers. Sessions then
+    ///   load their own embedder CPU-only — measured *faster* than GPU for
+    ///   batch-1 query embeds — and never load a local reranker while the
+    ///   daemon is reachable, so a session holds zero GPU memory. Daemon
+    ///   down at session start: exactly the old behavior ([rerank] auto =
+    ///   "warm" eager-loads a local reranker on the configured device);
+    ///   daemon dies mid-session: embeds fall back to the session's CPU
+    ///   embedder in the same call, reranks degrade to fused order, and
+    ///   delegation resumes on its own when the daemon returns. The only
+    ///   deliberate cost: with no daemon at all, background bulk indexing
+    ///   (first contact with a big repo) runs on CPU instead of GPU.
+    /// - "off": pre-daemon behavior — every process loads its own models
+    ///   on the [embedding] device and nothing is delegated.
+    pub inference: String,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        DaemonConfig {
+            inference: "auto".into(),
+        }
+    }
 }
 
 /// Settings for the opt-in Claude Code hooks (`mimir init --hooks`).

@@ -761,6 +761,11 @@ pub fn run(
     http_token: Option<String>,
 ) -> Result<()> {
     let engine = Mimir::open()?;
+    // Inference delegation (default on): background engines and the stdio
+    // session run their embedder on CPU and route bulk embeds/reranks to a
+    // running `mimir daemon`, so GPU device create/teardown happens in ONE
+    // process instead of every session and background tick.
+    let delegate = engine.config.daemon.inference == "auto";
     let project_id = match server_cwd() {
         Some(d) => match engine.detect_project(&d) {
             Ok((node, detection)) => {
@@ -797,6 +802,10 @@ pub fn run(
         if auto.graph || auto.docs {
             std::thread::spawn(move || {
                 let Ok(mut m) = Mimir::open() else { return };
+                if delegate {
+                    m.set_embedder_device("cpu");
+                    crate::infer::attach_lazy(&mut m);
+                }
                 let Ok(proj) = mimir_core::store::get_node(&m.conn, pid) else {
                     return;
                 };
@@ -872,10 +881,16 @@ pub fn run(
         let interval = engine.config.sync.interval_mins.max(1);
         std::thread::spawn(move || loop {
             match mimir_core::Mimir::open() {
-                Ok(mut m) => match crate::sync::perform(&mut m) {
-                    Ok(summary) => tracing::info!("auto-sync: {summary}"),
-                    Err(e) => tracing::warn!("auto-sync failed: {e}"),
-                },
+                Ok(mut m) => {
+                    if delegate {
+                        m.set_embedder_device("cpu");
+                        crate::infer::attach_lazy(&mut m);
+                    }
+                    match crate::sync::perform(&mut m) {
+                        Ok(summary) => tracing::info!("auto-sync: {summary}"),
+                        Err(e) => tracing::warn!("auto-sync failed: {e}"),
+                    }
+                }
                 Err(e) => tracing::warn!("auto-sync open failed: {e}"),
             }
             std::thread::sleep(std::time::Duration::from_secs(interval * 60));
@@ -892,7 +907,18 @@ pub fn run(
                 // work above and never actually serves requests, so loading
                 // the reranker onto it would just be a wasted cold load.
                 let mut engine = engine;
-                eager_load_reranker_if_auto(&mut engine);
+                // With a live daemon this session holds zero GPU state: CPU
+                // embedder (measured faster for batch-1 query embeds than
+                // GPU) and no local reranker — `[rerank] auto = "warm"`
+                // fires through the daemon instead. Daemon unreachable at
+                // startup (or delegation off): exactly the old behavior.
+                let daemon_alive = crate::infer::attach(&mut engine);
+                if delegate {
+                    engine.set_embedder_device("cpu");
+                }
+                if !daemon_alive {
+                    eager_load_reranker_if_auto(&mut engine);
+                }
                 let service = MimirServer::new(engine, project_id)
                     .serve(rmcp::transport::stdio())
                     .await?;

@@ -894,9 +894,14 @@ pub fn doctor(check_only: bool) -> Result<()> {
         // state — the hooks fall back to the cold `mimir recall-inject` path —
         // so this must never fail `doctor`'s exit code, same precedent as the
         // "model" check above.
-        let inject_url = Config::load(&paths.config_file)
-            .map(|c| c.hooks.inject_url)
-            .unwrap_or_else(|_| mimir_core::config::HooksConfig::default().inject_url);
+        let (inject_url, delegation) = Config::load(&paths.config_file)
+            .map(|c| (c.hooks.inject_url, c.daemon.inference))
+            .unwrap_or_else(|_| {
+                (
+                    mimir_core::config::HooksConfig::default().inject_url,
+                    mimir_core::config::DaemonConfig::default().inference,
+                )
+            });
         let warm = ureq::get(&inject_url)
             .timeout(std::time::Duration::from_secs(1))
             .call()
@@ -905,11 +910,14 @@ pub fn doctor(check_only: bool) -> Result<()> {
             "daemon",
             true,
             if warm {
-                format!("warm ({inject_url} reachable — hooks use the fast HTTP path)")
+                format!(
+                    "warm ({inject_url} reachable — hooks use the fast HTTP path; \
+                     inference delegation: {delegation})"
+                )
             } else {
                 format!(
                     "cold ({inject_url} not reachable — hooks fall back to `mimir recall-inject`; \
-                     run `mimir daemon` for the warm path)"
+                     run `mimir daemon` for the warm path; inference delegation: {delegation})"
                 )
             },
             &mut failures,
@@ -1161,7 +1169,8 @@ pub fn daemon() -> Result<()> {
     let addr = inject_addr(&mimir.config.hooks.inject_url)?;
     println!(
         "mimir daemon: warm path at http://{addr}/inject — the auto-recall hook will use \
-         this instead of the cold `mimir recall-inject` fallback"
+         this instead of the cold `mimir recall-inject` fallback; /embed and /rerank serve \
+         inference delegation for MCP sessions ([daemon] inference = \"auto\")"
     );
     // Same HTTP surface as `mimir mcp --http`, so honor the same env-var
     // bearer gate (there is no --http-token flag on daemon by design).

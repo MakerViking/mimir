@@ -992,3 +992,119 @@ fn server_sync_survives_peer_clock_skew() {
         "Y's edit landed on the hub: {listing2}"
     );
 }
+
+/// A stdio MCP session with the default `[daemon] inference = "auto"` and NO
+/// daemon running: the startup probe fails fast, the session comes up, and
+/// recall answers locally — delegation must never block or break a session.
+#[test]
+fn mcp_stdio_recall_works_without_daemon() {
+    use std::io::{BufRead, BufReader, Write};
+
+    let h = Harness::new();
+    h.ok(&["init", "--no-model"]);
+    h.ok(&[
+        "remember",
+        "SCRAM auth rejects non-ASCII passwords",
+        "-t",
+        "gotcha",
+    ]);
+    // Point delegation at a port nothing listens on (fast refusal) instead
+    // of the default :8077, where the developer's real daemon might live.
+    std::fs::write(
+        h.home.path().join("config.toml"),
+        "[hooks]\ninject_url = \"http://127.0.0.1:9/inject\"\n",
+    )
+    .unwrap();
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_mimir"))
+        .arg("mcp")
+        .env("MIMIR_HOME", h.home.path())
+        .env("HOME", h.home.path())
+        .env("USERPROFILE", h.home.path())
+        .current_dir(h.cwd.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    // Take the pipes before the kill-on-drop guard owns the child; `stdin`
+    // must stay alive (open) until the response is read — EOF would race
+    // the session shutdown against the reply.
+    let mut stdin = child.stdin.take().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let _guard = HubGuard(child);
+
+    let requests = concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+        "\n",
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"query":"SCRAM auth passwords"}}}"#,
+        "\n"
+    );
+    stdin.write_all(requests.as_bytes()).unwrap();
+    stdin.flush().unwrap();
+
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if line.contains("\"id\":2") {
+                let _ = tx.send(line);
+                return;
+            }
+        }
+    });
+    let response = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("recall response within 30s despite the dead daemon URL");
+    assert!(
+        response.contains("SCRAM"),
+        "recall must answer locally when the daemon is unreachable: {response}"
+    );
+    drop(stdin);
+}
+
+/// `mimir daemon` exposes the inference-delegation endpoints: the probe
+/// answers the configured model names, and a model-less store says 503 on
+/// /embed (the client's back-off signal) rather than pretending to help.
+#[test]
+fn daemon_serves_inference_endpoints() {
+    let home = tempfile::tempdir().unwrap();
+    init_server_home(home.path());
+    // Different base than the sync-hub tests so parallel binaries can't collide.
+    let port: u16 = 43000 + (std::process::id() % 2000) as u16;
+    std::fs::write(
+        home.path().join("config.toml"),
+        format!("[hooks]\ninject_url = \"http://127.0.0.1:{port}/inject\"\n"),
+    )
+    .unwrap();
+    let bin = env!("CARGO_BIN_EXE_mimir");
+    let _daemon = HubGuard(
+        Command::new(bin)
+            .arg("daemon")
+            .env("MIMIR_HOME", home.path())
+            .env("HOME", home.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_hub(port);
+
+    let info: serde_json::Value = ureq::get(&format!("http://127.0.0.1:{port}/inference"))
+        .call()
+        .expect("/inference answers")
+        .into_json()
+        .unwrap();
+    assert_eq!(info["embedding_model"], "bge-small-en-v1.5");
+    assert_eq!(info["rerank_model"], "jina-reranker-v1-turbo-en");
+
+    let embed = ureq::post(&format!("http://127.0.0.1:{port}/embed"))
+        .set("Content-Type", "application/json")
+        .send_string(r#"{"texts":["hi"]}"#);
+    match embed {
+        Err(ureq::Error::Status(code, _)) => assert_eq!(code, 503, "model-less store => 503"),
+        other => panic!("expected 503 from /embed on a model-less store, got {other:?}"),
+    }
+}

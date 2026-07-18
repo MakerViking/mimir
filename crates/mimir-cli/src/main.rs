@@ -6,6 +6,7 @@ mod filters;
 mod fsutil;
 mod graph_cmd;
 mod graph_viz;
+mod infer;
 mod mcp;
 mod project_cmd;
 mod proxy_cmd;
