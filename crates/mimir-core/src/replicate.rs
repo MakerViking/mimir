@@ -7,11 +7,14 @@
 //! if that project hasn't been opened on this machine yet (adopted on first
 //! local open). Identity is the node `uid` (a globally unique ULID), so merges
 //! are uid-keyed last-write-wins on `updated_at` — convergent and idempotent
-//! across machines. Tombstones ride along as `deleted_at`. Local-only signals
+//! across machines. Caveat: `updated_at` is second-resolution and an incoming
+//! row wins only when STRICTLY newer, so two edits of the same memory within
+//! one second resolve by arrival order (one is silently kept, the other
+//! dropped). Tombstones ride along as `deleted_at`. Local-only signals
 //! (strength, access_count, recall_event) and embeddings are never synced; a
 //! peer recomputes embeddings locally.
 
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
@@ -73,6 +76,14 @@ pub struct ApplyStats {
 /// memories of a sync-enabled project that carries a portable key.
 const SYNCABLE: &str = "m.kind='memory' AND (m.project_id IS NULL OR \
     (json_extract(p.meta,'$.sync')=1 AND json_extract(p.meta,'$.portable_key') IS NOT NULL))";
+
+/// Rust twin of `SYNCABLE`'s project condition: a project's memories sync only
+/// when its meta has `sync = true` AND a `portable_key`. Keep in lockstep with
+/// the SQL predicate above — callers (e.g. `reproject`'s warning) rely on the
+/// two agreeing.
+pub fn project_is_syncable(meta: &serde_json::Value) -> bool {
+    meta.get("sync").and_then(|v| v.as_bool()) == Some(true) && meta.get("portable_key").is_some()
+}
 
 /// "Changed since `since`" = syncable memories whose latest activity
 /// (max of updated_at and deleted_at) is newer than `since`, plus all edges
@@ -173,6 +184,10 @@ pub fn current_high_watermark(conn: &Connection) -> Result<i64> {
 /// upsert for edges (danglers skipped, never fatal). Idempotent.
 pub fn apply_changes(conn: &Connection, batch: &SyncBatch) -> Result<ApplyStats> {
     let mut stats = ApplyStats::default();
+    // IMMEDIATE + one transaction for the whole batch: a crash or error
+    // mid-apply must not leave a partial batch (some nodes/edges upserted,
+    // others not) on disk. Same lock-upgrade rationale as store::record_shown.
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     for n in &batch.nodes {
         let hash: Option<Vec<u8>> = n.content_hash.as_deref().and_then(from_hex);
         let tags_text = n.tags.join(" ");
@@ -181,12 +196,12 @@ pub fn apply_changes(conn: &Connection, batch: &SyncBatch) -> Result<ApplyStats>
         // when that project is later opened locally.
         let project_id: Option<i64> = match n.project_key.as_deref() {
             None => None,
-            Some(key) => Some(store::resolve_or_shadow_project(conn, key)?),
+            Some(key) => Some(store::resolve_or_shadow_project(&tx, key)?),
         };
         // Upsert; on uid conflict, overwrite only the synced fields and only when
         // the incoming record is strictly newer. Local signals (strength,
         // access_count, …) are never touched.
-        let changed = conn.execute(
+        let changed = tx.execute(
             "INSERT INTO node (uid, kind, subkind, project_id, title, body, tags_text, content_hash,
                                meta, pinned, created_at, updated_at, deleted_at)
              VALUES (?1, 'memory', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
@@ -227,16 +242,17 @@ pub fn apply_changes(conn: &Connection, batch: &SyncBatch) -> Result<ApplyStats>
     }
 
     for e in &batch.edges {
-        let src = store::get_node_by_uid(conn, &e.src_uid).ok();
-        let dst = store::get_node_by_uid(conn, &e.dst_uid).ok();
+        let src = store::get_node_by_uid(&tx, &e.src_uid).ok();
+        let dst = store::get_node_by_uid(&tx, &e.dst_uid).ok();
         match (src, dst, e.rel.parse::<Rel>()) {
             (Some(s), Some(d), Ok(rel)) => {
-                store::link(conn, s.id, d.id, rel, e.weight)?;
+                store::link(&tx, s.id, d.id, rel, e.weight)?;
                 stats.edges_upserted += 1;
             }
             _ => stats.edges_skipped += 1,
         }
     }
+    tx.commit()?;
     Ok(stats)
 }
 

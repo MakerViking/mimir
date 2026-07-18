@@ -28,6 +28,9 @@ pub enum Error {
     #[error("{0}")]
     Invalid(String),
 
+    #[error("refused: text looks like it contains {0} — redact it and retry")]
+    Secret(&'static str),
+
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 

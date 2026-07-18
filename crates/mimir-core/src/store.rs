@@ -405,6 +405,59 @@ pub fn resolve_or_shadow_project(conn: &Connection, key: &str) -> Result<i64> {
     Ok(insert_node(conn, new)?.id)
 }
 
+/// Resolve a project by its display title, preferring a locally-bound project
+/// (one with a `path`) over a synced shadow (path-less, `meta.shadow`) of the
+/// same name — so `reproject --project foo` targets the real local project when
+/// a shadow pulled in over sync shares its title. Returns `None` if nothing
+/// matches; an error explaining the title must be unique if two
+/// equally-preferred projects share it.
+pub fn find_project_by_title(conn: &Connection, title: &str) -> Result<Option<Node>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} FROM node
+         WHERE kind = 'project' AND deleted_at IS NULL AND title = ?1"
+    ))?;
+    let mut nodes: Vec<Node> = stmt
+        .query_map([title], row_to_node)?
+        .collect::<rusqlite::Result<_>>()?;
+    // Prefer path-bearing (locally-bound) projects; drop shadows if any real
+    // local project matched.
+    if nodes.iter().any(|n| n.path.is_some()) {
+        nodes.retain(|n| n.path.is_some());
+    }
+    match nodes.len() {
+        0 => Ok(None),
+        1 => Ok(Some(nodes.into_iter().next().unwrap())),
+        n => Err(Error::Invalid(format!(
+            "{n} projects share the title '{title}', so --project can't pick one; \
+             give the target project a unique title first"
+        ))),
+    }
+}
+
+/// Move a memory to another project (`project_id = Some`) or to global scope
+/// (`project_id = None`). A memory's project is fixed at `remember` time from
+/// the session's working directory; this re-files one that landed in the wrong
+/// place. Bumps `updated_at` so the change rides the existing last-write-wins
+/// sync: `changes_since` emits the (new) owning project as `portable_key` and
+/// `apply_changes` reattaches via `resolve_or_shadow_project`, so it converges
+/// across the hub and every machine. Refuses non-memory nodes — files, symbols,
+/// and doc/code chunks derive their project from their source, so moving one
+/// would only desync it from the graph it belongs to.
+pub fn reproject(conn: &Connection, node: &Node, project_id: Option<i64>) -> Result<()> {
+    if node.kind != Kind::Memory {
+        return Err(Error::Invalid(format!(
+            "node #{} is a {}, not a memory; only memories can be reprojected",
+            node.id,
+            node.kind.as_str()
+        )));
+    }
+    conn.execute(
+        "UPDATE node SET project_id = ?2, updated_at = ?3 WHERE id = ?1",
+        params![node.id, project_id, now_unix()],
+    )?;
+    Ok(())
+}
+
 /// Live file nodes whose relative path ends with `suffix` (max 3).
 pub fn files_by_path_suffix(conn: &Connection, suffix: &str) -> Result<Vec<Node>> {
     let mut stmt = conn.prepare(&format!(
@@ -599,6 +652,54 @@ mod tests {
         new.body = Some(body.into());
         new.tags = vec!["alpha".into(), "beta".into()];
         insert_node(conn, new).unwrap()
+    }
+
+    #[test]
+    fn reproject_moves_memory_and_bumps_updated_at() {
+        let c = conn();
+        let src = ensure_project(&c, "/abs/src", "src").unwrap();
+        let dst = ensure_project(&c, "/abs/dst", "dst").unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.title = Some("m".into());
+        new.project_id = Some(src.id);
+        let m = insert_node(&c, new).unwrap();
+        assert_eq!(m.project_id, Some(src.id));
+
+        // Move to another project.
+        reproject(&c, &m, Some(dst.id)).unwrap();
+        let moved = get_node(&c, m.id).unwrap();
+        assert_eq!(moved.project_id, Some(dst.id));
+        assert!(
+            moved.updated_at >= m.updated_at,
+            "updated_at must not regress"
+        );
+
+        // Move to global (no project).
+        reproject(&c, &m, None).unwrap();
+        assert_eq!(get_node(&c, m.id).unwrap().project_id, None);
+    }
+
+    #[test]
+    fn reproject_refuses_non_memory() {
+        let c = conn();
+        let dst = ensure_project(&c, "/abs/dst", "dst").unwrap();
+        // A project node is not a memory.
+        let err = reproject(&c, &dst, None).unwrap_err();
+        assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn find_project_by_title_prefers_local_over_shadow() {
+        let c = conn();
+        // A synced shadow (path-less) and a local project share the title.
+        let shadow = resolve_or_shadow_project(&c, "git:github.com/o/dup").unwrap();
+        let local = ensure_project(&c, "/abs/dup", "dup").unwrap();
+        // The shadow's title is derived from the key tail ("dup"), same as local.
+        let found = find_project_by_title(&c, "dup").unwrap().unwrap();
+        assert_eq!(found.id, local.id, "should pick the path-bearing local");
+        assert_ne!(found.id, shadow);
+        // No match returns None, not an error.
+        assert!(find_project_by_title(&c, "nope").unwrap().is_none());
     }
 
     #[test]

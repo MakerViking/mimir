@@ -24,6 +24,7 @@ pub mod replicate;
 pub mod savings;
 pub mod scope;
 pub mod search;
+pub mod secrets;
 pub mod store;
 pub mod tokens;
 
