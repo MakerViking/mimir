@@ -218,6 +218,15 @@ mimir doctor                          # confirms "daemon: warm (...)"
   only (semantic-only matches wait for the daemon).
 - Either way the engine's own warm recall is single-digit ms; there is no
   configuration in which the hook blocks your prompt for half a second.
+- **On GPU builds the daemon is also the only GPU process.** It serves
+  `/embed` and `/rerank` alongside `/inject`, and every MCP session
+  delegates bulk embedding and reranking to it (`[daemon] inference =
+  "auto"`, the default) while running its own query embedder CPU-only —
+  which is measured *faster* than GPU for single-query embeds. Net: N
+  concurrent agent sessions cost one model's worth of GPU memory instead of
+  N. No daemon, no problem: sessions fall back to fully-local inference
+  automatically; `[daemon] inference = "off"` restores the old
+  every-process-loads-its-own behavior.
 
 To keep the daemon across reboots, install the systemd user unit:
 `cp contrib/mimir-daemon.service ~/.config/systemd/user/ && systemctl --user enable --now mimir-daemon`.

@@ -5,6 +5,23 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **Shared inference daemon — zero-VRAM sessions on GPU builds.** `mimir
+  daemon` (and `mimir mcp --http`) now serves three inference-delegation
+  endpoints on its warm engine: `GET /inference` (which models it holds),
+  `POST /embed` (L2-normalized vectors), `POST /rerank` (cross-encoder
+  scores). With the new `[daemon] inference = "auto"` (default), every stdio
+  MCP session and background engine loads its embedder **CPU-only** —
+  measured *faster* than GPU for the batch-1 query embeds sessions actually
+  do — and routes bulk embedding and reranking to the one daemon process, so
+  N concurrent agent sessions cost one model's worth of GPU memory instead
+  of N (previously ~0.7 GiB VRAM per session and growing). Fully graceful:
+  daemon absent at session start ⇒ exactly the old local behavior (including
+  `[rerank] auto = "warm"` eager-loading a local reranker); daemon dies
+  mid-session ⇒ embeds fall back to the session's CPU embedder in the same
+  call, reranks degrade to fused order, and delegation resumes on its own; a
+  bearer-token rejection or a daemon serving different model names disables
+  delegation for that session (mismatched vectors would poison the store).
+  `[daemon] inference = "off"` restores the fully-local pre-daemon behavior.
 - **Secrets guard on `remember`** — capture now refuses text, tags, or
   `fires_when` phrases that look like they contain an actual credential: private-key blocks, AWS access
   key ids, GitHub tokens/PATs, Slack tokens, JWTs. High-precision structural
@@ -60,6 +77,15 @@ the `mimir-mem` crate, and the on-disk schema move together.
   wiring `doctor --check` to a desktop notification on failure.
 
 ### Fixed
+- **GPU memory leak in long-lived sessions** — `embed_pending` loaded the
+  embedding model *before* checking whether anything needed embedding, so
+  every speculative background call (the auto-sync loop, every
+  `interval_mins`) created and tore down a whole GPU device just to discover
+  there was no work — and repeated Vulkan/Dawn device create/teardown leaks
+  driver memory (observed: `mimir mcp` sessions growing from ~0.7 to ~6 GiB
+  VRAM over a day). A cheap `EXISTS` probe now gates the model load, and
+  background engines run their embedder on CPU, so GPU device churn is gone
+  entirely.
 - **Sync: client push watermark could be poisoned by another peer's clock
   skew.** `sync push` advanced the client's `last_push` cursor from the hub's
   post-apply *global* high-watermark instead of the local batch it actually

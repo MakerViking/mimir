@@ -100,6 +100,17 @@ loopback-bind posture as `/mcp` — it's the identical axum server on the
 identical address, so the non-loopback refusal and `--http-allow-remote`
 escape hatch described above apply to it too.
 
+The same warm engine also serves the inference-delegation endpoints
+(`GET /inference`, `POST /embed`, `POST /rerank`) that local stdio MCP
+sessions use to avoid loading their own GPU models — see the README's
+daemon section. Two caveats in the hub context: sessions connected over
+`/mcp` do **not** delegate (each opens its own engine inside this very
+process — delegation is for the stdio sessions on the same machine as a
+daemon), and a client only trusts a daemon that reports the exact embedding
+and rerank model names from its own config, so keep hub and client
+`config.toml` models in lockstep if you point `[hooks] inject_url` at a
+remote hub.
+
 `GET /inject?prompt=<text>&enrich=<stems>` runs the same relevance-floor
 logic as the cold CLI path (`mimir_core::inject::compute`) and returns
 `text/plain`: either one formatted `Relevant memory: ...` line, or an empty
