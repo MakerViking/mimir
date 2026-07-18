@@ -1134,7 +1134,131 @@ async fn inject_handler(
 fn inject_router(state: InjectState) -> axum::Router {
     axum::Router::new()
         .route("/inject", axum::routing::get(inject_handler))
+        .route("/inference", axum::routing::get(inference_handler))
+        .route("/embed", axum::routing::post(embed_handler))
+        .route("/rerank", axum::routing::post(rerank_handler))
         .with_state(state)
+}
+
+/// Caps on delegated inference requests. Embed matches `TX_BATCH`'s order of
+/// magnitude but clients chunk at EMBED_BATCH (64) anyway to keep the shared
+/// engine mutex hold short; rerank matches realistic candidate counts.
+const EMBED_MAX_TEXTS: usize = 256;
+const RERANK_MAX_DOCS: usize = 64;
+
+/// `GET /inference` — cheap probe for inference delegation: which models
+/// this daemon is configured for, without force-loading either (a probe
+/// must never cost a model load). Clients compare against their own config
+/// before trusting `/embed` / `/rerank` vectors.
+async fn inference_handler(
+    axum::extract::State(state): axum::extract::State<InjectState>,
+) -> axum::Json<serde_json::Value> {
+    let engine = state.engine.lock().unwrap_or_else(|p| p.into_inner());
+    axum::Json(serde_json::json!({
+        "embedding_model": engine.config.embedding.model,
+        "rerank_model": engine.config.rerank.model,
+    }))
+}
+
+#[derive(Deserialize)]
+struct EmbedRequest {
+    texts: Vec<String>,
+}
+
+/// `POST /embed {"texts": [...]}` — L2-normalized vectors from the daemon's
+/// resident embedder, so per-session MCP servers never need their own GPU
+/// copy. 503 (not 200-with-nothing) when no model is loadable: the client
+/// treats that as "daemon can't help", backs off, and embeds locally.
+async fn embed_handler(
+    axum::extract::State(state): axum::extract::State<InjectState>,
+    axum::Json(req): axum::Json<EmbedRequest>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    if req.texts.is_empty() || req.texts.len() > EMBED_MAX_TEXTS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("texts must be 1..={EMBED_MAX_TEXTS}"),
+        ));
+    }
+    let engine = state.engine.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(embedder) = engine.ensure_embedder(false) else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "embedding model unavailable".to_string(),
+            ));
+        };
+        let vectors = embedder
+            .embed(req.texts)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        Ok(axum::Json(serde_json::json!({
+            "model": embedder.name,
+            "dim": embedder.dim,
+            "vectors": vectors,
+        })))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+}
+
+#[derive(Deserialize)]
+struct RerankRequest {
+    query: String,
+    docs: Vec<String>,
+}
+
+/// `POST /rerank {"query": ..., "docs": [...]}` — cross-encoder scores in
+/// **docs order** (the local `Reranker::rerank` returns best-first pairs;
+/// re-sorting here keeps the wire format positional and dead simple).
+async fn rerank_handler(
+    axum::extract::State(state): axum::extract::State<InjectState>,
+    axum::Json(req): axum::Json<RerankRequest>,
+) -> Result<axum::Json<serde_json::Value>, (axum::http::StatusCode, String)> {
+    use axum::http::StatusCode;
+    if req.docs.is_empty() || req.docs.len() > RERANK_MAX_DOCS {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!("docs must be 1..={RERANK_MAX_DOCS}"),
+        ));
+    }
+    let engine = state.engine.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut engine = engine.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(reranker) = engine.ensure_reranker(false) else {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "rerank model unavailable".to_string(),
+            ));
+        };
+        let n = req.docs.len();
+        let ranked = reranker
+            .rerank(&req.query, req.docs)
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let mut scores = vec![0f32; n];
+        let mut seen = 0usize;
+        for (idx, score) in ranked {
+            if let Some(slot) = scores.get_mut(idx) {
+                *slot = score;
+                seen += 1;
+            }
+        }
+        if seen != n {
+            // A partial scoring would silently mis-rank the unscored docs
+            // at 0.0 (cross-encoder scores can be negative) — refuse instead
+            // and let the client keep its fused order.
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reranker scored {seen}/{n} docs"),
+            ));
+        }
+        Ok(axum::Json(serde_json::json!({
+            "model": reranker.name,
+            "scores": scores,
+        })))
+    })
+    .await
+    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
 }
 
 #[cfg(test)]
@@ -1262,9 +1386,10 @@ mod tests {
         });
         let url = format!("http://{addr}/mcp");
         let inject_url = format!("http://{addr}/inject?prompt=hello");
+        let embed_url = format!("http://{addr}/embed");
 
         const INIT: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#;
-        let (no_auth, wrong, right, inj_no_auth, inj_right) =
+        let (no_auth, wrong, right, inj_no_auth, inj_right, emb_no_auth, emb_right) =
             tokio::task::spawn_blocking(move || {
                 let agent = ureq::AgentBuilder::new()
                     .timeout_read(Duration::from_secs(10))
@@ -1292,12 +1417,23 @@ mod tests {
                         .set("Content-Type", "application/json")
                         .set("Accept", "application/json, text/event-stream")
                 };
+                let embed_req = || {
+                    agent
+                        .post(&embed_url)
+                        .set("Content-Type", "application/json")
+                };
                 (
                     send(mcp_req(), None, Some(INIT)),
                     send(mcp_req(), Some("Bearer nope"), Some(INIT)),
                     send(mcp_req(), Some("Bearer s3cret"), Some(INIT)),
                     send(agent.get(&inject_url), None, None),
                     send(agent.get(&inject_url), Some("Bearer s3cret"), None),
+                    send(embed_req(), None, Some(r#"{"texts":["hi"]}"#)),
+                    send(
+                        embed_req(),
+                        Some("Bearer s3cret"),
+                        Some(r#"{"texts":["hi"]}"#),
+                    ),
                 )
             })
             .await
@@ -1310,6 +1446,79 @@ mod tests {
             inj_right, 200,
             "/inject with token must pass, got {inj_right}"
         );
+        assert_eq!(emb_no_auth, 401, "/embed without token must be rejected");
+        assert_eq!(
+            emb_right, 503,
+            "/embed with token must clear auth and hit the model-less 503, got {emb_right}"
+        );
+    }
+
+    /// The inference-delegation endpoints on a model-less temp store: the
+    /// probe answers with configured names (no model load), /embed and
+    /// /rerank say 503 "can't help" (the client's back-off signal), and
+    /// malformed/oversized bodies are 400s, not 500s.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn inference_endpoints_semantics() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Mimir::open_at(Paths::under_root(dir.path())).unwrap();
+        let router = inject_router(InjectState {
+            engine: Arc::new(Mutex::new(engine)),
+            project_id: None,
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        let base = format!("http://{addr}");
+
+        let (probe, embed_503, rerank_503, embed_400_empty, embed_400_oversize) =
+            tokio::task::spawn_blocking(move || {
+                let agent = ureq::AgentBuilder::new()
+                    .timeout_read(Duration::from_secs(10))
+                    .build();
+                let probe = agent
+                    .get(&format!("{base}/inference"))
+                    .call()
+                    .unwrap()
+                    .into_string()
+                    .unwrap();
+                let status = |res: std::result::Result<ureq::Response, ureq::Error>| match res {
+                    Ok(r) => r.status(),
+                    Err(ureq::Error::Status(code, _)) => code,
+                    Err(_) => 0,
+                };
+                let post = |path: &str, body: String| {
+                    status(
+                        agent
+                            .post(&format!("{base}{path}"))
+                            .set("Content-Type", "application/json")
+                            .send_string(&body),
+                    )
+                };
+                let big = serde_json::json!({
+                    "texts": vec!["x"; EMBED_MAX_TEXTS + 1]
+                })
+                .to_string();
+                (
+                    probe,
+                    post("/embed", r#"{"texts":["hi"]}"#.into()),
+                    post("/rerank", r#"{"query":"q","docs":["a","b"]}"#.into()),
+                    post("/embed", r#"{"texts":[]}"#.into()),
+                    post("/embed", big),
+                )
+            })
+            .await
+            .unwrap();
+
+        let probe: serde_json::Value = serde_json::from_str(&probe).unwrap();
+        assert_eq!(probe["embedding_model"], "bge-small-en-v1.5");
+        assert_eq!(probe["rerank_model"], "jina-reranker-v1-turbo-en");
+        assert_eq!(embed_503, 503, "no model on disk => 503, not an error body");
+        assert_eq!(rerank_503, 503, "no reranker on disk => 503");
+        assert_eq!(embed_400_empty, 400, "empty texts is a client error");
+        assert_eq!(embed_400_oversize, 400, "oversized batch is a client error");
     }
 
     fn remember_args(text: &str, ty: &str) -> RememberArgs {
