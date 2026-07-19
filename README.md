@@ -451,12 +451,15 @@ is where your hardware decides:
 | CPU | ~84 ms/candidate | ~1.3 s |
 | GPU | ~12 ms/candidate | ~0.18 s |
 
-`"warm"` fires only when the model is already resident — long-lived
-processes (the MCP server, `mimir daemon`) eager-load it at startup, while
-one-shot CLI calls never pay a cold model load. Pick by how you consume
-recall:
+`"warm"` fires only when reranking is free *right now*: the model is
+already resident in this process, or a live `mimir daemon` answers for it
+(`[daemon] inference = "auto"`). Long-lived processes (the MCP server,
+`mimir daemon`) eager-load a local copy at startup only when no daemon is
+reachable; one-shot CLI calls never pay a cold model load. Pick by how you
+consume recall:
 - **GPU build**: `"warm"` is a straightforward win — the quality gain at
-  ~0.18 s is below anything you'll notice.
+  ~0.18 s is below anything you'll notice, and with `mimir daemon` running
+  every session shares its one GPU copy.
 - **CPU build, agent-driven recall** (MCP): `"warm"` is still a reasonable
   choice — ~1.3 s disappears inside an LLM turn that takes seconds anyway;
   you're trading invisible latency for better-ordered results.

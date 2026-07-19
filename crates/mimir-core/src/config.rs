@@ -380,14 +380,16 @@ pub struct RerankConfig {
     ///   is hardware-bound and per-machine: ~1.3 s per recall is a bad
     ///   surprise at an interactive CPU CLI, so turning it on should be an
     ///   informed per-box choice, not a shipped one.
-    /// - `"warm"`: rerank only if the model is *already resident* in this
-    ///   process — checked, never loaded, so a one-shot CLI call never eats
-    ///   a cold ONNX load just because this is on. Long-lived processes
-    ///   (the MCP server) eager-load at startup to make this fire from
-    ///   their first query — see `mcp.rs`'s startup wiring. A clear win on
-    ///   GPU builds; on CPU it's still reasonable for agent-driven recall
-    ///   (the ~1.3 s hides inside an LLM turn) — see the README's
-    ///   "[rerank] auto" guidance for the full decision table.
+    /// - `"warm"`: rerank only when it's free *right now* — the model is
+    ///   already resident in this process, or a live inference daemon
+    ///   answers for it (`remote_alive`); checked, never loaded, so a
+    ///   one-shot CLI call never eats a cold ONNX load just because this is
+    ///   on. Long-lived processes (the MCP server) eager-load a local copy
+    ///   at startup only when no daemon is reachable — see `mcp.rs`'s
+    ///   startup wiring. A clear win on GPU builds; on CPU it's still
+    ///   reasonable for agent-driven recall (the ~1.3 s hides inside an LLM
+    ///   turn) — see the README's "[rerank] auto" guidance for the full
+    ///   decision table.
     /// - `"always"`: also loads the model on demand if it isn't resident
     ///   yet (same cost as an explicit `--rerank`, just automatic).
     ///
