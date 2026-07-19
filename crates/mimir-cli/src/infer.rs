@@ -285,15 +285,49 @@ mod tests {
         c
     }
 
-    /// One-shot HTTP stub: accepts a single connection, ignores the request,
-    /// answers with a fixed status + JSON body.
+    /// One-shot HTTP stub: accepts a single connection, drains the FULL
+    /// request (headers + Content-Length body), then answers with a fixed
+    /// status + JSON body. Draining first matters: responding while the
+    /// client is still writing makes Windows reset the connection
+    /// (os error 10054), which turns these tests into transport-error
+    /// tests — caught by CI, not locally on Linux.
     fn stub(status: u16, body: &'static str) -> String {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         std::thread::spawn(move || {
             if let Ok((mut sock, _)) = listener.accept() {
+                let mut req = Vec::new();
                 let mut buf = [0u8; 4096];
-                let _ = sock.read(&mut buf);
+                let mut header_end = None;
+                let mut content_len = 0usize;
+                loop {
+                    match sock.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => req.extend_from_slice(&buf[..n]),
+                    }
+                    if header_end.is_none() {
+                        if let Some(pos) = req.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            content_len = String::from_utf8_lossy(&req[..pos])
+                                .lines()
+                                .filter_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    if k.eq_ignore_ascii_case("content-length") {
+                                        v.trim().parse().ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .next()
+                                .unwrap_or(0);
+                        }
+                    }
+                    if let Some(h) = header_end {
+                        if req.len() >= h + content_len {
+                            break;
+                        }
+                    }
+                }
                 let _ = write!(
                     sock,
                     "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
