@@ -368,19 +368,26 @@ pub struct RerankConfig {
     /// `Mimir::search_with` default it on anyway? An explicit `rerank: true`
     /// argument always reranks (cold-loading the model if needed) in every
     /// mode — this only controls the default.
+    ///
+    /// Both sides of the trade are measured now (graded retrieval eval,
+    /// 2026-07): reranking the top 15 fused candidates raises nDCG@10 by
+    /// ~0.03 and puts the first relevant hit at rank 1 almost always, at
+    /// ~84 ms/candidate on CPU (~1.3 s per recall at 15) vs ~12 ms/candidate
+    /// on a GPU build (~0.18 s). Deeper pools measured WORSE (25 candidates
+    /// regressed nDCG): keep `candidates` at 15.
     /// - `"off"` (default): automatic reranking never fires; only an
-    ///   explicit request reranks. Off by default because the cost is
-    ///   measured and the benefit is not: the cross-encoder runs ~84 ms per
-    ///   candidate on realistic code chunks (~1.3 s per warm recall at the
-    ///   default 15 candidates), while the retrieval eval does not yet
-    ///   exercise reranking. Revisit once rerank is wired into the eval
-    ///   harness and shows a measured win.
+    ///   explicit request reranks. Still the right default because the cost
+    ///   is hardware-bound and per-machine: ~1.3 s per recall is a bad
+    ///   surprise at an interactive CPU CLI, so turning it on should be an
+    ///   informed per-box choice, not a shipped one.
     /// - `"warm"`: rerank only if the model is *already resident* in this
     ///   process — checked, never loaded, so a one-shot CLI call never eats
     ///   a cold ONNX load just because this is on. Long-lived processes
     ///   (the MCP server) eager-load at startup to make this fire from
-    ///   their first query — see `mcp.rs`'s startup wiring. Choose this if
-    ///   you run a daemon and accept the latency for possible precision.
+    ///   their first query — see `mcp.rs`'s startup wiring. A clear win on
+    ///   GPU builds; on CPU it's still reasonable for agent-driven recall
+    ///   (the ~1.3 s hides inside an LLM turn) — see the README's
+    ///   "[rerank] auto" guidance for the full decision table.
     /// - `"always"`: also loads the model on demand if it isn't resident
     ///   yet (same cost as an explicit `--rerank`, just automatic).
     ///

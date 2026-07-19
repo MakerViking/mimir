@@ -440,11 +440,37 @@ decay ever weights meaningfully; values below a 60-day safety floor are
 clamped up (with a log warning) rather than silently starving the signal.
 `[rerank] auto = "off" |
 "warm" | "always"` (default `"off"`) controls whether a plain `recall`
-auto-reranks without an explicit `--rerank`: off by default because the
-cross-encoder costs ~84ms/candidate (~1.3s at the default 15 candidates) and
-the win isn't measured yet; `"warm"` fires only when the model's already
-loaded in a long-lived process (the MCP server), `"always"` loads it on
-demand too.
+auto-reranks without an explicit `--rerank`. The trade-off, measured on a
+graded retrieval eval over this repo's own docs + source (837 dual-judged
+labels, 60 queries): reranking the top 15 fused candidates raises nDCG@10
+by ~0.03 and puts the first relevant hit at rank 1 almost always. The cost
+is where your hardware decides:
+
+| build | cross-encoder cost | per recall (15 candidates) |
+|---|---|---|
+| CPU | ~84 ms/candidate | ~1.3 s |
+| GPU | ~12 ms/candidate | ~0.18 s |
+
+`"warm"` fires only when the model is already resident — long-lived
+processes (the MCP server, `mimir daemon`) eager-load it at startup, while
+one-shot CLI calls never pay a cold model load. Pick by how you consume
+recall:
+- **GPU build**: `"warm"` is a straightforward win — the quality gain at
+  ~0.18 s is below anything you'll notice.
+- **CPU build, agent-driven recall** (MCP): `"warm"` is still a reasonable
+  choice — ~1.3 s disappears inside an LLM turn that takes seconds anyway;
+  you're trading invisible latency for better-ordered results.
+- **CPU build, interactive CLI use**: leave it `"off"` — 1.3 s per recall
+  is very noticeable at a prompt. Explicit `--rerank` is always there for
+  the queries worth the wait.
+- The config is per-machine and the cost is hardware-bound: re-decide per
+  box rather than copying a config across machines.
+- Keep `candidates = 15`: 25+ measured *worse* (the reranker overrides
+  correct fusion ranks more often than it rescues deep candidates), and
+  cost scales linearly with the count.
+`"always"` additionally cold-loads the model on demand (same cost as an
+explicit `--rerank`, just automatic). Per-prompt auto-recall injection
+never reranks regardless — only explicit `recall` calls are affected.
 
 State lives in the platform-standard directories
 (`~/.local/share/mimir`, `~/.config/mimir`, `~/.cache/mimir` on Linux);
