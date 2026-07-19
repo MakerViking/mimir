@@ -279,9 +279,13 @@ mod tests {
             "bge-small-en-v1.5".into(),
             "jina-reranker-v1-turbo-en".into(),
         );
-        // Fast test clock: expired cooldowns flip available() back quickly.
-        c.dead_short = Duration::from_millis(30);
-        c.dead_long = Duration::from_millis(60);
+        // Compressed test cooldowns — but with margins wide enough for slow
+        // CI runners: a "still in cooldown" assertion only turns flaky if
+        // the runner stalls for the WHOLE remaining window (seconds, not
+        // the tens-of-ms the first version of these tests assumed — that
+        // flaked on macOS CI).
+        c.dead_short = Duration::from_millis(100);
+        c.dead_long = Duration::from_secs(2);
         c
     }
 
@@ -350,7 +354,11 @@ mod tests {
         assert!(c.available(), "fresh client starts available");
         assert!(c.embed(&["hi".into()]).is_err());
         assert!(!c.available(), "transport error must start the cooldown");
-        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            !c.disabled.load(Ordering::Relaxed),
+            "a cooldown, not a permanent disable"
+        );
+        std::thread::sleep(Duration::from_millis(150));
         assert!(c.available(), "cooldown expiry must re-enable delegation");
     }
 
@@ -362,9 +370,12 @@ mod tests {
         );
         let c = client_for(base);
         assert!(c.embed(&["hi".into()]).is_err());
-        assert!(!c.available());
-        std::thread::sleep(Duration::from_millis(80));
-        assert!(!c.available(), "a model mismatch must never self-heal");
+        assert!(
+            c.disabled.load(Ordering::Relaxed),
+            "a model mismatch must disable, not cool down"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!c.available(), "disable must outlive the short cooldown");
     }
 
     #[test]
@@ -372,8 +383,12 @@ mod tests {
         let base = stub(401, r#"{"error":"unauthorized"}"#);
         let c = client_for(base);
         assert!(c.rerank("q", &["a".into()]).is_err());
-        std::thread::sleep(Duration::from_millis(80));
-        assert!(!c.available(), "401 must never self-heal");
+        assert!(
+            c.disabled.load(Ordering::Relaxed),
+            "401 must disable, not cool down"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(!c.available(), "disable must outlive the short cooldown");
     }
 
     #[test]
@@ -382,12 +397,17 @@ mod tests {
         let c = client_for(base);
         assert!(c.embed(&["hi".into()]).is_err());
         assert!(!c.available());
-        std::thread::sleep(Duration::from_millis(40));
+        assert!(
+            !c.disabled.load(Ordering::Relaxed),
+            "503 is a cooldown, not a permanent disable"
+        );
+        // Well past the 100ms short cooldown, well short of the 2s long one.
+        std::thread::sleep(Duration::from_millis(400));
         assert!(
             !c.available(),
             "503 uses the long cooldown, not the short one"
         );
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_secs(2));
         assert!(c.available());
     }
 
