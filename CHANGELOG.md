@@ -3,7 +3,7 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
-## [Unreleased]
+## [0.15.0] - 2026-07-20
 ### Added
 - **Shared inference daemon — zero-VRAM sessions on GPU builds.** `mimir
   daemon` (and `mimir mcp --http`) now serves three inference-delegation
