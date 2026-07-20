@@ -333,6 +333,14 @@ nothing matches, says so and points at `touch .mimir`. And agents without MCP
 can just shell out — the CLI's default output is the same token-lean format
 the server returns.
 
+> **A memory's project is decided by the directory your session runs in** —
+> not by what you happen to be editing. Start each project's session inside
+> that project's folder so captures tag correctly (every capture confirms
+> its project as `pr:<name>` in the output, so a wrong one is visible
+> immediately). Pin a stable identity with `mimir project init --sync` and
+> commit the `.mimir` file. If something still lands in the wrong place,
+> move it with `mimir reproject <ref> --project <name>` (or `--global`).
+
 `mimir init` also installs a set of `/m-*` slash commands for the agent
 CLIs it finds on the machine — Claude Code, Codex, OpenCode, Gemini CLI
 and Cursor (the `m-` prefix keeps them clear of your own commands):
