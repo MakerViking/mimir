@@ -5,7 +5,13 @@ After=network.target
 [Service]
 Type=simple
 ExecStart=%h/.cargo/bin/mimir daemon
-Restart=on-failure
+# On GPU builds the ONNX WebGPU/Dawn runtime grows VRAM without bound over
+# days of inference (shape-keyed allocation pools are never freed), so the
+# daemon recycles itself daily. Clients are built for this: a session whose
+# daemon vanishes mid-call falls back to CPU-local inference in that same
+# call and resumes delegation automatically once the daemon is back.
+RuntimeMaxSec=86400
+Restart=always
 RestartSec=5
 
 [Install]

@@ -3,6 +3,18 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [Unreleased]
+### Changed
+- **`contrib/mimir-daemon.service` recycles the daemon daily**
+  (`RuntimeMaxSec=86400`, `Restart=always`). On GPU builds the ONNX
+  WebGPU/Dawn runtime allocates VRAM at inference time into shape-keyed
+  pools that are never freed, and the daemon — as the one process doing
+  GPU inference — accumulates them without bound (~1.2 GiB/day measured
+  under normal agent load). A daily restart bounds it; sessions are
+  unaffected by design (a mid-call daemon loss falls back to CPU-local
+  inference in the same call and delegation auto-resumes). Existing
+  installs: re-copy the unit and `systemctl --user daemon-reload`.
+
 ## [0.15.0] - 2026-07-20
 ### Added
 - **Shared inference daemon — zero-VRAM sessions on GPU builds.** `mimir
