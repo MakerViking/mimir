@@ -1,3 +1,4 @@
+mod brief_cmd;
 mod commands;
 mod context_cmd;
 mod context_guard_cmd;
@@ -394,6 +395,14 @@ enum Command {
         #[command(subcommand)]
         cmd: RulesCmd,
     },
+    /// Session brief: capped digest of drift-preventing memories (gotchas +
+    /// decisions) for session start. `mimir brief` previews it with scores;
+    /// `mimir brief show` is the SessionStart hook entry (stdin JSON,
+    /// silent unless `[brief] enabled = true`).
+    Brief {
+        #[command(subcommand)]
+        cmd: Option<BriefCmd>,
+    },
     /// Project identity for cross-machine sync (the `.mimir` marker).
     Project {
         #[command(subcommand)]
@@ -425,6 +434,12 @@ enum RulesCmd {
     Show,
     /// Remove the rules pack.
     Clear,
+}
+
+#[derive(Subcommand)]
+enum BriefCmd {
+    /// SessionStart hook entry — reads the hook event JSON on stdin.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -815,6 +830,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             RulesCmd::Set { text } => rules_cmd::set(text),
             RulesCmd::Show => rules_cmd::show(),
             RulesCmd::Clear => rules_cmd::clear(),
+        },
+        Command::Brief { cmd } => match cmd {
+            Some(BriefCmd::Show) => brief_cmd::show(),
+            None => brief_cmd::dry_run(),
         },
         Command::Project { cmd } => match cmd {
             ProjectCmd::Init { sync } => project_cmd::init(sync),

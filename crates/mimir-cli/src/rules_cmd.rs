@@ -19,7 +19,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// Tag that marks a memory as the project's rules pack.
 pub const RULES_TAG: &str = "mimir-rules";
 
-fn find_rules(conn: &Connection, project_id: i64) -> Result<Option<Node>> {
+pub(crate) fn find_rules(conn: &Connection, project_id: i64) -> Result<Option<Node>> {
     let node = conn
         .query_row(
             &format!(

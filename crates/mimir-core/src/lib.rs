@@ -5,6 +5,7 @@
 //! BM25 + vector retrieval with reciprocal-rank fusion.
 
 pub mod anchors;
+pub mod brief;
 pub mod config;
 pub mod consolidate;
 pub mod context_guard;

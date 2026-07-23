@@ -409,8 +409,8 @@ fn context_guard_hooks_install_and_are_idempotent() {
     assert_eq!(hooks["PreCompact"].as_array().unwrap().len(), 1);
     assert_eq!(
         hooks["SessionStart"].as_array().unwrap().len(),
-        2,
-        "rules pack + context guard"
+        3,
+        "rules pack + brief + context guard"
     );
 
     // Re-running must not duplicate any entry.
@@ -424,7 +424,7 @@ fn context_guard_hooks_install_and_are_idempotent() {
     assert_eq!(hooks2["PreToolUse"].as_array().unwrap().len(), 2);
     assert_eq!(hooks2["UserPromptSubmit"].as_array().unwrap().len(), 1);
     assert_eq!(hooks2["PreCompact"].as_array().unwrap().len(), 1);
-    assert_eq!(hooks2["SessionStart"].as_array().unwrap().len(), 2);
+    assert_eq!(hooks2["SessionStart"].as_array().unwrap().len(), 3);
 }
 
 // Windows: see the cfg note on hooks_install_bakes_custom_inject_url_….
@@ -480,8 +480,8 @@ fn context_guard_off_by_default_adds_no_new_hook_entries() {
     assert!(hooks.get("PreCompact").is_none());
     assert_eq!(
         hooks["SessionStart"].as_array().unwrap().len(),
-        1,
-        "rules pack only"
+        2,
+        "rules pack + brief only"
     );
 }
 
@@ -1107,4 +1107,103 @@ fn daemon_serves_inference_endpoints() {
         Err(ureq::Error::Status(code, _)) => assert_eq!(code, 503, "model-less store => 503"),
         other => panic!("expected 503 from /embed on a model-less store, got {other:?}"),
     }
+}
+
+/// Session brief: startup fire renders, same-session repeat is suppressed,
+/// resume and unknown sources are silent, and the kill-switch works.
+#[test]
+fn session_brief_fires_suppresses_and_respects_kill_switch() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let h = Harness::new();
+    h.ok(&["init", "--no-model"]);
+    h.ok(&[
+        "remember",
+        "never test against prod without MIMIR_HOME isolation",
+        "-t",
+        "gotcha",
+    ]);
+    h.ok(&[
+        "remember",
+        "we chose sqlite over postgres",
+        "-t",
+        "decision",
+    ]);
+
+    let run_show = |source: &str, session: &str| -> String {
+        let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_mimir"))
+            .args(["brief", "show"])
+            .env("MIMIR_HOME", h.home.path())
+            .env("HOME", h.home.path())
+            .env("USERPROFILE", h.home.path())
+            .current_dir(h.cwd.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let event = format!(
+            r#"{{"session_id":"{session}","source":"{source}","cwd":{:?}}}"#,
+            h.cwd.path().to_string_lossy()
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(event.as_bytes())
+            .unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "brief show must exit 0");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Default config: disabled — the kill-switch keeps the hook silent.
+    assert_eq!(
+        run_show("startup", "s1"),
+        "",
+        "disabled brief must be silent"
+    );
+
+    std::fs::write(
+        h.home.path().join("config.toml"),
+        "[brief]\nenabled = true\n",
+    )
+    .unwrap();
+
+    // Startup fire renders both memories with imperative labels + header.
+    let first = run_show("startup", "s1");
+    assert!(first.contains("Mimir guards (do not violate):"), "{first}");
+    assert!(first.contains("- GOTCHA [m:") && first.contains("- DECISION [m:"));
+
+    // Same session again (compact recap): everything already shown => silent,
+    // and the empty fire must not consume budget (asserted implicitly: a
+    // later fire with a new memory still works).
+    assert_eq!(run_show("compact", "s1"), "", "shown items must suppress");
+
+    // A newly captured gotcha DOES surface on the next recap fire.
+    h.ok(&[
+        "remember",
+        "new gotcha captured mid-session",
+        "-t",
+        "gotcha",
+    ]);
+    let recap = run_show("compact", "s1");
+    assert!(
+        recap.contains("new gotcha captured mid-session"),
+        "fresh capture must surface on recap: {recap:?}"
+    );
+
+    // Resume and unknown sources: fail closed even with unseen content.
+    h.ok(&["remember", "another gotcha for resume test", "-t", "gotcha"]);
+    assert_eq!(run_show("resume", "s1"), "", "resume must never fire");
+    assert_eq!(
+        run_show("mystery", "s1"),
+        "",
+        "unknown source must fail closed"
+    );
+
+    // Dry-run preview works and lists candidates with scores.
+    let preview = h.ok(&["brief"]);
+    assert!(preview.contains("candidates (score desc"), "{preview}");
 }

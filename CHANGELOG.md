@@ -4,6 +4,31 @@ All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
+### Added
+- **Session brief — capped digest of drift-preventing memories at session
+  start.** `mimir brief show` (a SessionStart hook entry `mimir init
+  --hooks` now installs, inert by default) injects the current scope's
+  top gotchas and decisions — ranked by existing signals only (pin,
+  decayed strength, recency, same-project affinity; no query, no model,
+  cheap SQL suited to a cold one-shot process) — as one imperative
+  `- GOTCHA [m:ref]: …` line each, hard-capped at `[brief] max_tokens`
+  (150) and `max_items` (6). Fires at `startup` and again after
+  `clear`/`compact` with a smaller `recap_tokens` (100) cap of
+  not-yet-shown items, never on `resume` (fail-closed on unknown
+  sources), at most `max_fires_per_session` (4) *rendered* fires: worst
+  case 450 tokens per session by construction, each fire recorded in the
+  savings ledger as spend (`source = "brief"`, honestly a cost — it never
+  counts as savings). Excluded from selection: superseded and deleted
+  memories, anything content-duplicated in the project's rules pack,
+  items already briefed this session (plus a 6-hour any-session
+  wall-clock fallback for clients that mint fresh session ids), and — in
+  handoff mode — the memory the context guard is restoring on the same
+  event. `mimir brief` previews the exact output with per-candidate
+  scores. **Default `enabled = false`**: the per-prompt silence-first
+  `/inject` path is untouched, and the brief stays opt-in until its drift
+  eval gate is passed with citable numbers (design + gate:
+  docs/design/session-brief.md).
+
 ### Changed
 - **`contrib/mimir-daemon.service` recycles the daemon daily**
   (`RuntimeMaxSec=86400`, `Restart=always`). On GPU builds the ONNX
