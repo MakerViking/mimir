@@ -53,13 +53,26 @@ fn scope_for_cwd(mimir: &Mimir, input: &serde_json::Value) -> Scope {
         .unwrap_or(Scope::Global)
 }
 
-/// Node ids already briefed — this session (by id) plus the recent
-/// wall-clock window (any session). One query over `session_state`.
-fn already_shown(mimir: &Mimir, session_id: &str, now: i64) -> Result<HashSet<i64>> {
-    let mut stmt = mimir.conn.prepare(
+/// Node ids to suppress for this fire. Semantics differ by fire kind:
+///
+/// - `recap = false` (startup): this session's own shown set PLUS the
+///   recent wall-clock window across ALL sessions — a fresh session inside
+///   the window shouldn't repeat what a sibling just showed.
+/// - `recap = true` (clear/compact): the context was just WIPED — the
+///   top-ranked guards that were shown before the reset are exactly what
+///   the agent forgot, so re-anchoring them is the point of the fire, not
+///   a duplicate. Only OTHER sessions' recent shows are suppressed (a
+///   client that mints a fresh session_id on compact degrades to startup
+///   semantics via the wall-clock — safe, just less re-anchoring).
+fn suppressed(mimir: &Mimir, session_id: &str, now: i64, recap: bool) -> Result<HashSet<i64>> {
+    let sql = if recap {
         "SELECT DISTINCT key FROM session_state
-         WHERE key LIKE ?1 AND (session_id = ?2 OR updated_at > ?3)",
-    )?;
+         WHERE key LIKE ?1 AND session_id != ?2 AND updated_at > ?3"
+    } else {
+        "SELECT DISTINCT key FROM session_state
+         WHERE key LIKE ?1 AND (session_id = ?2 OR updated_at > ?3)"
+    };
+    let mut stmt = mimir.conn.prepare(sql)?;
     let rows = stmt.query_map(
         rusqlite::params![
             format!("{SHOWN_PREFIX}%"),
@@ -106,12 +119,13 @@ pub fn show() -> Result<()> {
     // brief. Unknown values: fail closed (never fire), matching the
     // context guard's inert-default arm. session_id stability across
     // clear/compact is undocumented upstream — the wall-clock fallback in
-    // already_shown() covers a minted id, so nothing here depends on it.
+    // suppressed() covers a minted id, so nothing here depends on it.
     let budget = match event_source {
         "startup" => mimir.config.brief.max_tokens,
         "clear" | "compact" => mimir.config.brief.recap_tokens,
         _ => return Ok(()),
     };
+    let recap = matches!(event_source, "clear" | "compact");
     let now = now_unix();
     // Fire-cap check before any selection work — a capped session pays
     // zero query cost. Only RENDERED fires increment it (below): a
@@ -124,7 +138,7 @@ pub fn show() -> Result<()> {
     }
 
     let scope = scope_for_cwd(&mimir, &input);
-    let mut exclude = already_shown(&mimir, session_id, now)?;
+    let mut exclude = suppressed(&mimir, session_id, now, recap)?;
     // Compact-boundary overlap: in handoff mode the context guard is about
     // to restore the handoff memory on this same event — don't brief it too.
     if matches!(event_source, "clear" | "compact") && mimir.config.hooks.context_guard == "handoff"

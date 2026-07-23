@@ -102,6 +102,8 @@ pub struct BriefConfig {
     /// project's signature (project title + its own memories' tags and
     /// titles) to be admitted; a project with no signal of its own admits
     /// NO globals — un-judgeable relevance is treated as irrelevant.
+    /// A PINNED global bypasses the gate (an explicit pin outranks the
+    /// heuristic) but still competes under ranking and the token budget.
     /// Deliberately lexical, not vector-based: cosine against a stored-
     /// embedding project centroid was measured on the real store first and
     /// REJECTED — bge cosines between unrelated technical memories compress
@@ -111,6 +113,21 @@ pub struct BriefConfig {
     /// never gated; briefs in global scope are never gated; `false`
     /// restores ungated pre-gate behavior.
     pub global_gate: bool,
+    /// Relative quality floor: a candidate must score at least this
+    /// fraction of the best ELIGIBLE candidate's score (measured before
+    /// session suppression removes anything) to be rendered. Without it,
+    /// rank is purely relative — once suppression rotates past the strong
+    /// guards, "best available" quietly becomes "weak tail", and the brief
+    /// serves scraped-bottom items rather than staying silent (observed in
+    /// first-day dogfooding). Interaction to know: the floor is measured
+    /// on the full score INCLUDING the 1.5x same-project affinity term, so
+    /// when a project has guards of its own, unpinned cross-project
+    /// memories sit below the default floor by construction — the brief
+    /// becomes project-first, and a global needs a PIN to compete. That is
+    /// deliberate (silence beats borrowed filler); pin the global if it
+    /// genuinely guards this project too. Default 0.75, calibrated on the
+    /// labeled dogfood cases; the drift eval refines it. `0.0` disables.
+    pub score_floor: f64,
 }
 
 impl Default for BriefConfig {
@@ -123,6 +140,7 @@ impl Default for BriefConfig {
             max_fires_per_session: 4,
             line_chars: 100,
             global_gate: true,
+            score_floor: 0.75,
         }
     }
 }
