@@ -122,11 +122,17 @@ pub fn rank(
     out
 }
 
-/// Everything the CLI needs in one call: fetch, filter the caller's
-/// exclusions (session suppression, handoff overlap), rules-pack content
+/// Everything the CLI needs in one call: fetch, filter rules-pack content
 /// duplicates and — when briefing a project — irrelevant GLOBAL memories
-/// (see [`BriefConfig::global_gate`]), batch the impression stats,
-/// rank.
+/// (see [`BriefConfig::global_gate`]), rank the whole eligible pool, then
+/// apply the caller's exclusions (session suppression, handoff overlap)
+/// and the relative score floor.
+///
+/// Ordering matters: the floor is measured against the best ELIGIBLE
+/// candidate — before suppression removes anything — so rotation cannot
+/// redefine "best" downward. A weak item is weak relative to what this
+/// store's guards actually look like, not relative to whatever happens to
+/// be left unseen (see [`BriefConfig::score_floor`]).
 pub fn select(
     conn: &Connection,
     scope: Scope,
@@ -138,7 +144,6 @@ pub fn select(
     let rules_norm = rules_body.map(normalize);
     let mut pool: Vec<Node> = candidates(conn, scope)?
         .into_iter()
-        .filter(|n| !exclude.contains(&n.id))
         .filter(|n| {
             rules_norm
                 .as_deref()
@@ -156,13 +161,13 @@ pub fn select(
         Scope::Project(id) => Some(id),
         _ => None,
     };
-    Ok(rank(
-        pool,
-        current_project,
-        &config.scoring,
-        &impressions,
-        now,
-    ))
+    let ranked = rank(pool, current_project, &config.scoring, &impressions, now);
+    let floor = config.brief.score_floor * ranked.first().map(|r| r.score).unwrap_or(0.0);
+    Ok(ranked
+        .into_iter()
+        .filter(|r| !exclude.contains(&r.node.id))
+        .filter(|r| r.score >= floor)
+        .collect())
 }
 
 /// Relevance gate: silence beats irrelevant filler (user-labeled ground
@@ -173,6 +178,13 @@ pub fn select(
 /// (project title + its own memories' tags and titles). A project with no
 /// signal of its own admits NO globals: un-judgeable relevance is treated
 /// as irrelevant.
+///
+/// Exception: a PINNED global bypasses the gate. The gate exists to
+/// silence *automatic* noise; a pin is the user explicitly saying "never
+/// miss this", and a lexical heuristic must not overrule that decision.
+/// The bypass is gate-only — a pinned global still competes under the
+/// ordinary ranking and budget cap, and the subkind admission gate in
+/// [`candidates`] still applies.
 ///
 /// Deliberately lexical. The obvious richer signal — cosine against a
 /// project centroid of already-STORED embeddings — was implemented and
@@ -189,7 +201,7 @@ fn gate_globals(conn: &Connection, pool: Vec<Node>, project_id: i64) -> Result<V
     let signature = project_signature(conn, project_id)?;
     Ok(pool
         .into_iter()
-        .filter(|n| n.project_id.is_some() || lexical_overlap(n, &signature))
+        .filter(|n| n.project_id.is_some() || n.pinned || lexical_overlap(n, &signature))
         .collect())
 }
 
@@ -356,16 +368,21 @@ mod tests {
     }
 
     fn select_ids(conn: &Connection, scope: Scope) -> Vec<i64> {
-        let ranked = select(
-            conn,
-            scope,
-            &HashSet::new(),
-            None,
-            &crate::config::Config::default(),
-            now_unix(),
-        )
-        .unwrap();
+        select_ids_cfg(conn, scope, &crate::config::Config::default())
+    }
+
+    fn select_ids_cfg(conn: &Connection, scope: Scope, cfg: &crate::config::Config) -> Vec<i64> {
+        let ranked = select(conn, scope, &HashSet::new(), None, cfg, now_unix()).unwrap();
         ranked.iter().map(|r| r.node.id).collect()
+    }
+
+    /// Config with the score floor off — for tests that assert the
+    /// relevance GATE's admission semantics, which the floor (project
+    /// affinity included in the reference score) would otherwise mask.
+    fn no_floor() -> crate::config::Config {
+        let mut cfg = crate::config::Config::default();
+        cfg.brief.score_floor = 0.0;
+        cfg
     }
 
     /// Admission gate: only gotcha/decision qualify — a pinned note is
@@ -457,7 +474,7 @@ mod tests {
             Scope::Global,
             &HashSet::new(),
             None,
-            &crate::config::Config::default(),
+            &no_floor(),
             now_unix(),
         )
         .unwrap();
@@ -491,7 +508,7 @@ mod tests {
             Scope::Global,
             &HashSet::new(),
             None,
-            &crate::config::Config::default(),
+            &no_floor(),
             now_unix(),
         )
         .unwrap();
@@ -630,6 +647,43 @@ mod tests {
         );
     }
 
+    /// An explicit pin overrules the lexical gate: a pinned global with
+    /// zero signature overlap must still surface — the gate silences
+    /// automatic noise, never a deliberate user decision.
+    #[test]
+    fn pinned_global_bypasses_the_gate() {
+        let conn = db::open_in_memory().unwrap();
+        let project = store::ensure_project(&conn, "/tmp/bookforge2", "bookforge2").unwrap();
+        remember(
+            &conn,
+            "chapter typesetting breaks on long epigraphs",
+            MemoryType::Gotcha,
+            Some(project.id),
+        );
+        let pinned = remember(
+            &conn,
+            "never force-push shared branches",
+            MemoryType::Gotcha,
+            None,
+        );
+        pin(&conn, pinned.id);
+        let unpinned = remember(
+            &conn,
+            "kubernetes ingress pitfall",
+            MemoryType::Gotcha,
+            None,
+        );
+        let ids = select_ids(&conn, Scope::Project(project.id));
+        assert!(
+            ids.contains(&pinned.id),
+            "pinned global must bypass the relevance gate"
+        );
+        assert!(
+            !ids.contains(&unpinned.id),
+            "unpinned no-overlap global must still be gated out"
+        );
+    }
+
     /// A global that shares the project's vocabulary survives — here via
     /// a title word ("mesher") the project's own memory also uses.
     #[test]
@@ -654,7 +708,7 @@ mod tests {
             MemoryType::Gotcha,
             None,
         );
-        let ids = select_ids(&conn, Scope::Project(project.id));
+        let ids = select_ids_cfg(&conn, Scope::Project(project.id), &no_floor());
         assert!(ids.contains(&near.id), "shared word must pass the gate");
         assert!(!ids.contains(&far.id));
     }
@@ -701,7 +755,7 @@ mod tests {
             MemoryType::Gotcha,
             None,
         );
-        let ids = select_ids(&conn, Scope::Project(project.id));
+        let ids = select_ids_cfg(&conn, Scope::Project(project.id), &no_floor());
         assert!(
             ids.contains(&matching.id),
             "shared tag must pass the lexical fallback"
@@ -749,6 +803,54 @@ mod tests {
         assert!(
             ranked.iter().any(|r| r.node.id == g.id),
             "global_gate = false must restore ungated behavior"
+        );
+    }
+
+    /// The floor: once suppression removes the strong guards, weak-tail
+    /// leftovers stay silent instead of being served as "best available".
+    /// Reference max is the ELIGIBLE pool's best, measured before
+    /// suppression — rotation cannot redefine "best" downward.
+    #[test]
+    fn score_floor_prefers_silence_over_weak_tail() {
+        let conn = db::open_in_memory().unwrap();
+        let strong = remember(&conn, "strong pinned guard", MemoryType::Gotcha, None);
+        pin(&conn, strong.id);
+        let weak = remember(&conn, "weak unpinned tail item", MemoryType::Gotcha, None);
+        let cfg = crate::config::Config::default();
+        let mut exclude = HashSet::new();
+        exclude.insert(strong.id); // simulate: already shown this session
+        let ranked = select(&conn, Scope::Global, &exclude, None, &cfg, now_unix()).unwrap();
+        assert!(
+            ranked.iter().all(|r| r.node.id != weak.id) && ranked.is_empty(),
+            "unpinned tail at ~0.5x of the pinned max must stay silent"
+        );
+        // Floor off: the tail is served again (pre-floor behavior).
+        let ranked = select(
+            &conn,
+            Scope::Global,
+            &exclude,
+            None,
+            &no_floor(),
+            now_unix(),
+        )
+        .unwrap();
+        assert!(ranked.iter().any(|r| r.node.id == weak.id));
+    }
+
+    /// Comparable peers are NOT floored: with the top item suppressed, an
+    /// equal-strength peer still renders.
+    #[test]
+    fn score_floor_keeps_comparable_peers() {
+        let conn = db::open_in_memory().unwrap();
+        let a = remember(&conn, "first equal gotcha", MemoryType::Gotcha, None);
+        let b = remember(&conn, "second equal gotcha", MemoryType::Gotcha, None);
+        let mut exclude = HashSet::new();
+        exclude.insert(a.id);
+        let cfg = crate::config::Config::default();
+        let ranked = select(&conn, Scope::Global, &exclude, None, &cfg, now_unix()).unwrap();
+        assert!(
+            ranked.iter().any(|r| r.node.id == b.id),
+            "an equal peer must clear the floor"
         );
     }
 }

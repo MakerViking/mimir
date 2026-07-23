@@ -3,6 +3,29 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [Unreleased]
+### Changed
+- **Session brief: recaps re-anchor instead of rotating.** A
+  `clear`/`compact` fire no longer excludes what this session already
+  showed — the context was just wiped, so the top guards shown before the
+  reset are exactly what the agent forgot; re-showing them (under the
+  smaller `recap_tokens` cap) is the point of the fire. First-day
+  dogfooding caught the old behavior serving the unseen weak tail at the
+  precise moment the #1 guard mattered most. Cross-session dedup (the 6 h
+  wall-clock window) still applies, and startup fires keep full
+  suppression.
+- **Session brief: relative score floor — silence over scraped bottom.**
+  Candidates must score ≥ `[brief] score_floor` (default 0.75) of the
+  best eligible candidate, measured before suppression — so once the
+  strong guards are suppressed or a store is thin, the brief goes silent
+  rather than serving weak-tail items as "best available". The reference
+  includes the project-affinity term, making briefs project-first by
+  construction: an unpinned cross-project memory yields to a project's
+  own guards, and a pinned one competes normally. `0.0` disables.
+- **Session brief: a pinned global bypasses the relevance gate** — the
+  gate silences automatic noise; an explicit pin is the user saying
+  "never miss this" and a lexical heuristic must not overrule it.
+
 ## [0.16.0] - 2026-07-23
 ### Added
 - **Session brief: global-relevance gate — silence beats irrelevant

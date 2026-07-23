@@ -104,10 +104,14 @@ project (`[brief] global_gate = true`, default), each GLOBAL candidate
 must share a significant (len > 3) tag/title word with the **project
 signature** — the project's title plus its own memories' tags and titles.
 A project with no signal of its own admits NO globals: un-judgeable
-relevance is treated as irrelevant, per the label. Project-scoped
-candidates are never gated; global-scope briefs are never gated; `false`
-disables. Pinned by hermetic fixtures including the exact labeled
-silence case.
+relevance is treated as irrelevant, per the label. Exception (added
+2026-07-23): a PINNED global bypasses the gate — the gate silences
+*automatic* noise, and an explicit pin is the user saying "never miss
+this"; the heuristic must not overrule that decision. Gate-only bypass:
+ranking, budget cap and the subkind admission gate still apply.
+Project-scoped candidates are never gated; global-scope briefs are never
+gated; `false` disables. Pinned by hermetic fixtures including the exact
+labeled silence case.
 
 *Measured and rejected alternative:* cosine against a project centroid of
 already-stored embeddings (read, not computed — it would have satisfied
@@ -180,15 +184,31 @@ Suppression state — reuses existing tables, no schema change:
   before any query. Default `max_fires_per_session = 4`. **Only fires that
   render ≥1 line consume budget** (blocker fix: a zero-gotcha project must
   not exhaust its budget on empty attempts before its first real capture).
-- **Per-item dedup:** `session_state` keys `brief_shown:<node_id>` —
+- **Per-item dedup — fire-kind-dependent (revised 2026-07-23 from
+  dogfooding):** the original design excluded same-session shown items on
+  EVERY fire, which inverted the recap's purpose — after a clear/compact
+  the context is wiped, so the top guards shown pre-reset are exactly what
+  the agent forgot, yet the rotation served the unseen weak tail instead.
+  Now: **startup fires** suppress this session's shown set plus the 6 h
+  any-session wall-clock window (unchanged); **recap fires**
+  (`clear`/`compact`) suppress only OTHER sessions' recent shows — the
+  same session's guards are deliberately re-anchored under the smaller
+  `recap_tokens` cap. A client that mints a fresh session_id on compact
+  degrades to startup semantics via the wall-clock — safe, just less
+  re-anchoring. Keys stay `session_state` `brief_shown:<node_id>` —
   **deliberately NOT the shared `injection_log`** (blocker fix: writing the
   shared ledger would permanently mute the higher-fidelity per-prompt floor
-  for exactly the nodes the brief showed; the floor's own relevance rules
-  must keep gating re-display independently). Both stores share the
-  existing 7-day prune.
-- **Wall-clock fallback** (serious fix): also drop any candidate whose
-  `brief_shown` key exists for *any* session in the last 6 h — covers the
-  unverified case where `resume` (or a compact) mints a fresh `session_id`.
+  for exactly the nodes the brief showed). Both stores share the existing
+  7-day prune.
+- **Score floor (added 2026-07-23 from dogfooding):** a candidate must
+  score ≥ `[brief] score_floor` (default 0.75) × the best ELIGIBLE
+  candidate's score, measured BEFORE suppression removes anything — so
+  rotation can never redefine "best" downward and the brief prefers
+  silence over scraping the bottom of the ranked list. Interaction stated
+  plainly: the reference score includes the 1.5× project-affinity term,
+  so when a project has its own guards, unpinned globals sit below the
+  default floor by construction — project-first on purpose; pin a global
+  to give it standing. `0.0` disables.
 
 Ground-truth note that shaped this: the per-prompt `injection_log` ledger
 is currently **plumbed but dead in the installed hook path** (the hook

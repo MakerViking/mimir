@@ -1185,22 +1185,35 @@ fn session_brief_fires_suppresses_and_respects_kill_switch() {
     assert!(first.contains("Mimir guards (do not violate):"), "{first}");
     assert!(first.contains("- GOTCHA [m:") && first.contains("- DECISION [m:"));
 
-    // Same session again (compact recap): everything already shown => silent,
-    // and the empty fire must not consume budget (asserted implicitly: a
-    // later fire with a new memory still works).
-    assert_eq!(run_show("compact", "s1"), "", "shown items must suppress");
+    // Compact recap RE-ANCHORS: the context was wiped, so the same-session
+    // shown set does NOT suppress — the top guards come back (under the
+    // smaller recap budget). Only OTHER sessions' recent shows suppress.
+    let recap1 = run_show("compact", "s1");
+    assert!(
+        recap1.contains("never test against prod"),
+        "recap must re-show the top guard after a context reset: {recap1:?}"
+    );
 
-    // A newly captured gotcha DOES surface on the next recap fire.
+    // A newly captured gotcha joins the next recap alongside the re-anchored
+    // guards.
     h.ok(&[
         "remember",
         "new gotcha captured mid-session",
         "-t",
         "gotcha",
     ]);
-    let recap = run_show("compact", "s1");
+    let recap2 = run_show("compact", "s1");
     assert!(
-        recap.contains("new gotcha captured mid-session"),
-        "fresh capture must surface on recap: {recap:?}"
+        recap2.contains("new gotcha captured mid-session"),
+        "fresh capture must surface on recap: {recap2:?}"
+    );
+
+    // A second session inside the wall-clock window IS suppressed by s1's
+    // shows (startup semantics keep the cross-session dedup).
+    assert_eq!(
+        run_show("startup", "s2"),
+        "",
+        "sibling session within 6h must not repeat s1's brief"
     );
 
     // Resume and unknown sources: fail closed even with unseen content.
