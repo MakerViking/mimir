@@ -978,8 +978,17 @@ fn server_sync_survives_peer_clock_skew() {
     // on a STRICTLY newer timestamp, so a same-second edit would spuriously
     // fail for reasons unrelated to the watermark fix under test. Step the
     // edited row 2s ahead deterministically instead of sleeping past the
-    // second boundary.
-    skew_updated_at(&y.path().join("mimir.db"), "revised torque", now + 2);
+    // second boundary — measured from a FRESH timestamp, not the `now`
+    // captured at test start: a dozen process spawns happen in between,
+    // and on a slow CI runner (observed on windows-latest) more than 2s
+    // of drift made `now + 2` OLDER than the row's real updated_at, so
+    // the hub's LWW correctly refused the edit and the test flaked.
+    let edit_ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64
+        + 2;
+    skew_updated_at(&y.path().join("mimir.db"), "revised torque", edit_ts);
     let push2 = sync_client_ok(y.path(), token, &["sync", "push"]);
     assert!(
         push2.contains("hub applied 1"),
