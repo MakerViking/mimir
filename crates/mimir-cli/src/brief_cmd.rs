@@ -101,9 +101,12 @@ pub fn show() -> Result<()> {
         return Ok(());
     };
     let event_source = input.get("source").and_then(|v| v.as_str()).unwrap_or("");
-    // resume: the transcript still contains any earlier brief. Unknown
-    // values: fail closed (never fire), matching the context guard's
-    // inert-default arm.
+    // resume and fork (v2.1.214+; older clients report forks as "resume"):
+    // the transcript already contains prior context including any earlier
+    // brief. Unknown values: fail closed (never fire), matching the
+    // context guard's inert-default arm. session_id stability across
+    // clear/compact is undocumented upstream — the wall-clock fallback in
+    // already_shown() covers a minted id, so nothing here depends on it.
     let budget = match event_source {
         "startup" => mimir.config.brief.max_tokens,
         "clear" | "compact" => mimir.config.brief.recap_tokens,

@@ -149,6 +149,7 @@ the CLI; config-flag-checked-first is the established rollback pattern).
 | `startup` | fire |
 | `clear` / `compact` | fire (recap budget) — the context reset is precisely the drift boundary |
 | `resume` | never fire — the transcript still contains any earlier brief |
+| `fork` (v2.1.214+; older clients report it as `resume`) | never fire — a forked transcript carries the prior context, same reasoning as `resume` |
 | anything else | **fail closed** — never fire (minor fix; matches context_guard's inert-default arm) |
 
 Suppression state — reuses existing tables, no schema change:
@@ -253,15 +254,26 @@ Gates, literally asserted:
   brief exposes the same content class the per-prompt `/inject` surface
   already auto-prints; pinned-only would gut zero-authoring value.
 
-## 11. Open questions (with recommended answers)
+## 11. Open questions — RESOLVED 2026-07-23 (verified against the official hooks docs)
 
-1. **Is `session_id` stable across `clear`/`compact`?** The whole
-   suppression scheme prefers it; the 6 h wall-clock fallback (§6) makes
-   the answer non-fatal either way. Verify against live hooks during
-   implementation, before trusting `max_fires_per_session` semantics.
-2. **`resume` after compaction on some clients?** Fail-closed table (§6)
-   already covers unknown values; verify the enum against current hook
-   docs at implementation time.
+1. **Is `session_id` stable across `clear`/`compact`?** **Undocumented
+   upstream** — the hooks reference specifies the `session_id` field and
+   the `source` values but nowhere states whether clear/compact/resume
+   mint or reuse the id, nor the post-compaction session lifecycle. The
+   design deliberately does not depend on the answer: stable id ⇒ the
+   `brief_shown` keys suppress; minted id ⇒ the 6 h wall-clock fallback
+   suppresses. Consequence worth knowing: `max_fires_per_session` is
+   per-*session_id*, so a client that mints ids on clear effectively
+   resets the fire budget — bounded anyway by the wall-clock exclusion
+   (a re-fire can only show not-recently-shown items). Tighten only if
+   upstream ever documents the lifecycle.
+2. **The `source` enum.** Five documented values: `startup`, `resume`,
+   `clear`, `compact`, and `fork` (v2.1.214+; forked sessions reported
+   `resume` before that). `fork` lands in the fail-closed arm, which is
+   the correct behavior for it (forked transcript carries prior context),
+   not an accident — recorded in §6. Whether `resume` can follow a
+   compaction is also undocumented; the fail-closed default absorbs any
+   surprise sequence.
 
 ## 12. Docs / release plan
 
