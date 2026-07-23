@@ -3,7 +3,7 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
-## [Unreleased]
+## [0.16.0] - 2026-07-23
 ### Added
 - **Session brief: global-relevance gate — silence beats irrelevant
   filler.** When briefing a project, a cross-project (global) memory now
