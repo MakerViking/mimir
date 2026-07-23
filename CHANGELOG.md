@@ -5,6 +5,20 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **Session brief: global-relevance gate — silence beats irrelevant
+  filler.** When briefing a project, a cross-project (global) memory now
+  has to be relevant to *that* project to spend brief budget: it must
+  share a significant tag/title word with the project's signature (its
+  title plus its own memories' tags and titles; `[brief] global_gate`,
+  default on, `false` disables). A project with no memories of its own
+  briefs nothing rather than other projects' gotchas. Project-scoped
+  memories are never gated. Deliberately lexical: a stored-embedding
+  centroid-cosine gate was implemented and measured on a real 102k-node
+  store first and rejected — embedding cosines between unrelated
+  technical memories compress into a ~0.62–0.79 band and mis-rank
+  labeled-irrelevant items, so no threshold separates. Born from
+  first-day dogfooding, where an unrelated project's entire brief was
+  three other projects' gotchas.
 - **Session brief — capped digest of drift-preventing memories at session
   start.** `mimir brief show` (a SessionStart hook entry `mimir init
   --hooks` now installs, inert by default) injects the current scope's

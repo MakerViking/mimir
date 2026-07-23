@@ -95,6 +95,22 @@ pub struct BriefConfig {
     /// the fill decision is only ever "does this whole bounded line fit"
     /// — never a mid-item cut that could read as a different claim.
     pub line_chars: usize,
+    /// Relevance gate for GLOBAL memories when briefing a project:
+    /// silence beats irrelevant filler (dogfood-labeled: a project with no
+    /// gotchas of its own was getting other projects' gotchas as filler).
+    /// A global candidate must share a significant tag/title word with the
+    /// project's signature (project title + its own memories' tags and
+    /// titles) to be admitted; a project with no signal of its own admits
+    /// NO globals — un-judgeable relevance is treated as irrelevant.
+    /// Deliberately lexical, not vector-based: cosine against a stored-
+    /// embedding project centroid was measured on the real store first and
+    /// REJECTED — bge cosines between unrelated technical memories compress
+    /// into ~0.62-0.79 and rank labeled-irrelevant items above relevant
+    /// ones, so no threshold separates (measurement 2026-07-23, see
+    /// docs/design/session-brief.md §3). Project-scoped candidates are
+    /// never gated; briefs in global scope are never gated; `false`
+    /// restores ungated pre-gate behavior.
+    pub global_gate: bool,
 }
 
 impl Default for BriefConfig {
@@ -106,6 +122,7 @@ impl Default for BriefConfig {
             max_items: 6,
             max_fires_per_session: 4,
             line_chars: 100,
+            global_gate: true,
         }
     }
 }

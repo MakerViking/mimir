@@ -123,18 +123,20 @@ pub fn rank(
 }
 
 /// Everything the CLI needs in one call: fetch, filter the caller's
-/// exclusions (session suppression, handoff overlap) and rules-pack
-/// content duplicates, batch the impression stats, rank.
+/// exclusions (session suppression, handoff overlap), rules-pack content
+/// duplicates and — when briefing a project — irrelevant GLOBAL memories
+/// (see [`BriefConfig::global_gate`]), batch the impression stats,
+/// rank.
 pub fn select(
     conn: &Connection,
     scope: Scope,
     exclude: &HashSet<i64>,
     rules_body: Option<&str>,
-    scoring: &ScoringConfig,
+    config: &crate::config::Config,
     now: i64,
 ) -> Result<Vec<Ranked>> {
     let rules_norm = rules_body.map(normalize);
-    let pool: Vec<Node> = candidates(conn, scope)?
+    let mut pool: Vec<Node> = candidates(conn, scope)?
         .into_iter()
         .filter(|n| !exclude.contains(&n.id))
         .filter(|n| {
@@ -143,13 +145,93 @@ pub fn select(
                 .is_none_or(|r| !duplicates_rules(n, r))
         })
         .collect();
+    if let Scope::Project(pid) = scope {
+        if config.brief.global_gate {
+            pool = gate_globals(conn, pool, pid)?;
+        }
+    }
     let ids: Vec<i64> = pool.iter().map(|n| n.id).collect();
     let impressions = store::impression_stats(conn, &ids)?;
     let current_project = match scope {
         Scope::Project(id) => Some(id),
         _ => None,
     };
-    Ok(rank(pool, current_project, scoring, &impressions, now))
+    Ok(rank(
+        pool,
+        current_project,
+        &config.scoring,
+        &impressions,
+        now,
+    ))
+}
+
+/// Relevance gate: silence beats irrelevant filler (user-labeled ground
+/// truth from dogfooding — a project with no gotchas of its own received
+/// three other projects' gotchas as its whole brief; the right brief was
+/// nothing). Project-scoped candidates always pass; a GLOBAL candidate
+/// must share a significant tag/title word with the project's signature
+/// (project title + its own memories' tags and titles). A project with no
+/// signal of its own admits NO globals: un-judgeable relevance is treated
+/// as irrelevant.
+///
+/// Deliberately lexical. The obvious richer signal — cosine against a
+/// project centroid of already-STORED embeddings — was implemented and
+/// measured on the real 102k-node store first, and REJECTED: bge cosines
+/// between unrelated technical memories compress into ~0.62–0.79
+/// (anisotropy), and the ordering itself mis-ranks (a labeled-irrelevant
+/// global scored near the top of its project's distribution), so no
+/// threshold separates. Measurement 2026-07-23; the implementation lives
+/// in git history should a better-separating embedder arrive.
+fn gate_globals(conn: &Connection, pool: Vec<Node>, project_id: i64) -> Result<Vec<Node>> {
+    if !pool.iter().any(|n| n.project_id.is_none()) {
+        return Ok(pool);
+    }
+    let signature = project_signature(conn, project_id)?;
+    Ok(pool
+        .into_iter()
+        .filter(|n| n.project_id.is_some() || lexical_overlap(n, &signature))
+        .collect())
+}
+
+/// Significant words (len > 3, lowercased) from the project's title, its
+/// memories' tags and titles — the lexical stand-in for the centroid on
+/// model-less stores.
+fn project_signature(conn: &Connection, project_id: i64) -> Result<HashSet<String>> {
+    let mut sig = HashSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT COALESCE(title,''), tags_text FROM node
+         WHERE (id = ?1) OR (project_id = ?1 AND kind = 'memory' AND deleted_at IS NULL)
+         LIMIT 65",
+    )?;
+    let mut rows = stmt.query([project_id])?;
+    while let Some(row) = rows.next()? {
+        for field in [row.get::<_, String>(0)?, row.get::<_, String>(1)?] {
+            for w in significant_words(&field) {
+                sig.insert(w);
+            }
+        }
+    }
+    Ok(sig)
+}
+
+/// Does the candidate share any significant tag/title word with the
+/// project signature?
+fn lexical_overlap(node: &Node, signature: &HashSet<String>) -> bool {
+    if signature.is_empty() {
+        return false;
+    }
+    let mut words = significant_words(&node.tags_text);
+    if let Some(t) = node.title.as_deref() {
+        words.extend(significant_words(t));
+    }
+    words.iter().any(|w| signature.contains(w))
+}
+
+fn significant_words(s: &str) -> Vec<String> {
+    s.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| w.chars().count() > 3)
+        .map(str::to_lowercase)
+        .collect()
 }
 
 /// Stage 3 — budget fill + render. Per-item truncation happens here,
@@ -172,9 +254,15 @@ pub fn compose(ranked: &[Ranked], cfg: &BriefConfig, budget_tokens: usize, now: 
             continue;
         }
         let candidate = if shown.is_empty() {
-            format!("{HEADER}\n{line}")
+            format!(
+                "{HEADER}
+{line}"
+            )
         } else {
-            format!("{text}\n{line}")
+            format!(
+                "{text}
+{line}"
+            )
         };
         if crate::tokens::count(&candidate) <= budget_tokens {
             text = candidate;
@@ -273,7 +361,7 @@ mod tests {
             scope,
             &HashSet::new(),
             None,
-            &crate::config::ScoringConfig::default(),
+            &crate::config::Config::default(),
             now_unix(),
         )
         .unwrap();
@@ -340,7 +428,7 @@ mod tests {
             Scope::Project(project.id),
             &HashSet::new(),
             None,
-            &crate::config::ScoringConfig::default(),
+            &crate::config::Config::default(),
             now_unix(),
         )
         .unwrap();
@@ -369,23 +457,28 @@ mod tests {
             Scope::Global,
             &HashSet::new(),
             None,
-            &crate::config::ScoringConfig::default(),
+            &crate::config::Config::default(),
             now_unix(),
         )
         .unwrap();
         assert_eq!(ranked[0].node.id, long.id, "precondition: long ranks first");
         let cfg = BriefConfig::default();
-        // Budget sized so the long (pinned, truncated-to-line_chars) line
-        // cannot fit but the short one can: header ~7 + short line fits
-        // inside 22 tokens; the 100-char long line does not.
-        let brief = compose(&ranked, &cfg, 22, now_unix());
+        // Budget sized to exactly fit header + the SHORT line — computed,
+        // not hardcoded: the node ref embeds a random ULID tail whose
+        // token count varies per run, so a fixed budget flakes. The long
+        // (pinned, truncated-to-line_chars ~100 chars) line cannot fit in
+        // a short-line-sized budget.
+        let idx = ranked.iter().position(|r| r.node.id == short.id).unwrap();
+        let budget =
+            crate::tokens::count(&compose(&ranked[idx..=idx], &cfg, 10_000, now_unix()).text);
+        let brief = compose(&ranked, &cfg, budget, now_unix());
         assert_eq!(
             brief.shown,
             vec![short.id],
             "best-fit must rescue the short line"
         );
         assert!(
-            crate::tokens::count(&brief.text) <= 22,
+            crate::tokens::count(&brief.text) <= budget,
             "token cap must hold"
         );
 
@@ -398,7 +491,7 @@ mod tests {
             Scope::Global,
             &HashSet::new(),
             None,
-            &crate::config::ScoringConfig::default(),
+            &crate::config::Config::default(),
             now_unix(),
         )
         .unwrap();
@@ -416,7 +509,7 @@ mod tests {
             Scope::Global,
             &HashSet::new(),
             None,
-            &crate::config::ScoringConfig::default(),
+            &crate::config::Config::default(),
             now_unix(),
         )
         .unwrap();
@@ -446,7 +539,7 @@ mod tests {
             Scope::Global,
             &exclude,
             Some(rules_body),
-            &crate::config::ScoringConfig::default(),
+            &crate::config::Config::default(),
             now_unix(),
         )
         .unwrap();
@@ -479,7 +572,7 @@ mod tests {
             Scope::Global,
             &HashSet::new(),
             None,
-            &crate::config::ScoringConfig::default(),
+            &crate::config::Config::default(),
             now_unix(),
         )
         .unwrap();
@@ -502,5 +595,160 @@ mod tests {
                 "line must be bounded before fill: {line}"
             );
         }
+    }
+
+    /// The user-labeled dogfood case: a project whose own footprint says
+    /// "chapters and typesetting" gets other projects' gotchas as
+    /// candidates — the right brief is SILENCE, not filler.
+    #[test]
+    fn irrelevant_globals_are_silenced() {
+        let conn = db::open_in_memory().unwrap();
+        let project = store::ensure_project(&conn, "/tmp/bookforge", "bookforge").unwrap();
+        let ours = remember(
+            &conn,
+            "chapter typesetting breaks on long epigraphs",
+            MemoryType::Gotcha,
+            Some(project.id),
+        );
+        let g1 = remember(
+            &conn,
+            "nvenc encoder leak on consumer gpu",
+            MemoryType::Gotcha,
+            None,
+        );
+        let g2 = remember(
+            &conn,
+            "colored 3mf from python mesher",
+            MemoryType::Gotcha,
+            None,
+        );
+        let ids = select_ids(&conn, Scope::Project(project.id));
+        assert!(ids.contains(&ours.id), "project item always passes");
+        assert!(
+            !ids.contains(&g1.id) && !ids.contains(&g2.id),
+            "globals sharing no signature word must be gated out"
+        );
+    }
+
+    /// A global that shares the project's vocabulary survives — here via
+    /// a title word ("mesher") the project's own memory also uses.
+    #[test]
+    fn relevant_global_survives_the_gate() {
+        let conn = db::open_in_memory().unwrap();
+        let project = store::ensure_project(&conn, "/tmp/p2", "p2").unwrap();
+        remember(
+            &conn,
+            "mesher output needs manifold repair before slicing",
+            MemoryType::Decision,
+            Some(project.id),
+        );
+        let near = remember(
+            &conn,
+            "python mesher drops vertex colors",
+            MemoryType::Gotcha,
+            None,
+        );
+        let far = remember(
+            &conn,
+            "kubernetes ingress pitfall",
+            MemoryType::Gotcha,
+            None,
+        );
+        let ids = select_ids(&conn, Scope::Project(project.id));
+        assert!(ids.contains(&near.id), "shared word must pass the gate");
+        assert!(!ids.contains(&far.id));
+    }
+
+    /// Tag overlap admits a global on any store — tags are first-class
+    /// signature words.
+    #[test]
+    fn tag_overlap_admits_globals() {
+        let conn = db::open_in_memory().unwrap();
+        let project = store::ensure_project(&conn, "/tmp/printfarm", "printfarm").unwrap();
+        match memory::remember(
+            &conn,
+            Remember {
+                text: "filament dryboxes matter".into(),
+                mtype: MemoryType::Gotcha,
+                tags: vec!["filament".into()],
+                project_id: Some(project.id),
+                force: true,
+            },
+        )
+        .unwrap()
+        {
+            RememberOutcome::Created(_) => {}
+            other => panic!("{other:?}"),
+        }
+        let matching = match memory::remember(
+            &conn,
+            Remember {
+                text: "global filament storage gotcha".into(),
+                mtype: MemoryType::Gotcha,
+                tags: vec!["filament".into()],
+                project_id: None,
+                force: true,
+            },
+        )
+        .unwrap()
+        {
+            RememberOutcome::Created(n) => n,
+            other => panic!("{other:?}"),
+        };
+        let unrelated = remember(
+            &conn,
+            "kubernetes ingress pitfall",
+            MemoryType::Gotcha,
+            None,
+        );
+        let ids = select_ids(&conn, Scope::Project(project.id));
+        assert!(
+            ids.contains(&matching.id),
+            "shared tag must pass the lexical fallback"
+        );
+        assert!(
+            !ids.contains(&unrelated.id),
+            "no overlap, no vectors: dropped"
+        );
+    }
+
+    /// A project with NO signal of its own (no memories, no embeddings)
+    /// gets NO globals: un-judgeable relevance is treated as irrelevant.
+    #[test]
+    fn empty_project_gets_silence_not_global_flood() {
+        let conn = db::open_in_memory().unwrap();
+        let project = store::ensure_project(&conn, "/tmp/fresh", "fresh").unwrap();
+        remember(&conn, "some global gotcha", MemoryType::Gotcha, None);
+        remember(&conn, "another global gotcha", MemoryType::Gotcha, None);
+        let ids = select_ids(&conn, Scope::Project(project.id));
+        assert!(
+            ids.is_empty(),
+            "empty project must brief silence, got {ids:?}"
+        );
+    }
+
+    /// Global scope and threshold 0.0 are both ungated.
+    #[test]
+    fn global_scope_and_zero_threshold_are_ungated() {
+        let conn = db::open_in_memory().unwrap();
+        let g = remember(&conn, "any global gotcha", MemoryType::Gotcha, None);
+        assert!(select_ids(&conn, Scope::Global).contains(&g.id));
+
+        let project = store::ensure_project(&conn, "/tmp/p3", "p3").unwrap();
+        let mut cfg = crate::config::Config::default();
+        cfg.brief.global_gate = false;
+        let ranked = select(
+            &conn,
+            Scope::Project(project.id),
+            &HashSet::new(),
+            None,
+            &cfg,
+            now_unix(),
+        )
+        .unwrap();
+        assert!(
+            ranked.iter().any(|r| r.node.id == g.id),
+            "global_gate = false must restore ungated behavior"
+        );
     }
 }

@@ -143,7 +143,7 @@ pub fn show() -> Result<()> {
         scope,
         &exclude,
         rules.as_deref(),
-        &mimir.config.scoring,
+        &mimir.config,
         now,
     )?;
     let composed = brief::compose(&ranked, &mimir.config.brief, budget, now);
@@ -199,7 +199,7 @@ pub fn dry_run() -> Result<()> {
         scope,
         &HashSet::new(),
         rules.as_deref(),
-        &mimir.config.scoring,
+        &mimir.config,
         now,
     )?;
     let composed = brief::compose(
