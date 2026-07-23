@@ -206,13 +206,15 @@ Three commands get you the lowest-latency configuration Mimir has — measured
 on the same machine as the benchmark above:
 
 ```bash
-mimir daemon &                        # warm engine: /inject answers in ~7 ms
+mimir daemon &                        # warm engine: /inject answers in ~7-40 ms
 mimir init --hooks --auto-recall      # per-prompt recall via the warm path
 mimir doctor                          # confirms "daemon: warm (...)"
 ```
 
 - **With the daemon running**, every auto-recall injection is served warm
-  (~7 ms) with full hybrid BM25+vector search.
+  with full hybrid BM25+vector search — ~7 ms on a small store, ~40 ms
+  median on a 102k-node store (measured live; the store grows, the number
+  moves).
 - **Without it**, the hook falls back to the cold CLI path, which defaults
   to `cold_mode = "fast"` — still ~5–6 ms, lexical + identifier matching
   only (semantic-only matches wait for the daemon).
@@ -228,8 +230,52 @@ mimir doctor                          # confirms "daemon: warm (...)"
   automatically; `[daemon] inference = "off"` restores the old
   every-process-loads-its-own behavior.
 
+![GPU memory before and after the shared inference daemon: five sessions at ~11.4 GiB total and growing, versus zero per session plus one 0.3–2.4 GiB daemon recycled daily](assets/daemon-vram.svg)
+
 To keep the daemon across reboots, install the systemd user unit:
 `cp contrib/mimir-daemon.service ~/.config/systemd/user/ && systemctl --user enable --now mimir-daemon`.
+
+### Default vs quality — one config away
+
+Mimir's defaults are deliberately **speed- and token-biased**: a fresh
+install answers fast, injects little, and never surprises a CPU-only box.
+Everything that trades a little latency (or a bounded token budget) for
+measurably better retrieval is **opt-in** — each knob was measured before
+it earned a place here, and the chart names what every one buys and costs:
+
+![Default vs quality profile: reranked recall buys +0.03 nDCG@10 for ~180 ms GPU / ~1.3 s CPU; per-prompt auto-recall costs 40 ms and ~71 tokens when it fires; cold semantic injection costs ~235 ms; the session brief costs at most 450 tokens per session](assets/quality-profile.svg)
+
+The whole quality tier, as config:
+
+```toml
+[rerank]
+auto = "warm"        # +0.03 nDCG@10, first hit at rank 1 · ~0.18 s/recall
+                     # on GPU, ~1.3 s on CPU — see the decision table below
+
+[hooks]
+cold_mode = "full"   # semantic matching even with no daemon · ~235 ms cold
+context_guard = "handoff"  # deliberate /clear + auto-restored handoff memory
+
+[brief]
+enabled = true       # gotcha/decision digest at session start · ≤450 tok/session
+```
+
+plus the auto-recall hook at install time (`mimir init --hooks
+--auto-recall`) and the daemon itself (above) — which is not a trade-off
+but free quality: warm ~40 ms injections and zero GPU memory per session.
+One more knob, `[scoring] impression_alpha`, damps memories that keep
+surfacing without ever being opened; it's off by default because it needs
+months of usage history to mean anything and has no measured delta yet —
+turn it on only once `mimir report` shows real recall traffic.
+
+> **Honesty box.** Every number above — and in both charts — was measured
+> on **one machine and one real store: mine** (102k nodes grown from daily
+> use; retrieval-quality deltas from an 837-label graded eval over Mimir's
+> own repo). None of it is a synthetic benchmark, and none of it is a
+> promise: a different corpus, GPU, or working style will shift the
+> numbers, which is exactly why these are knobs and not defaults. If you
+> benchmark Mimir against something else, please say which profile you
+> ran — "defaults" and "quality" are different tools on purpose.
 
 ### Session brief
 
