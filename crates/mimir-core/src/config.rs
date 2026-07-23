@@ -57,6 +57,57 @@ pub struct Config {
     pub hooks: HooksConfig,
     pub learn: LearnConfig,
     pub daemon: DaemonConfig,
+    pub brief: BriefConfig,
+}
+
+/// Settings for the session brief (`mimir brief show`, SessionStart hook):
+/// a hard-capped digest of the project's most drift-preventing memories
+/// (gotchas + decisions), fired once at session start and again after a
+/// context clear/compaction. Design doc: docs/design/session-brief.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BriefConfig {
+    /// Master switch, checked FIRST by `mimir brief show` (the hook entry
+    /// is installed regardless, so flipping this off is the whole
+    /// kill-switch — same rollback pattern as `hooks.context_guard`).
+    /// Default false: the brief may not default on until the eval gate in
+    /// the design doc is passed with citable numbers (rules-pack baseline
+    /// beaten at this token budget; marginal-catch curve justifies the
+    /// cap; repeated-exposure compliance measured).
+    pub enabled: bool,
+    /// Hard token cap for the startup fire, enforced by construction in
+    /// the budget-fill loop (`tokens::count` over the cumulative rendered
+    /// text). Whichever of this and `max_items` binds first wins.
+    pub max_tokens: usize,
+    /// Smaller cap for re-fires on clear/compact — the reset needs a
+    /// reminder, not the full brief. Worst-case session cost is the
+    /// stated constant `max_tokens + (max_fires_per_session-1) *
+    /// recap_tokens` (450 tokens at defaults).
+    pub recap_tokens: usize,
+    /// Line-count cap, independent of tokens: many tiny gotchas must not
+    /// balloon the brief into a list the agent skims rather than absorbs.
+    pub max_items: usize,
+    /// Only fires that actually render at least one line consume this
+    /// budget — a zero-gotcha project must not exhaust it on empty
+    /// attempts before its first real capture.
+    pub max_fires_per_session: usize,
+    /// Per-item character bound applied BEFORE the budget-fill loop, so
+    /// the fill decision is only ever "does this whole bounded line fit"
+    /// — never a mid-item cut that could read as a different claim.
+    pub line_chars: usize,
+}
+
+impl Default for BriefConfig {
+    fn default() -> Self {
+        BriefConfig {
+            enabled: false,
+            max_tokens: 150,
+            recap_tokens: 100,
+            max_items: 6,
+            max_fires_per_session: 4,
+            line_chars: 100,
+        }
+    }
 }
 
 /// Settings for `mimir daemon` inference delegation.

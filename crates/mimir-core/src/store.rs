@@ -537,6 +537,42 @@ pub fn prune_session_state(conn: &Connection, cutoff: i64) -> Result<usize> {
     Ok(a + b)
 }
 
+/// Per-session KV working state (v8 `session_state` table). Shared by the
+/// context guard (transcript markers, nag counters) and the session brief
+/// (fire counts, `brief_shown:<id>` exposure keys); pruned together with
+/// `injection_log` above.
+pub fn get_session_state(conn: &Connection, session_id: &str, key: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT value FROM session_state WHERE session_id = ?1 AND key = ?2",
+            params![session_id, key],
+            |r| r.get(0),
+        )
+        .optional()?)
+}
+
+pub fn set_session_state(
+    conn: &Connection,
+    session_id: &str,
+    key: &str,
+    value: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO session_state (session_id, key, value, updated_at) VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+        params![session_id, key, value, crate::model::now_unix()],
+    )?;
+    Ok(())
+}
+
+pub fn clear_session_state(conn: &Connection, session_id: &str, key: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM session_state WHERE session_id = ?1 AND key = ?2",
+        params![session_id, key],
+    )?;
+    Ok(())
+}
+
 /// Append to the implicit-feedback ledger (shown/opened/useful/not_useful).
 pub fn record_event(
     conn: &Connection,

@@ -18,12 +18,12 @@
 //! degrades to "estimate from the full transcript" / "don't nag" rather
 //! than blocking or erroring the hook.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use crate::config::HooksConfig;
 use crate::error::Result;
 use crate::memory;
-use crate::model::{now_unix, Scope};
+use crate::model::Scope;
 
 /// Estimate the percent of the context window the transcript has used since
 /// `marker_bytes` (the size recorded at the last `/clear`/`/compact`, or 0
@@ -142,37 +142,13 @@ pub fn restore_handoff_text(conn: &Connection, scope: Scope) -> Result<Option<St
         .map(|body| format!("Restored session handoff:\n{body}")))
 }
 
-fn get_session_state(conn: &Connection, session_id: &str, key: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT value FROM session_state WHERE session_id = ?1 AND key = ?2",
-            params![session_id, key],
-            |r| r.get(0),
-        )
-        .optional()?)
-}
-
-fn set_session_state(conn: &Connection, session_id: &str, key: &str, value: &str) -> Result<()> {
-    conn.execute(
-        "INSERT INTO session_state (session_id, key, value, updated_at) VALUES (?1, ?2, ?3, ?4)
-         ON CONFLICT(session_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
-        params![session_id, key, value, now_unix()],
-    )?;
-    Ok(())
-}
-
-fn clear_session_state(conn: &Connection, session_id: &str, key: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM session_state WHERE session_id = ?1 AND key = ?2",
-        params![session_id, key],
-    )?;
-    Ok(())
-}
+use crate::store::{clear_session_state, get_session_state, set_session_state};
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db;
+    use rusqlite::params;
 
     fn cfg() -> HooksConfig {
         HooksConfig {

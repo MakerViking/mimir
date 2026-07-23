@@ -23,6 +23,13 @@ pub mod source {
     pub const PROXY_CACHE: &str = "proxy_cache";
     pub const PROXY_DEDUP: &str = "proxy_dedup";
     pub const PROXY_PRUNE: &str = "proxy_prune";
+    /// Session-brief injection (`mimir brief show`). Recorded with
+    /// `before = 0` — honestly a COST, not a saving; cost sources are
+    /// excluded from every "saved" aggregate (see [`COST_SOURCES_SQL`])
+    /// so injected tokens can never silently net against real savings.
+    /// A "Spent" rollup in `mimir savings` is required before `[brief]
+    /// enabled` may default on (see docs/design/session-brief.md §5).
+    pub const BRIEF: &str = "brief";
 }
 
 /// Aggregate counters for a set of savings events.
@@ -54,15 +61,24 @@ pub struct Summary {
     pub all: Totals,
 }
 
+/// SQL `IN`-list of pure-cost sources (tokens injected, nothing shrunk).
+/// Every "saved" aggregate (`summary`, `totals`, `daily_saved`) excludes
+/// them — a cost event must never net against real savings, which the raw
+/// `before - after` sums would silently do. They remain visible in
+/// `by_source` (its per-source `Totals::saved()` clamps to 0).
+const COST_SOURCES_SQL: &str = "('brief')";
+
 /// One-scan equivalent of calling `totals` for day/week/month/all.
 pub fn summary(conn: &Connection, now: i64) -> Result<Summary> {
     let row = conn.query_row(
-        "SELECT
-           COALESCE(SUM(CASE WHEN at >= ?1 THEN tokens_before - tokens_after END), 0),
-           COALESCE(SUM(CASE WHEN at >= ?2 THEN tokens_before - tokens_after END), 0),
-           COALESCE(SUM(CASE WHEN at >= ?3 THEN tokens_before - tokens_after END), 0),
-           COUNT(*), COALESCE(SUM(tokens_before), 0), COALESCE(SUM(tokens_after), 0)
-         FROM savings_event",
+        &format!(
+            "SELECT
+               COALESCE(SUM(CASE WHEN at >= ?1 THEN tokens_before - tokens_after END), 0),
+               COALESCE(SUM(CASE WHEN at >= ?2 THEN tokens_before - tokens_after END), 0),
+               COALESCE(SUM(CASE WHEN at >= ?3 THEN tokens_before - tokens_after END), 0),
+               COUNT(*), COALESCE(SUM(tokens_before), 0), COALESCE(SUM(tokens_after), 0)
+             FROM savings_event WHERE source NOT IN {COST_SOURCES_SQL}"
+        ),
         params![now - 86_400, now - 7 * 86_400, now - 30 * 86_400],
         |r| {
             Ok(Summary {
@@ -110,8 +126,10 @@ pub fn record(
 pub fn totals(conn: &Connection, since: Option<i64>) -> Result<Totals> {
     let cutoff = since.unwrap_or(0);
     let row = conn.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(tokens_before),0), COALESCE(SUM(tokens_after),0)
-         FROM savings_event WHERE at >= ?1",
+        &format!(
+            "SELECT COUNT(*), COALESCE(SUM(tokens_before),0), COALESCE(SUM(tokens_after),0)
+             FROM savings_event WHERE at >= ?1 AND source NOT IN {COST_SOURCES_SQL}"
+        ),
         [cutoff],
         |r| {
             Ok(Totals {
@@ -152,11 +170,11 @@ pub fn by_source(conn: &Connection, since: Option<i64>) -> Result<Vec<(String, T
 /// where day_index = at / 86400. Sparse: days with no events are omitted.
 pub fn daily_saved(conn: &Connection, days: i64, now: i64) -> Result<Vec<(i64, i64)>> {
     let cutoff = now - days * 86_400;
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT at/86400 AS day, COALESCE(SUM(tokens_before - tokens_after),0)
-         FROM savings_event WHERE at >= ?1
+         FROM savings_event WHERE at >= ?1 AND source NOT IN {COST_SOURCES_SQL}
          GROUP BY day ORDER BY day",
-    )?;
+    ))?;
     let rows = stmt
         .query_map([cutoff], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -226,5 +244,39 @@ mod tests {
             after: 25,
         };
         assert_eq!(t.saved(), 0);
+    }
+
+    /// A pure-cost source (brief) must never net against real savings in
+    /// any "saved" aggregate — but stays visible in the per-source view.
+    #[test]
+    fn cost_sources_never_reduce_saved_aggregates() {
+        let conn = db::open_in_memory().unwrap();
+        let now = crate::model::now_unix();
+        record(
+            &conn,
+            None,
+            source::FILTER,
+            1000,
+            200,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        record(&conn, None, source::BRIEF, 0, 86, serde_json::json!({})).unwrap();
+        let s = summary(&conn, now).unwrap();
+        assert_eq!(
+            s.day, 800,
+            "brief cost must not net against today's savings"
+        );
+        assert_eq!(s.all.saved(), 800);
+        let t = totals(&conn, None).unwrap();
+        assert_eq!(t.saved(), 800);
+        let daily = daily_saved(&conn, 7, now).unwrap();
+        assert_eq!(daily.iter().map(|(_, s)| s).sum::<i64>(), 800);
+        let per_source = by_source(&conn, None).unwrap();
+        let brief_row = per_source.iter().find(|(s, _)| s == source::BRIEF);
+        assert!(
+            brief_row.is_some_and(|(_, t)| t.after == 86 && t.saved() == 0),
+            "brief stays visible per-source with its cost, clamped to 0 saved"
+        );
     }
 }
