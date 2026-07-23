@@ -370,6 +370,20 @@ fn merge_hook_settings(
         messages.push("SessionStart (project rules) added".into());
     }
 
+    // SessionStart: the session brief (own entry — stdouts concatenate).
+    // Installed unconditionally but inert until `[brief] enabled = true`
+    // (the command's own first check), so installing costs nothing.
+    if entries_mention(session_arr, "mimir brief show") {
+        messages.push("SessionStart (brief) already installed".into());
+    } else {
+        session_arr.push(serde_json::json!({
+            "hooks": [{ "type": "command", "command": "mimir brief show" }]
+        }));
+        messages.push(
+            "SessionStart (session brief) added — inert until `[brief] enabled = true`".into(),
+        );
+    }
+
     // PreToolUse(Bash): the rewrite hook. Skip if another rewrite hook (e.g.
     // RTK) is present — running both would double-wrap commands.
     let pre = hooks
@@ -1961,8 +1975,8 @@ mod hooks_tests {
         assert!(root["hooks"]["SessionStart"].is_array());
         assert_eq!(
             root["hooks"]["SessionStart"].as_array().unwrap().len(),
-            1,
-            "context_guard=off must add exactly one SessionStart entry (rules), not two"
+            2,
+            "context_guard=off must add exactly two SessionStart entries (rules + brief), not three"
         );
         let pre_arr = root["hooks"]["PreToolUse"].as_array().unwrap();
         assert_eq!(
@@ -2075,8 +2089,8 @@ mod hooks_tests {
         assert_eq!(root["hooks"]["PreCompact"].as_array().unwrap().len(), 1);
         assert_eq!(
             root["hooks"]["SessionStart"].as_array().unwrap().len(),
-            2,
-            "rules entry + context-guard entry"
+            3,
+            "rules entry + brief entry + context-guard entry"
         );
         assert!(messages
             .iter()
@@ -2101,7 +2115,7 @@ mod hooks_tests {
             1
         );
         assert_eq!(root2["hooks"]["PreCompact"].as_array().unwrap().len(), 1);
-        assert_eq!(root2["hooks"]["SessionStart"].as_array().unwrap().len(), 2);
+        assert_eq!(root2["hooks"]["SessionStart"].as_array().unwrap().len(), 3);
         assert!(messages2
             .iter()
             .any(|m| m.contains("UserPromptSubmit context-guard already installed")));
