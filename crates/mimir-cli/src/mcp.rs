@@ -83,6 +83,12 @@ pub struct RememberArgs {
     /// each; oversized ones are dropped (not truncated).
     #[serde(default)]
     pub fires_when: Vec<String>,
+    /// File/command glob patterns (e.g. "deploy.sh", "src/store.rs") that
+    /// surface this memory at act-time via the PreToolUse guard when the
+    /// agent edits a matching file or runs a matching command. Up to 8,
+    /// 200 chars each; oversized/empty dropped. Optional "file:" prefix.
+    #[serde(default)]
+    pub anchors: Vec<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -266,7 +272,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Store a typed memory. Pass `link` to attach it to a code symbol/file. Pass `fires_when` to force-inject on trigger phrases without keyword overlap."
+        description = "Store a typed memory. Pass `link` to attach it to a code symbol/file. Pass `fires_when` to force-inject on trigger phrases without keyword overlap. Pass `anchors` to surface it at act-time when a matching file is edited or command is run."
     )]
     async fn remember(&self, Parameters(args): Parameters<RememberArgs>) -> String {
         let project_id = self.project_id;
@@ -311,6 +317,13 @@ impl MimirServer {
                         let phrases = memory::sanitize_fires_when(args.fires_when);
                         if !phrases.is_empty() {
                             store::set_fires_when(&m.conn, node.id, &phrases)
+                                .map_err(engine_err)?;
+                        }
+                    }
+                    if !args.anchors.is_empty() {
+                        let patterns = mimir_core::anchors::sanitize_anchors(args.anchors);
+                        if !patterns.is_empty() {
+                            mimir_core::anchors::set_anchors(&m.conn, node.id, &patterns)
                                 .map_err(engine_err)?;
                         }
                     }
@@ -1555,6 +1568,7 @@ mod tests {
             global: true,
             link: None,
             fires_when: Vec::new(),
+            anchors: Vec::new(),
         }
     }
 
@@ -1584,6 +1598,34 @@ mod tests {
 
         let body = s.get(Parameters(GetArgs { r#ref: id })).await;
         assert!(body.contains("SCRAM"), "get: {body}");
+    }
+
+    /// Anchors passed to the MCP `remember` tool land in `meta.anchors` —
+    /// the agent-facing path to the same guard the CLI `--anchor` flag sets.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remember_with_anchors_sets_meta() {
+        let (_dir, s) = server();
+        let stored = s
+            .remember(Parameters(RememberArgs {
+                text: "this deploy step looks safe and is not".into(),
+                r#type: Some("gotcha".into()),
+                tags: Vec::new(),
+                global: true,
+                link: None,
+                fires_when: Vec::new(),
+                anchors: vec!["deploy.sh".into()],
+            }))
+            .await;
+        assert!(stored.starts_with("stored"), "remember: {stored}");
+        let uid = stored.split_whitespace().nth(1).unwrap();
+
+        let engine = s.engine.lock().unwrap_or_else(|p| p.into_inner());
+        let node = store::resolve_ref(&engine.conn, uid).unwrap();
+        assert_eq!(
+            node.meta["anchors"][0], "deploy.sh",
+            "meta.anchors should hold the pattern: {:?}",
+            node.meta
+        );
     }
 
     /// The secrets guard (mimir_core::secrets::scan) is wired into the MCP
@@ -1619,6 +1661,7 @@ mod tests {
                 global: true,
                 link: None,
                 fires_when: Vec::new(),
+                anchors: Vec::new(),
             }))
             .await;
         assert!(

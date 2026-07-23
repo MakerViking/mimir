@@ -4,6 +4,15 @@ All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
+### Added
+- **Guard anchors are now settable from the MCP `remember` tool**, not just
+  the CLI `--anchor` flag. An agent that captures a memory mid-task can
+  attach the file/command patterns that should surface it at act-time
+  (`anchors: ["deploy.sh"]`), turning the guard from human-curated-only into
+  something the agent populates as it works. Same sanitize/cap rules as the
+  CLI (up to 8 patterns, 200 chars each, optional `file:` prefix); the
+  0.14.0 CLI-only limitation is lifted.
+
 ### Changed
 - **Session brief: recaps re-anchor instead of rotating.** A
   `clear`/`compact` fire no longer excludes what this session already
