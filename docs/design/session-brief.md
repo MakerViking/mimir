@@ -96,6 +96,29 @@ least visibly old. No decay-math change anywhere.
 invariant violation): those phrases match prompt text, and session start
 has no prompt. They stay fully honored on the next per-prompt injection.
 
+**Global-relevance gate (added 2026-07-23 from dogfood ground truth).**
+First real-store dogfooding showed a project with no gotchas of its own
+receiving three other projects' gotchas as its entire brief; the user
+labeled all three irrelevant — *silence beats filler*. So when briefing a
+project (`[brief] global_gate = true`, default), each GLOBAL candidate
+must share a significant (len > 3) tag/title word with the **project
+signature** — the project's title plus its own memories' tags and titles.
+A project with no signal of its own admits NO globals: un-judgeable
+relevance is treated as irrelevant, per the label. Project-scoped
+candidates are never gated; global-scope briefs are never gated; `false`
+disables. Pinned by hermetic fixtures including the exact labeled
+silence case.
+
+*Measured and rejected alternative:* cosine against a project centroid of
+already-stored embeddings (read, not computed — it would have satisfied
+the cold-CLI constraint). Implemented first and measured on the real
+102k-node store: bge cosines between unrelated technical memories
+compress into ~0.62–0.79 (anisotropy), and the ordering itself mis-ranks
+— the labeled-irrelevant colored-3MF global scored near the TOP of its
+project's distribution — so no threshold separates. The implementation
+lives in git history should a better-separating embedder arrive; do not
+re-add it without a new separation measurement.
+
 ## 4. Rendering
 
 ```
