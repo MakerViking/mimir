@@ -231,6 +231,44 @@ mimir doctor                          # confirms "daemon: warm (...)"
 To keep the daemon across reboots, install the systemd user unit:
 `cp contrib/mimir-daemon.service ~/.config/systemd/user/ && systemctl --user enable --now mimir-daemon`.
 
+### Session brief
+
+Opt-in, off by default. A fresh session (or one that just compacted) has
+forgotten every gotcha it ever learned — that window is where an agent
+drifts into violating a constraint nobody repeated. `mimir brief show`
+(a SessionStart hook entry `mimir init --hooks` installs, inert until
+enabled) injects a hard-capped digest of the current project's most
+drift-preventing memories — gotchas and decisions, ranked by the signals
+the store already has (pin, decayed strength, recency, same-project
+affinity), one imperative line each:
+
+```
+Mimir guards (do not violate):
+- GOTCHA [m:ABC123]: never test against prod without MIMIR_HOME isolation
+- DECISION [m:XY9QRT] (10mo): we chose sqlite over postgres — don't relitigate
+```
+
+Zero authoring required, zero per-prompt cost — it fires once at startup
+(default cap 150 tokens / 6 lines) and again after a `/clear` or compact
+with a smaller 100-token recap of not-yet-shown items, at most 4 rendered
+fires per session: worst case **450 tokens per session, ever**, each fire
+recorded in the savings ledger as spend. Memories already covered by your
+rules pack, already shown this session, or superseded are excluded;
+`mimir brief` previews the exact output with per-candidate scores so
+"why did this appear?" always has an answer.
+
+```toml
+[brief]
+enabled = true        # default false
+max_tokens = 150      # startup fire cap (recap_tokens = 100 for re-fires)
+max_items = 6
+```
+
+Honest caveats: it needs a hook-running client (Claude Code — MCP-only
+clients like Claude Desktop don't execute SessionStart hooks and get no
+brief), and it ships disabled while the retrieval eval's drift gate is
+still being calibrated — enable it deliberately.
+
 ### Context guard
 
 Opt-in, off by default. `mimir init --hooks --context-guard pause` (or
