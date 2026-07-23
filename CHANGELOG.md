@@ -73,7 +73,11 @@ the `mimir-mem` crate, and the on-disk schema move together.
   scores. **Default `enabled = false`**: the per-prompt silence-first
   `/inject` path is untouched, and the brief stays opt-in until its drift
   eval gate is passed with citable numbers (design + gate:
-  docs/design/session-brief.md).
+  docs/design/session-brief.md). Idea credit:
+  [@nworks3d](https://github.com/nworks3d)'s THOR fork of Mimir — its
+  session-boundary briefing channel is what this answers; written
+  clean-room from that one-sentence concept (THOR is GPLv3; its source was
+  never read). Thanks!
 
 ### Changed
 - **`contrib/mimir-daemon.service` recycles the daemon daily**

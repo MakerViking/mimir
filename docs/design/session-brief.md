@@ -5,7 +5,9 @@ workflow: 4 code-ground readers + prior-art research → 3 opposed designs →
 3-lens judge panel (winner: "Lean Brief", 24/19/10.5) → adversarial review
 (16 findings, 5 blockers — all resolved below) → completeness critic.
 Competitor context: THOR's 2026-07-22 public benchmark; its session channel
-is idea-level inspiration only (GPLv3 — no source read for this design).
+(the work of [@nworks3d](https://github.com/nworks3d), whose THOR fork of
+Mimir is the idea source here) is idea-level inspiration only (GPLv3 — no
+source read for this design).
 
 ## 1. Problem
 
