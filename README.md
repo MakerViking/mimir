@@ -296,12 +296,15 @@ Mimir guards (do not violate):
 
 Zero authoring required, zero per-prompt cost — it fires once at startup
 (default cap 150 tokens / 6 lines) and again after a `/clear` or compact
-with a smaller 100-token recap of not-yet-shown items, at most 4 rendered
-fires per session: worst case **450 tokens per session, ever**, each fire
-recorded in the savings ledger as spend. Memories already covered by your
-rules pack, already shown this session, or superseded are excluded;
-`mimir brief` previews the exact output with per-candidate scores so
-"why did this appear?" always has an answer.
+with a smaller 100-token recap, at most 4 rendered fires per session:
+worst case **450 tokens per session, ever**, each fire recorded in the
+savings ledger as spend. A recap re-anchors the top guards the wipe made
+the agent forget; a startup fire skips what was already shown this session
+(and, across sessions, anything briefed in the last 6 hours). Memories
+covered by your rules pack, superseded, or below the relevance/quality
+bar for this project are never shown; `mimir brief` previews the exact
+output with per-candidate scores so "why did this appear?" always has an
+answer.
 
 ```toml
 [brief]
@@ -313,7 +316,9 @@ max_items = 6
 Honest caveats: it needs a hook-running client (Claude Code — MCP-only
 clients like Claude Desktop don't execute SessionStart hooks and get no
 brief), and it ships disabled while the retrieval eval's drift gate is
-still being calibrated — enable it deliberately.
+still being calibrated — enable it deliberately. The session-boundary
+briefing idea comes from [@nworks3d](https://github.com/nworks3d)'s THOR
+fork of Mimir (built clean-room from the concept) — thanks!
 
 ### Context guard
 
