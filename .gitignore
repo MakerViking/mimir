@@ -15,3 +15,8 @@ docs/*-article.md
 # crates/mimir-core/src/eval harness, which ships; the unanchored form
 # silently ignored new files there.
 /eval/
+
+# Norn arc (tamper-evident eval loop) — local-only, like /eval/
+/norn/
+# Local agent-harness config (norn write-guard etc.) — never shipped
+/.claude/
