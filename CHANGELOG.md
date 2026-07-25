@@ -25,6 +25,9 @@ the `mimir-mem` crate, and the on-disk schema move together.
   operation, not breakage. Prompted by a field report of a from-source
   GPU build colliding with Windows Smart App Control (which blocks
   freshly compiled, unsigned build scripts — and is permanent to disable).
+  Hardware-validated on Windows 11 + NVIDIA before first release — thanks
+  RacOutlaw for testing (GPU active, and ~9.4 GB of no-longer-needed
+  build toolchain reclaimed).
 - **Session-brief drift eval (design §9) is implemented** —
   `crates/mimir-core/src/eval/brief.rs`: store-shape fixtures with
   labeled expected/forbidden sets drive brief selection+composition as
