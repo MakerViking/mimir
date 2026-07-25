@@ -1167,7 +1167,14 @@ fn session_brief_fires_suppresses_and_respects_kill_switch() {
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
 
-    // Default config: disabled — the kill-switch keeps the hook silent.
+    // Kill-switch: an explicit `enabled = false` keeps the hook silent
+    // (the default has been ON since the §9 gate passed, so the switch is
+    // exercised by writing false, not by relying on the default).
+    std::fs::write(
+        h.home.path().join("config.toml"),
+        "[brief]\nenabled = false\n",
+    )
+    .unwrap();
     assert_eq!(
         run_show("startup", "s1"),
         "",

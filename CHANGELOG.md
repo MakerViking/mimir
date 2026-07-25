@@ -47,6 +47,21 @@ the `mimir-mem` crate, and the on-disk schema move together.
   0.14.0 CLI-only limitation is lifted.
 
 ### Changed
+- **The session brief is now ON by default** (`[brief] enabled = true`).
+  The 0.16.0 design gated this flip on an eval, and the gate has been
+  passed with citable numbers (scoped to hook-running clients): selection
+  catches 96.0 pts of labeled must-know guards at the default 150-token
+  cap vs 4.0 pts for a hand-written rules pack alone; the marginal-catch
+  curve (85.3/96.0/96.0/96.0 at 100/150/250/400 tokens) calibrates
+  exactly the shipped cap; zero forbidden guards ever rendered across the
+  fixture families; and a preregistered repeated-exposure experiment
+  (sealed protocol, mechanical scoring) found no boilerplate blindness —
+  subject compliance held at 0.889 whether the same brief had been seen
+  1, 5, or 10 times. `enabled = false` remains the one-line kill-switch.
+  **Upgrade note:** configs written by `mimir init` before this release
+  contain an explicit `enabled = false` and keep it — flip the existing
+  key in place (appending a second `[brief]` table is a TOML parse
+  error).
 - **Session brief: recaps re-anchor instead of rotating.** A
   `clear`/`compact` fire no longer excludes what this session already
   showed — the context was just wiped, so the top guards shown before the

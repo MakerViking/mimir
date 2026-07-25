@@ -70,10 +70,13 @@ pub struct BriefConfig {
     /// Master switch, checked FIRST by `mimir brief show` (the hook entry
     /// is installed regardless, so flipping this off is the whole
     /// kill-switch — same rollback pattern as `hooks.context_guard`).
-    /// Default false: the brief may not default on until the eval gate in
-    /// the design doc is passed with citable numbers (rules-pack baseline
-    /// beaten at this token budget; marginal-catch curve justifies the
-    /// cap; repeated-exposure compliance measured).
+    /// Default true since 2026-07-25: the §9 eval gate passed with citable
+    /// numbers — rules-pack baseline beaten (96.0 vs 4.0 pts catch@150),
+    /// zero forbidden renders, marginal-catch curve calibrating this cap,
+    /// and repeated-exposure compliance measured flat (0.889 at exposures
+    /// 1/5/10, degradation within noise; preregistered Norn arc) — see
+    /// docs/design/session-brief.md §9. Configs written by `mimir init`
+    /// before the flip carry an explicit `enabled = false` and keep it.
     pub enabled: bool,
     /// Hard token cap for the startup fire, enforced by construction in
     /// the budget-fill loop (`tokens::count` over the cumulative rendered
@@ -133,7 +136,7 @@ pub struct BriefConfig {
 impl Default for BriefConfig {
     fn default() -> Self {
         BriefConfig {
-            enabled: false,
+            enabled: true,
             max_tokens: 150,
             recap_tokens: 100,
             max_items: 6,

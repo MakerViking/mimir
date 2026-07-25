@@ -31,9 +31,10 @@ per-prompt floor and must treat token cost as a first-class budget.
 drift-preventing memories (gotchas + decisions, ranked by existing signals
 only), fires on `startup` and again on `clear`/`compact` (never `resume`),
 suppresses per-session repeats, records its cost to the savings ledger, and
-ships **`enabled = false`** until the eval gate (§9) is passed with citable
-numbers. Zero authoring required; zero new user-facing concepts; no new
-schema.
+shipped **`enabled = false`** until the eval gate (§9) was passed with
+citable numbers — **gate passed and default flipped to true 2026-07-25**
+(see §9's implementation note). Zero authoring required; zero new
+user-facing concepts; no new schema.
 
 ## 3. Selection
 
@@ -220,7 +221,7 @@ never passes `session_id`) — nothing here builds on it being populated.
 
 ```toml
 [brief]
-enabled = false          # flips to true only per the gate in §9
+enabled = true           # default since 2026-07-25, per the gate in §9; false = kill-switch
 max_tokens = 150
 recap_tokens = 100
 max_items = 6
@@ -296,8 +297,19 @@ half is asserted (replay across simulated sessions: top guard keeps its
 seat, recap re-anchors, within-window sibling stays silent); the
 *compliance* half (agent boilerplate-blindness by session N) cannot be
 asserted in Rust — the report prints each replay brief verbatim as the
-corpus for that labeling, which together with the accumulating dogfood
-labels is what still stands between this gate and the default-flip.
+corpus for that labeling. **That measurement ran 2026-07-25** as a
+preregistered, sealed-protocol experiment (Norn arc; oracle + 12
+mechanical guard fixtures in the repo-local eval/compliance/): a Sonnet
+subject answering violation-tempting tasks against simulated transcripts
+carrying the same brief block 1, 5, and 10 times (recency-controlled —
+everything after the last brief block is byte-identical across
+conditions). Result, median of 5 preregistered runs on the 9-fixture
+train split: compliance 0.889 flat at every exposure level, degradation
+−0.111 against a measured 0.111 noise floor — **no boilerplate
+blindness detected**. On those numbers plus the assertable gates above,
+`enabled` defaulted to true (2026-07-25). Scope caveats carried with the
+claim: hook-running clients, Sonnet subject, mechanical fixtures,
+flat-prompt transcript simulation.
 Numbers above are scoped to hook-running clients (gate 5).
 
 ## 10. Explicitly not doing (with triggers where deferred)

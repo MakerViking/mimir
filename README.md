@@ -303,11 +303,12 @@ turn it on only once `mimir report` shows real recall traffic.
 
 ### Session brief
 
-Opt-in, off by default. A fresh session (or one that just compacted) has
-forgotten every gotcha it ever learned — that window is where an agent
-drifts into violating a constraint nobody repeated. `mimir brief show`
-(a SessionStart hook entry `mimir init --hooks` installs, inert until
-enabled) injects a hard-capped digest of the current project's most
+**On by default** (since its eval gate passed — see the caveats below for
+the numbers and how to switch it off). A fresh session (or one that just
+compacted) has forgotten every gotcha it ever learned — that window is
+where an agent drifts into violating a constraint nobody repeated.
+`mimir brief show` (a SessionStart hook entry `mimir init --hooks`
+installs) injects a hard-capped digest of the current project's most
 drift-preventing memories — gotchas and decisions, ranked by the signals
 the store already has (pin, decayed strength, recency, same-project
 affinity), one imperative line each:
@@ -332,17 +333,26 @@ answer.
 
 ```toml
 [brief]
-enabled = true        # default false
+enabled = false       # the kill-switch (default true)
 max_tokens = 150      # startup fire cap (recap_tokens = 100 for re-fires)
 max_items = 6
 ```
 
 Honest caveats: it needs a hook-running client (Claude Code — MCP-only
 clients like Claude Desktop don't execute SessionStart hooks and get no
-brief), and it ships disabled while the retrieval eval's drift gate is
-still being calibrated — enable it deliberately. The session-boundary
-briefing idea comes from [@nworks3d](https://github.com/nworks3d)'s THOR
-fork of Mimir (built clean-room from the concept) — thanks!
+brief). It shipped disabled until its drift-eval gate passed, and the
+default flipped only on those numbers (scoped to hook-running clients):
+selection catches 96.0 pts of labeled must-know guards at the 150-token
+cap vs 4.0 for a hand-written rules pack alone, the 150 cap is where the
+marginal-catch curve flattens (85.3/96.0/96.0/96.0 at 100/150/250/400),
+zero forbidden guards ever rendered across the fixture families, and a
+preregistered repeated-exposure experiment found no boilerplate
+blindness — subject compliance held at 0.889 whether the brief had been
+seen 1, 5, or 10 times. Configs written by `mimir init` before the flip
+carry an explicit `enabled = false` and keep it — flip the key in place
+(don't append a second `[brief]` table). The session-boundary briefing
+idea comes from [@nworks3d](https://github.com/nworks3d)'s THOR fork of
+Mimir (built clean-room from the concept) — thanks!
 
 ### Context guard
 
