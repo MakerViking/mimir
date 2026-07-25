@@ -144,6 +144,30 @@ Notes:
 - `config.toml: embedding.device = "cpu"` forces CPU in a GPU build;
   the default `"auto"` falls back to CPU if GPU init fails.
 
+**Windows, honestly:** the prebuilt `mimir.exe` is CPU-only, so any GPU
+flavor means compiling from source — and on Windows that means installing
+Rust ([rustup](https://rustup.rs)) *plus* the Visual Studio Build Tools
+C++ workload (several GB of toolchain). That's standing up a native dev
+environment, not flipping a feature — weigh it against what GPU actually
+buys you (bulk indexing and fast `--rerank`; single-query embeds are
+*faster on CPU*, which is why sessions use CPU by design). If you do build:
+
+- The CUDA Toolkit is **not** needed to compile — onnxruntime is
+  downloaded prebuilt during the build. The `gpu-cuda` binary *does* need
+  NVIDIA's CUDA 12/13 + cuDNN 9 runtime DLLs findable at run time (the
+  toolkit installer is the easiest way to get them).
+- NVIDIA users have a lighter path: `gpu-webgpu` uses DirectX 12 on
+  Windows — no CUDA install at all (upstream marks the WebGPU provider
+  experimental).
+- **Smart App Control breaks `cargo` builds entirely** (field-reported):
+  build scripts are freshly compiled, unsigned executables, which SAC
+  blocks — for *any* Rust build, either GPU flavor. Disabling SAC is
+  permanent (Windows won't re-enable it without a reset), so if SAC is
+  on, our honest advice is to stay on the prebuilt CPU binary rather
+  than trade SAC for a GPU build.
+- Set the stack workaround PowerShell-style:
+  `$env:RUST_MIN_STACK=33554432` before `cargo install`.
+
 Measured on an RX 6900 XT (Vulkan): bulk embedding 2.3× faster, recall
 22 ms → 7 ms, `--rerank` 1.9 s → 0.14 s.
 
