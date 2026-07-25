@@ -25,6 +25,7 @@
 //! cargo test -p mimir-mem-core --features eval eval:: -- --ignored --nocapture
 //! ```
 
+pub mod brief;
 pub mod fixtures;
 
 use std::collections::HashSet;

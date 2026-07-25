@@ -11,4 +11,7 @@ assets/launch-video.mp4
 # Personal drafts (blog/marketing) — never shipped in the repo
 docs/medium-article.md
 docs/*-article.md
-eval/
+# Local-only eval data (labels/ledger at the repo root) — NOT the
+# crates/mimir-core/src/eval harness, which ships; the unanchored form
+# silently ignored new files there.
+/eval/

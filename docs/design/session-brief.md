@@ -281,6 +281,25 @@ Gates, literally asserted:
 5. Any published number is labeled as scoped to hook-running clients
    (minor fix — this is not a general session-drift improvement claim).
 
+**Implemented 2026-07-25** in `crates/mimir-core/src/eval/brief.rs`
+(deterministic, model-free, plain `cargo test`; report via
+`cargo test -p mimir-mem-core eval::brief -- --ignored --nocapture`).
+All four assertable gates pass: catch@150 = 96.0 pts vs rules-baseline
+4.0 pts (gate 1, non-strawman — one hand-promoted guard IS rules-caught);
+zero forbidden ever selected or rendered at any cap (gate 2); budget
+adherence at every fixture × cap (gate 3); marginal-catch curve
+85.3/96.0/96.0/96.0 at 100/150/250/400 calibrates to the shipped 150
+default under the pro-rata ≥3 pts/100-tok rule (gate 4). Dogfood labels
+are encoded as fixtures (BookForge=silence, ARIA=canonical-gotcha-first,
+rotation-to-weak-tail=wrong). The repeated-exposure family's *selection*
+half is asserted (replay across simulated sessions: top guard keeps its
+seat, recap re-anchors, within-window sibling stays silent); the
+*compliance* half (agent boilerplate-blindness by session N) cannot be
+asserted in Rust — the report prints each replay brief verbatim as the
+corpus for that labeling, which together with the accumulating dogfood
+labels is what still stands between this gate and the default-flip.
+Numbers above are scoped to hook-running clients (gate 5).
+
 ## 10. Explicitly not doing (with triggers where deferred)
 
 - **THOR-style always-on courier / never-empty injection** — violates the
