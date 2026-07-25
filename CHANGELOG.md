@@ -5,6 +5,15 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **`mimir savings` shows a "Spent" rollup.** Cost sources (the session
+  brief) have always been excluded from every saved-aggregate so injected
+  tokens can never net against real savings — but that made the cost
+  invisible. The report now prints a `spent` line (all-time + today +
+  fire count, in tokens and dollars, explicitly "not netted above"), the
+  JSON output gains a windowed `spent` object, and the dashboard's
+  savings panel shows spent-on-injected-context. Silent while nothing
+  has ever fired. This was a stated precondition of the brief's
+  default-flip (design §5).
 - **Prebuilt Windows GPU binary (`windows-x86_64-gpu-webgpu`).** Releases
   now attach a `gpu-webgpu` build of `mimir.exe` with its runtime
   libraries (Dawn + the DirectX shader compiler DLLs) in the zip —

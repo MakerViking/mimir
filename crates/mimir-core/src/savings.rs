@@ -96,6 +96,49 @@ pub fn summary(conn: &Connection, now: i64) -> Result<Summary> {
     Ok(row)
 }
 
+/// Injected-context spend for the standard reporting windows — the mirror
+/// of [`Summary`] over the COST sources only (today: the session brief).
+/// This is the "Spent" rollup the brief's default-flip gate requires:
+/// cost events are excluded from every saved-aggregate, and without this
+/// they'd be excluded into invisibility.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Spent {
+    pub day: i64,
+    pub week: i64,
+    pub month: i64,
+    pub all: i64,
+    /// Rendered fires, all time.
+    pub events: i64,
+}
+
+/// One-scan windowed spend over the cost sources. Spend is
+/// `tokens_after - tokens_before` (cost sources record `before = 0`
+/// today; the subtraction stays honest if a future cost source ever
+/// records a nonzero before).
+pub fn spent(conn: &Connection, now: i64) -> Result<Spent> {
+    let row = conn.query_row(
+        &format!(
+            "SELECT
+               COALESCE(SUM(CASE WHEN at >= ?1 THEN tokens_after - tokens_before END), 0),
+               COALESCE(SUM(CASE WHEN at >= ?2 THEN tokens_after - tokens_before END), 0),
+               COALESCE(SUM(CASE WHEN at >= ?3 THEN tokens_after - tokens_before END), 0),
+               COALESCE(SUM(tokens_after - tokens_before), 0), COUNT(*)
+             FROM savings_event WHERE source IN {COST_SOURCES_SQL}"
+        ),
+        params![now - 86_400, now - 7 * 86_400, now - 30 * 86_400],
+        |r| {
+            Ok(Spent {
+                day: r.get(0)?,
+                week: r.get(1)?,
+                month: r.get(2)?,
+                all: r.get(3)?,
+                events: r.get(4)?,
+            })
+        },
+    )?;
+    Ok(row)
+}
+
 /// Append one savings event. `project_id` is optional (the proxy may run
 /// outside any project). Never fails the caller's main work — callers that
 /// only want best-effort logging can ignore the error.
@@ -278,5 +321,34 @@ mod tests {
             brief_row.is_some_and(|(_, t)| t.after == 86 && t.saved() == 0),
             "brief stays visible per-source with its cost, clamped to 0 saved"
         );
+    }
+
+    /// The Spent rollup mirrors summary's windows over cost sources only:
+    /// savings events never leak in, cost events all count.
+    #[test]
+    fn spent_rollup_counts_only_cost_sources() {
+        let conn = db::open_in_memory().unwrap();
+        let now = crate::model::now_unix();
+        record(
+            &conn,
+            None,
+            source::FILTER,
+            1000,
+            200,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        record(&conn, None, source::BRIEF, 0, 86, serde_json::json!({})).unwrap();
+        record(&conn, None, source::BRIEF, 0, 100, serde_json::json!({})).unwrap();
+        let sp = spent(&conn, now).unwrap();
+        assert_eq!(sp.day, 186, "both brief fires count, filter never does");
+        assert_eq!(sp.week, 186);
+        assert_eq!(sp.month, 186);
+        assert_eq!(sp.all, 186);
+        assert_eq!(sp.events, 2);
+
+        // An empty ledger spends nothing (and errors nowhere).
+        let empty = db::open_in_memory().unwrap();
+        assert_eq!(spent(&empty, now).unwrap(), Spent::default());
     }
 }

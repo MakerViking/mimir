@@ -25,6 +25,7 @@ pub fn savings(json: bool, oneline: bool) -> Result<()> {
         return Ok(());
     }
 
+    let spent = savings::spent(&mimir.conn, now_unix())?;
     let by_source = savings::by_source(&mimir.conn, None)?;
 
     if json {
@@ -46,6 +47,11 @@ pub fn savings(json: bool, oneline: bool) -> Result<()> {
             serde_json::json!({
                 "saved": { "day": s.day, "week": s.week, "month": s.month, "all": s.all.saved() },
                 "saved_usd_all": to_dollars(s.all.saved(), price),
+                "spent": {
+                    "day": spent.day, "week": spent.week, "month": spent.month,
+                    "all": spent.all, "events": spent.events,
+                    "all_usd": to_dollars(spent.all, price),
+                },
                 "input_price_per_mtok": price,
                 "events_all": s.all.events,
                 "tokens_before_all": s.all.before,
@@ -74,6 +80,18 @@ pub fn savings(json: bool, oneline: bool) -> Result<()> {
     if s.all.before > 0 {
         let pct = 100.0 * s.all.saved() as f64 / s.all.before as f64;
         println!("  ratio  {pct:.0}% of source tokens avoided  (input @ ${price}/MTok)");
+    }
+    // The other side of the ledger: context Mimir injected (the session
+    // brief). Never netted against the savings above — shown so the cost
+    // is a number, not a footnote. Silent while nothing has ever fired.
+    if spent.events > 0 {
+        println!(
+            "  spent  {:>8} tok  {}  on injected context (today {}, {} fires) — not netted above",
+            human(spent.all),
+            usd(spent.all, price),
+            human(spent.day),
+            spent.events
+        );
     }
     if by_source.is_empty() {
         println!(

@@ -359,6 +359,16 @@ fn render(mimir: &Mimir) -> Result<String> {
         "—".into()
     };
 
+    // The other side of the ledger: context Mimir injected (session
+    // brief). Cost sources are excluded from every saved-aggregate above;
+    // this line keeps the spend a visible number instead of a footnote.
+    let spent = mimir_core::savings::spent(conn, now)?;
+    let spent_cell = if spent.events > 0 {
+        format!("{} ({} fires)", fmt_n(spent.all), fmt_n(spent.events))
+    } else {
+        "—".into()
+    };
+
     // Time-window strip: today / 7d / 30d / all (tokens + $).
     let saved_windows: String = [
         ("today", sv.day),
@@ -437,6 +447,7 @@ fn render(mimir: &Mimir) -> Result<String> {
         .replace("{{SAVED_BEFORE}}", &fmt_n(saved_all.before))
         .replace("{{SAVED_EVENTS}}", &fmt_n(saved_all.events))
         .replace("{{SAVED_RATIO}}", &saved_ratio)
+        .replace("{{SPENT}}", &spent_cell)
         .replace("{{SAVED_WINDOWS}}", &saved_windows)
         .replace("{{SAVINGS_BARS}}", &savings_bars)
         .replace(
@@ -654,6 +665,7 @@ footer span{margin-left:auto}
       <div><span>source tokens avoided</span><b class="teal">{{SAVED_RATIO}}</b></div>
       <div><span>source tokens seen</span><b>{{SAVED_BEFORE}}</b></div>
       <div><span>savings events</span><b>{{SAVED_EVENTS}}</b></div>
+      <div><span>spent on injected context</span><b>{{SPENT}}</b></div>
     </div>
     <div class="win">{{SAVED_WINDOWS}}</div>
     <svg width="100%" height="96" viewBox="0 0 308 96" preserveAspectRatio="none">
