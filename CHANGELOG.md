@@ -5,6 +5,27 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **Prebuilt Windows GPU binary (`windows-x86_64-gpu-webgpu`).** Releases
+  now attach a `gpu-webgpu` build of `mimir.exe` with its runtime
+  libraries (Dawn + the DirectX shader compiler DLLs) in the zip —
+  GPU acceleration on Windows without standing up a Rust/MSVC toolchain,
+  and without any CUDA install (WebGPU rides DirectX 12, any GPU vendor).
+  Labeled experimental: the upstream WebGPU execution provider is
+  experimental and CI runners can't hardware-test it; `device = "auto"`
+  falls back to CPU if GPU init fails, so the failure mode is CPU-speed
+  operation, not breakage. Prompted by a field report of a from-source
+  GPU build colliding with Windows Smart App Control (which blocks
+  freshly compiled, unsigned build scripts — and is permanent to disable).
+- **Session-brief drift eval (design §9) is implemented** —
+  `crates/mimir-core/src/eval/brief.rs`: store-shape fixtures with
+  labeled expected/forbidden sets drive brief selection+composition as
+  pure functions, asserting the §9 gates in plain `cargo test`
+  (zero forbidden guards ever rendered, token-budget adherence at every
+  fixture, rules-pack baseline beaten, and the 100/150/250/400
+  marginal-catch curve calibrating the default 150-token cap). The
+  repeated-exposure replay prints per-session briefs for the remaining
+  agent-compliance measurement. Dev-only; the `[brief] enabled` default
+  is unchanged until that last measurement lands.
 - **Guard anchors are now settable from the MCP `remember` tool**, not just
   the CLI `--anchor` flag. An agent that captures a memory mid-task can
   attach the file/command patterns that should surface it at act-time

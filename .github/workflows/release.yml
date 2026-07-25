@@ -1,13 +1,21 @@
 name: Release
 
 # Tag a version (`git tag v0.1.0 && git push --tags`) to build and publish
-# prebuilt binaries. CPU-only on purpose: they run on any machine. GPU
-# builds stay source-only (see README) since they dynamically link
-# vendor-specific provider libraries.
+# prebuilt binaries. CPU-only by default: they run on any machine. The one
+# GPU exception is windows-x86_64-gpu-webgpu — WebGPU's runtime libraries
+# (Dawn + the DirectX shader compiler) are vendor-neutral and ship inside
+# the zip, unlike CUDA's, which need NVIDIA's runtime installed and so
+# stay source-only (see README). The GPU asset builds on a GPU-less
+# runner and cannot be hardware-tested in CI; `device = "auto"` falls
+# back to CPU, so its failure mode is CPU-speed operation, not breakage.
+#
+# `workflow_dispatch` builds the same artifacts without publishing a
+# release — use it to test-build (e.g. the GPU asset) before tagging.
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -32,6 +40,10 @@ jobs:
           # No macOS Intel: onnxruntime ships no x86_64-apple-darwin binaries
           - { name: macos-aarch64, os: macos-latest, target: aarch64-apple-darwin }
           - { name: windows-x86_64, os: windows-latest, target: x86_64-pc-windows-msvc }
+          # GPU via WebGPU/D3D12: ort downloads a prebuilt onnxruntime
+          # (no CUDA, no GPU needed at build time); the three runtime
+          # DLLs are packaged below. Experimental upstream EP.
+          - { name: windows-x86_64-gpu-webgpu, os: windows-latest, target: x86_64-pc-windows-msvc, features: gpu-webgpu }
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -39,7 +51,12 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }} -p mimir-mem
+        # RUST_MIN_STACK: rustc/LLVM ThinLTO overflows its default thread
+        # stack linking the large onnxruntime GPU binaries; harmless for
+        # the CPU builds, so it's set unconditionally.
+        env:
+          RUST_MIN_STACK: "33554432"
+        run: cargo build --release --target ${{ matrix.target }} -p mimir-mem ${{ matrix.features && format('--features {0}', matrix.features) || '' }}
       # The artifact must contain what main contains — a 0.4.0 release once
       # shipped without the slash-command installer because the tag predated
       # the feature. Assert the built binary actually installs them.
@@ -65,6 +82,17 @@ jobs:
           New-Item -ItemType Directory -Force dist | Out-Null
           Copy-Item target/${{ matrix.target }}/release/mimir.exe dist/
           Copy-Item README.md,LICENSE-MIT,LICENSE-APACHE dist/
+          if ('${{ matrix.features }}' -ne '') {
+            # The webgpu build loads these from the exe's directory at
+            # runtime: Dawn plus the DirectX shader compiler. They live in
+            # ort's download cache after the build; fail loudly if the
+            # layout ever changes rather than shipping a broken asset.
+            $dawn = Get-ChildItem -Path "$env:LOCALAPPDATA","$env:USERPROFILE" -Recurse -Filter webgpu_dawn.dll -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $dawn) { throw "webgpu_dawn.dll not found in ort's cache" }
+            foreach ($dll in 'webgpu_dawn.dll','dxcompiler.dll','dxil.dll') {
+              Copy-Item (Join-Path $dawn.DirectoryName $dll) dist/
+            }
+          }
           Compress-Archive -Path dist/* -DestinationPath mimir-${{ matrix.name }}.zip
       - uses: actions/upload-artifact@v5
         with:
@@ -74,6 +102,8 @@ jobs:
 
   release:
     needs: build
+    # workflow_dispatch runs stop at artifacts — only tags publish.
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v5
