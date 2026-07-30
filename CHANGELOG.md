@@ -5,6 +5,18 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **Runaway circuit breaker on the proxy (`--max-request-tokens`, `[proxy]
+  max_request_tokens`).** Off by default. Above the cap, `mimir proxy`
+  rejects a `/v1/messages` request with an Anthropic-shaped
+  `request_too_large` error (so the client SDK raises a readable
+  exception rather than a bare gateway failure) and does not forward it.
+  It **rejects, never truncates**: silently dropping content would change
+  what the model sees and could drop the actual question. Checked after
+  dedup/prune so those can bring a request back under the line first, and
+  skipped entirely under `--dry-run`, which stays measure-only. The
+  estimate covers `system`, message text, and the `tools` array — tool
+  definitions are input too — and errs deliberately low, since a false
+  rejection is worse than firing late.
 - **Configurable prompt-cache TTL on the proxy (`--cache-ttl`, `[proxy]
   cache_ttl`).** The breakpoints `mimir proxy` adds were hardcoded to the
   API's default 5-minute lifetime; `"1h"` is now selectable. Deliberately

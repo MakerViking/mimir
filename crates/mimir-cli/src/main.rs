@@ -366,6 +366,10 @@ enum Command {
         /// Enable lossy pruning of stale tool results (off by default).
         #[arg(long)]
         prune: bool,
+        /// Reject requests estimated over this many input tokens (0 = off).
+        /// A runaway circuit breaker: rejects, never truncates.
+        #[arg(long, value_name = "N")]
+        max_request_tokens: Option<usize>,
     },
     /// Sync memories with the central store (optional; see docs/sync.md).
     Sync {
@@ -803,7 +807,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cache_ttl,
             no_dedup,
             prune,
-        } => proxy_cmd::run(bind, dry_run, no_cache, cache_ttl, no_dedup, prune),
+            max_request_tokens,
+        } => proxy_cmd::run(
+            bind,
+            dry_run,
+            no_cache,
+            cache_ttl,
+            no_dedup,
+            prune,
+            max_request_tokens,
+        ),
         Command::Sync { cmd } => match cmd {
             None => sync::sync(),
             Some(SyncCmd::Push) => sync::push(),

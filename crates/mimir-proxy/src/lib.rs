@@ -26,7 +26,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 mod optimize;
-pub use optimize::{optimize_request, CacheTtl, Optimization, OptimizeOpts};
+pub use optimize::{count_request_tokens, optimize_request, CacheTtl, Optimization, OptimizeOpts};
 
 /// Upper bound on a buffered request body (the messages JSON).
 const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -46,6 +46,11 @@ pub struct ProxyConfig {
     pub cache_ttl: CacheTtl,
     pub dedup: bool,
     pub prune: bool,
+    /// Runaway circuit breaker: reject a `/v1/messages` request whose estimated
+    /// input exceeds this many tokens. `0` disables it (the default). We
+    /// **reject**, never truncate — silently dropping content would change what
+    /// the model sees, and the whole point is to make a runaway loud.
+    pub max_request_tokens: usize,
     pub db_path: Option<PathBuf>,
     /// `recall_event` retention window in days for the idle-timer prune
     /// below (`config::LearnConfig::effective_retention_days`); `None`
@@ -198,11 +203,24 @@ async fn proxy(state: &AppState, req: axum::extract::Request) -> Result<Response
     let is_messages = parts.method == Method::POST && parts.uri.path().ends_with("/v1/messages");
     // we_cached: true only on requests where WE introduced caching (so the
     // measured cache reads downstream are ours to claim).
-    let (send_bytes, we_cached) = if is_messages {
+    let (send_bytes, we_cached, req_tokens) = if is_messages {
         optimize_messages_body(state, &body_bytes)
     } else {
-        (body_bytes.to_vec(), false)
+        (body_bytes.to_vec(), false, 0)
     };
+
+    // Circuit breaker. Checked AFTER the optimization passes, so dedup/prune
+    // get their chance to bring an over-budget request back under the line
+    // rather than us rejecting work the proxy could have salvaged.
+    let cap = state.cfg.max_request_tokens;
+    if cap > 0 && req_tokens > cap {
+        tracing::warn!(
+            tokens = req_tokens,
+            cap,
+            "proxy: rejected oversized request (max_request_tokens)"
+        );
+        return Ok(oversize_response(req_tokens, cap));
+    }
 
     // Forward upstream, copying headers (minus hop-by-hop, host, content-length).
     let mut rb = state.client.request(parts.method.clone(), &url);
@@ -242,11 +260,14 @@ async fn proxy(state: &AppState, req: axum::extract::Request) -> Result<Response
     Ok(builder.body(body)?)
 }
 
-/// Optimize a `/v1/messages` body. Returns the bytes to forward and whether we
-/// introduced caching (and so should measure the response's cache reads).
-fn optimize_messages_body(state: &AppState, body_bytes: &[u8]) -> (Vec<u8>, bool) {
+/// Optimize a `/v1/messages` body. Returns the bytes to forward, whether we
+/// introduced caching (and so should measure the response's cache reads), and
+/// the estimated input tokens of the optimized body.
+fn optimize_messages_body(state: &AppState, body_bytes: &[u8]) -> (Vec<u8>, bool, usize) {
     let Ok(json) = serde_json::from_slice::<Value>(body_bytes) else {
-        return (body_bytes.to_vec(), false); // not JSON we understand — pass through
+        // Not JSON we understand — pass through, and report 0 tokens so the
+        // circuit breaker cannot fire on a body we failed to parse.
+        return (body_bytes.to_vec(), false, 0);
     };
     let we_cached = state.cfg.cache && !optimize::has_cache_control(&json);
     let (new_json, opt) = optimize_request(
@@ -258,6 +279,7 @@ fn optimize_messages_body(state: &AppState, body_bytes: &[u8]) -> (Vec<u8>, bool
             prune: state.cfg.prune,
         },
     );
+    let req_tokens = count_request_tokens(&new_json);
     if state.cfg.dry_run {
         if opt.deduped > 0 || opt.pruned > 0 {
             tracing::info!(
@@ -266,11 +288,35 @@ fn optimize_messages_body(state: &AppState, body_bytes: &[u8]) -> (Vec<u8>, bool
                 "proxy dry-run: would optimize"
             );
         }
-        return (body_bytes.to_vec(), false);
+        // Report 0 so --dry-run stays what it says on the tin: measure only,
+        // never alter the outcome of a request (including by rejecting it).
+        return (body_bytes.to_vec(), false, 0);
     }
     record_request_savings(&state.db, &opt);
     let bytes = serde_json::to_vec(&new_json).unwrap_or_else(|_| body_bytes.to_vec());
-    (bytes, we_cached)
+    (bytes, we_cached, req_tokens)
+}
+
+/// An Anthropic-shaped `request_too_large` error, so the client's SDK raises a
+/// readable exception instead of a bare gateway failure it can't interpret.
+fn oversize_response(tokens: usize, cap: usize) -> Response {
+    let body = serde_json::json!({
+        "type": "error",
+        "error": {
+            "type": "request_too_large",
+            "message": format!(
+                "mimir proxy: request is ~{tokens} input tokens, over the configured \
+                 cap of {cap} ([proxy] max_request_tokens / --max-request-tokens). \
+                 The request was NOT sent upstream and you were not billed for it. \
+                 Start a fresh session, or raise/disable the cap (0 = off)."
+            ),
+        }
+    });
+    Response::builder()
+        .status(StatusCode::PAYLOAD_TOO_LARGE)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .expect("static oversize response is always well-formed")
 }
 
 fn is_hop_by_hop(name: &str) -> bool {
@@ -381,6 +427,89 @@ fn field_u64(s: &str, key: &str) -> Option<u64> {
 mod tests {
     use super::{field_u64, prune_events_once, prune_session_state_once, Db};
     use std::sync::{Arc, Mutex};
+
+    /// An `AppState` whose upstream is a closed port, so "did we forward?" is
+    /// observable: a forwarded request fails to connect (502 via `handle`),
+    /// while a rejected one never gets that far.
+    fn state_with_cap(max_request_tokens: usize) -> super::AppState {
+        super::AppState {
+            cfg: super::ProxyConfig {
+                bind: "127.0.0.1:0".parse().unwrap(),
+                // Port 1 is reserved and never listening — instant refusal.
+                upstream: "http://127.0.0.1:1".into(),
+                dry_run: false,
+                cache: false,
+                cache_ttl: super::CacheTtl::FiveMin,
+                dedup: false,
+                prune: false,
+                max_request_tokens,
+                db_path: None,
+                event_retention_days: None,
+            },
+            client: reqwest::Client::new(),
+            db: None,
+        }
+    }
+
+    fn messages_request(system: &str) -> axum::extract::Request {
+        let body = serde_json::json!({
+            "model": "claude-opus-5",
+            "system": system,
+            "messages": [{"role": "user", "content": "hi"}],
+        });
+        axum::http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/v1/messages")
+            .body(axum::body::Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn oversized_request_is_rejected_and_never_forwarded() {
+        let state = state_with_cap(50);
+        // ~1000 tokens of system prompt, far over the 50-token cap.
+        let resp = super::proxy(&state, messages_request(&"word ".repeat(1000)))
+            .await
+            .expect("rejection is a normal response, not a transport error");
+
+        assert_eq!(resp.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // Must be Anthropic-shaped so the client SDK raises a real exception.
+        assert_eq!(json["type"], "error");
+        assert_eq!(json["error"]["type"], "request_too_large");
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not billed"),
+            "the error must tell the user they were not billed"
+        );
+    }
+
+    #[tokio::test]
+    async fn under_cap_request_is_forwarded() {
+        let state = state_with_cap(50_000);
+        // Reaching a closed upstream is an Err — which is itself the proof
+        // that we attempted the forward instead of short-circuiting.
+        let result = super::proxy(&state, messages_request("short prompt")).await;
+        assert!(
+            result.is_err(),
+            "an under-cap request must be forwarded (and so fail on the dead upstream)"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_of_zero_disables_the_breaker() {
+        let state = state_with_cap(0);
+        let result = super::proxy(&state, messages_request(&"word ".repeat(10_000))).await;
+        assert!(
+            result.is_err(),
+            "cap=0 must forward even a huge request rather than reject it"
+        );
+    }
 
     #[test]
     fn parses_usage_field() {

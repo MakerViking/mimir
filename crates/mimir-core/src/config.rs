@@ -353,6 +353,13 @@ pub struct ProxyConfig {
     pub dedup: bool,
     /// Prune stale tool_result blocks from older turns (lossy — opt in).
     pub prune: bool,
+    /// Runaway circuit breaker: reject a `/v1/messages` request whose estimated
+    /// input exceeds this many tokens. `0` (the default) disables it. The proxy
+    /// **rejects** an over-cap request with a `request_too_large` error and does
+    /// not forward it — it never truncates, since silently dropping content
+    /// would change what the model sees without telling anyone. Checked after
+    /// dedup/prune, so those get a chance to bring a request back under first.
+    pub max_request_tokens: usize,
 }
 
 impl Default for ProxyConfig {
@@ -364,6 +371,7 @@ impl Default for ProxyConfig {
             cache_ttl: "5m".into(),
             dedup: true,
             prune: false,
+            max_request_tokens: 0,
         }
     }
 }

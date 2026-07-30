@@ -11,6 +11,7 @@ pub fn run(
     cache_ttl: Option<String>,
     no_dedup: bool,
     prune: bool,
+    max_request_tokens: Option<usize>,
 ) -> Result<()> {
     let mimir = Mimir::open()?;
     let pc = &mimir.config.proxy;
@@ -34,6 +35,7 @@ pub fn run(
         cache_ttl: ttl,
         dedup: pc.dedup && !no_dedup,
         prune: prune || pc.prune,
+        max_request_tokens: max_request_tokens.unwrap_or(pc.max_request_tokens),
         db_path: Some(mimir.paths.db_file.clone()),
         event_retention_days: mimir.config.learn.effective_retention_days(),
     };

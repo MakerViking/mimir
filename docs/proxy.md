@@ -35,6 +35,18 @@ content*:
 - **Prune stale tool results** (default **off**, lossy). Replaces large
   `tool_result` blocks in older turns with a short placeholder. This changes
   what the model sees, so it's opt-in (`--prune` or `[proxy] prune = true`).
+- **Runaway circuit breaker** (`--max-request-tokens N`, `[proxy]
+  max_request_tokens`, default `0` = off). Rejects a `/v1/messages` request
+  whose estimated input exceeds `N` tokens, returning an Anthropic-shaped
+  `request_too_large` error so your SDK raises a readable exception. The
+  request is **not** forwarded and you are not billed for it. It **rejects,
+  never truncates** — silently dropping content would change what the model
+  sees without telling anyone, and could drop the actual question. Checked
+  *after* dedup/prune, so those get a chance to bring a request back under the
+  line first. The estimate counts `system`, message text, and the `tools` array
+  (tool definitions are input too), and deliberately errs **low** — a false
+  rejection is worse than firing slightly late. Leave it off unless you're
+  guarding against a specific runaway loop.
 
 Everything else — every other path, method, header and the entire streaming
 (SSE) response — is forwarded **verbatim**. Your `x-api-key` / auth headers are
@@ -56,6 +68,7 @@ mimir proxy --prune              # also enable lossy tool-result pruning
 mimir proxy --no-cache           # disable the cache pass
 mimir proxy --cache-ttl 1h       # 1-hour breakpoints (2x write cost — see above)
 mimir proxy --no-dedup           # disable the dedup pass
+mimir proxy --max-request-tokens 400000   # reject runaway requests (0 = off)
 
 # point your client at it
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8788
@@ -78,6 +91,7 @@ cache    = true     # add cache breakpoints when the client set none
 cache_ttl = "5m"    # "5m" (default) or "1h" — 1h doubles the write cost
 dedup    = true     # elide later identical large blocks (lossless)
 prune    = false    # lossy: elide stale tool results
+max_request_tokens = 0   # 0 = off; above this, reject (never truncate)
 
 [savings]
 input_price_per_mtok = 3.0   # set to your model's input price (e.g. 15.0 for Opus)

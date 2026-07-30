@@ -178,6 +178,60 @@ fn set_block_text(block: &mut Value, placeholder: &str) {
     }
 }
 
+/// Approximate billed input tokens for a `/v1/messages` body: the `system`
+/// prompt, every message's text/tool_result content, and the `tools` array
+/// (whose descriptions and schemas are input too — often tens of thousands of
+/// tokens before the user types anything).
+///
+/// Deliberately an **under**-estimate: it counts text, not JSON scaffolding or
+/// per-message overhead. This is only used as a runaway circuit breaker, where
+/// a false positive (rejecting a request that was actually fine) is much worse
+/// than firing slightly late. Never use it for billing — the real numbers come
+/// from the response's `usage`.
+pub fn count_request_tokens(req: &Value) -> usize {
+    let mut total = 0usize;
+
+    total += match req.get("system") {
+        Some(Value::String(s)) => tokens::count(s),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter_map(block_text)
+            .map(|t| tokens::count(&t))
+            .sum(),
+        _ => 0,
+    };
+
+    if let Some(msgs) = req.get("messages").and_then(|m| m.as_array()) {
+        for msg in msgs {
+            total += match msg.get("content") {
+                Some(Value::String(s)) => tokens::count(s),
+                Some(Value::Array(blocks)) => blocks
+                    .iter()
+                    .filter_map(block_text)
+                    .map(|t| tokens::count(&t))
+                    .sum(),
+                _ => 0,
+            };
+        }
+    }
+
+    // Tool definitions ride along on every single request.
+    if let Some(tools) = req.get("tools").and_then(|t| t.as_array()) {
+        for tool in tools {
+            for key in ["name", "description"] {
+                if let Some(s) = tool.get(key).and_then(|v| v.as_str()) {
+                    total += tokens::count(s);
+                }
+            }
+            if let Some(schema) = tool.get("input_schema") {
+                total += tokens::count(&schema.to_string());
+            }
+        }
+    }
+
+    total
+}
+
 /// Replace later identical large blocks with a placeholder (keep the first).
 fn dedup_blocks(req: &mut Value, opt: &mut Optimization) {
     let Some(msgs) = req.get_mut("messages").and_then(|m| m.as_array_mut()) else {
@@ -289,6 +343,53 @@ mod tests {
         assert_eq!(CacheTtl::parse("1hour"), None);
         assert_eq!(CacheTtl::parse("300"), None);
         assert_eq!(CacheTtl::parse(""), None);
+    }
+
+    #[test]
+    fn count_request_tokens_covers_system_messages_and_tools() {
+        let req = json!({
+            "system": "You are careful. ".repeat(50),
+            "messages": [
+                {"role":"user","content":"hello there"},
+                {"role":"user","content":[
+                    {"type":"text","text":"x ".repeat(100)},
+                    {"type":"tool_result","tool_use_id":"a","content":"y ".repeat(100)}
+                ]}
+            ],
+            "tools": [{
+                "name":"get_weather",
+                "description":"Get the weather. ".repeat(30),
+                "input_schema":{"type":"object","properties":{"city":{"type":"string"}}}
+            }]
+        });
+        let n = count_request_tokens(&req);
+
+        // Each section must actually contribute — a counter that silently
+        // skipped `tools` would still look plausible on the total alone.
+        let no_tools = count_request_tokens(&json!({
+            "system": req["system"], "messages": req["messages"]
+        }));
+        let only_tools = count_request_tokens(&json!({ "tools": req["tools"] }));
+        assert!(only_tools > 0, "tool definitions must be counted");
+        assert_eq!(n, no_tools + only_tools);
+    }
+
+    #[test]
+    fn count_request_tokens_is_zero_for_an_empty_body() {
+        assert_eq!(count_request_tokens(&json!({})), 0);
+        assert_eq!(count_request_tokens(&json!({"messages": []})), 0);
+    }
+
+    #[test]
+    fn count_request_tokens_ignores_unknown_block_types() {
+        // An image block carries no countable text; it must not panic or
+        // inflate the estimate via its base64 payload.
+        let req = json!({
+            "messages": [{"role":"user","content":[
+                {"type":"image","source":{"type":"base64","data":"AAAA".repeat(500)}}
+            ]}]
+        });
+        assert_eq!(count_request_tokens(&req), 0);
     }
 
     #[test]
