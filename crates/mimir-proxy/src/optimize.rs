@@ -18,9 +18,50 @@ use std::hash::{Hash, Hasher};
 use mimir_core::tokens;
 use serde_json::{json, Value};
 
+/// Lifetime of the breakpoints we add. The API bills a cache *write* at 1.25x
+/// input for `FiveMin` and 2x for `OneHour`, and a read at ~0.1x either way —
+/// so 5m breaks even on the 2nd request and 1h only on the 3rd. 1h pays off
+/// solely when the session idles longer than 5 minutes between turns (an agent
+/// waiting on a human); for back-to-back work it is strictly more expensive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CacheTtl {
+    #[default]
+    FiveMin,
+    OneHour,
+}
+
+impl CacheTtl {
+    /// Parse the `[proxy] cache_ttl` value. Returns `None` on anything else so
+    /// callers can reject it loudly rather than silently falling back.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim() {
+            "5m" => Some(CacheTtl::FiveMin),
+            "1h" => Some(CacheTtl::OneHour),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CacheTtl::FiveMin => "5m",
+            CacheTtl::OneHour => "1h",
+        }
+    }
+
+    /// The `cache_control` object to stamp on a block. 5m is the API default,
+    /// so we omit `ttl` entirely there and keep the emitted JSON unchanged.
+    fn control(self) -> Value {
+        match self {
+            CacheTtl::FiveMin => json!({ "type": "ephemeral" }),
+            CacheTtl::OneHour => json!({ "type": "ephemeral", "ttl": "1h" }),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct OptimizeOpts {
     pub cache: bool,
+    pub cache_ttl: CacheTtl,
     pub dedup: bool,
     pub prune: bool,
 }
@@ -45,7 +86,7 @@ const DEDUP_PLACEHOLDER: &str = "[identical to an earlier block — elided by mi
 pub fn optimize_request(mut req: Value, opts: OptimizeOpts) -> (Value, Optimization) {
     let mut opt = Optimization::default();
     if opts.cache {
-        add_cache_breakpoints(&mut req);
+        add_cache_breakpoints(&mut req, opts.cache_ttl);
     }
     if opts.dedup {
         dedup_blocks(&mut req, &mut opt);
@@ -76,12 +117,12 @@ pub(crate) fn has_cache_control(req: &Value) -> bool {
 
 /// Mark the stable prefix for caching: the system prompt and the last message's
 /// final block. No-op if the client already manages caching.
-fn add_cache_breakpoints(req: &mut Value) {
+fn add_cache_breakpoints(req: &mut Value, ttl: CacheTtl) {
     if has_cache_control(req) {
         return;
     }
     if let Some(system) = req.get_mut("system") {
-        mark_cache_control(system);
+        mark_cache_control(system, ttl);
     }
     if let Some(content) = req
         .get_mut("messages")
@@ -89,23 +130,23 @@ fn add_cache_breakpoints(req: &mut Value) {
         .and_then(|m| m.last_mut())
         .and_then(|m| m.get_mut("content"))
     {
-        mark_cache_control(content);
+        mark_cache_control(content, ttl);
     }
 }
 
 /// Put an ephemeral cache breakpoint on a `system`/`content` value, converting
 /// a bare string into a one-block array so the marker has somewhere to live.
-fn mark_cache_control(v: &mut Value) {
+fn mark_cache_control(v: &mut Value, ttl: CacheTtl) {
     match v {
         Value::String(s) => {
             let text = std::mem::take(s);
             *v = json!([{
-                "type": "text", "text": text, "cache_control": { "type": "ephemeral" }
+                "type": "text", "text": text, "cache_control": ttl.control()
             }]);
         }
         Value::Array(arr) => {
             if let Some(obj) = arr.last_mut().and_then(|b| b.as_object_mut()) {
-                obj.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+                obj.insert("cache_control".into(), ttl.control());
             }
         }
         _ => {}
@@ -198,9 +239,56 @@ mod tests {
     fn opts(cache: bool, dedup: bool, prune: bool) -> OptimizeOpts {
         OptimizeOpts {
             cache,
+            cache_ttl: CacheTtl::FiveMin,
             dedup,
             prune,
         }
+    }
+
+    #[test]
+    fn five_min_ttl_omits_the_ttl_field() {
+        let req = json!({
+            "system": "You are careful. ".repeat(20),
+            "messages": [{"role":"user","content":"hi"}]
+        });
+        let (out, _) = optimize_request(req, opts(true, false, false));
+        // 5m is the API default — emit the bare marker, unchanged from before.
+        assert_eq!(
+            out["system"][0]["cache_control"],
+            json!({"type":"ephemeral"})
+        );
+    }
+
+    #[test]
+    fn one_hour_ttl_stamps_both_breakpoints() {
+        let req = json!({
+            "system": "You are careful. ".repeat(20),
+            "messages": [{"role":"user","content":"do the thing"}]
+        });
+        let (out, _) = optimize_request(
+            req,
+            OptimizeOpts {
+                cache: true,
+                cache_ttl: CacheTtl::OneHour,
+                dedup: false,
+                prune: false,
+            },
+        );
+        let expected = json!({"type":"ephemeral","ttl":"1h"});
+        assert_eq!(out["system"][0]["cache_control"], expected);
+        assert_eq!(
+            out["messages"][0]["content"][0]["cache_control"], expected,
+            "the last message must carry the same TTL as the system prefix"
+        );
+    }
+
+    #[test]
+    fn cache_ttl_parse_rejects_unknown_values() {
+        assert_eq!(CacheTtl::parse("5m"), Some(CacheTtl::FiveMin));
+        assert_eq!(CacheTtl::parse(" 1h "), Some(CacheTtl::OneHour));
+        assert_eq!(CacheTtl::parse("1hour"), None);
+        assert_eq!(CacheTtl::parse("300"), None);
+        assert_eq!(CacheTtl::parse(""), None);
     }
 
     #[test]

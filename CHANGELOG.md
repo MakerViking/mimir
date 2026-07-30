@@ -5,6 +5,19 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **Configurable prompt-cache TTL on the proxy (`--cache-ttl`, `[proxy]
+  cache_ttl`).** The breakpoints `mimir proxy` adds were hardcoded to the
+  API's default 5-minute lifetime; `"1h"` is now selectable. Deliberately
+  *not* the default: a cache write costs 1.25x input at 5m and 2x at 1h
+  while a read is ~0.1x either way, so 5m breaks even on the 2nd request
+  and 1h only on the 3rd — 1h wins only when turns idle more than 5
+  minutes apart (an agent waiting on a human), and loses on continuous
+  work. An unrecognized value is rejected at startup rather than silently
+  falling back to 5m, since that failure would show up as an unexplained
+  bill rather than an error. 5m still emits the bare `{"type":
+  "ephemeral"}` marker, byte-unchanged from before. Because the proxy
+  already measures real `cache_read_input_tokens`, the two are A/B-able
+  against `mimir savings` instead of guessed at.
 - **`mimir savings` shows a "Spent" rollup.** Cost sources (the session
   brief) have always been excluded from every saved-aggregate so injected
   tokens can never net against real savings — but that made the cost

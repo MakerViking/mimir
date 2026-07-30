@@ -18,6 +18,16 @@ content*:
   proxy reads `usage.cache_read_input_tokens` from the response and records the
   real reduction — and only on requests where it actually introduced the
   caching (if your client already caches, e.g. Claude Code, it does nothing).
+- **Cache TTL** (`--cache-ttl`, `[proxy] cache_ttl`, default `"5m"`). The
+  breakpoints above are written with the API's default 5-minute lifetime. Set
+  `"1h"` to keep them alive across longer gaps. This is **not** a free upgrade:
+  a cache write costs 1.25x input at 5m and **2x at 1h**, while a read is ~0.1x
+  either way — so 5m breaks even on the 2nd request and 1h only on the 3rd.
+  Choose `"1h"` only when your turns idle more than 5 minutes apart (an agent
+  waiting on a human, a bursty batch job); for back-to-back work it is strictly
+  more expensive. Because the proxy measures real `cache_read_input_tokens`,
+  you can A/B the two against `mimir savings` instead of guessing. Only applies
+  to breakpoints *we* add — a client that manages its own caching is untouched.
 - **Block dedup** (default **on**, safe/lossless). When the same large content
   block (a re-read file, a repeated tool result) appears more than once, later
   copies are replaced with `[identical to an earlier block …]`. The model still
@@ -44,6 +54,7 @@ mimir proxy                      # 127.0.0.1:8788 — cache on, dedup on, prune 
 mimir proxy --dry-run            # measure only — forward bodies unchanged
 mimir proxy --prune              # also enable lossy tool-result pruning
 mimir proxy --no-cache           # disable the cache pass
+mimir proxy --cache-ttl 1h       # 1-hour breakpoints (2x write cost — see above)
 mimir proxy --no-dedup           # disable the dedup pass
 
 # point your client at it
@@ -64,6 +75,7 @@ mimir savings --oneline    # compact segment for a statusline
 bind     = "127.0.0.1:8788"
 upstream = "https://api.anthropic.com"
 cache    = true     # add cache breakpoints when the client set none
+cache_ttl = "5m"    # "5m" (default) or "1h" — 1h doubles the write cost
 dedup    = true     # elide later identical large blocks (lossless)
 prune    = false    # lossy: elide stale tool results
 

@@ -343,6 +343,12 @@ pub struct ProxyConfig {
     pub upstream: String,
     /// Add prompt-cache breakpoints when the client set none (safe, ~10% billing).
     pub cache: bool,
+    /// Lifetime of those breakpoints: `"5m"` (default) or `"1h"`. A cache write
+    /// costs 1.25x input at 5m and 2x at 1h, a read ~0.1x either way — so 5m
+    /// breaks even on the 2nd request and 1h only on the 3rd. Choose `"1h"`
+    /// only when turns are more than 5 minutes apart (an agent idling on human
+    /// input); for continuous work it is strictly more expensive.
+    pub cache_ttl: String,
     /// Replace later identical large blocks with a placeholder (safe, lossless).
     pub dedup: bool,
     /// Prune stale tool_result blocks from older turns (lossy — opt in).
@@ -355,6 +361,7 @@ impl Default for ProxyConfig {
             bind: "127.0.0.1:8788".into(),
             upstream: "https://api.anthropic.com".into(),
             cache: true,
+            cache_ttl: "5m".into(),
             dedup: true,
             prune: false,
         }

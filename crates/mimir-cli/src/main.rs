@@ -356,6 +356,10 @@ enum Command {
         /// Disable the prompt-cache breakpoint pass.
         #[arg(long)]
         no_cache: bool,
+        /// TTL for the breakpoints we add: 5m (default) or 1h. 1h doubles the
+        /// write cost, so it only pays off when turns idle >5min apart.
+        #[arg(long, value_name = "5m|1h")]
+        cache_ttl: Option<String>,
         /// Disable the (safe) repeated-block dedup pass.
         #[arg(long)]
         no_dedup: bool,
@@ -796,9 +800,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             bind,
             dry_run,
             no_cache,
+            cache_ttl,
             no_dedup,
             prune,
-        } => proxy_cmd::run(bind, dry_run, no_cache, no_dedup, prune),
+        } => proxy_cmd::run(bind, dry_run, no_cache, cache_ttl, no_dedup, prune),
         Command::Sync { cmd } => match cmd {
             None => sync::sync(),
             Some(SyncCmd::Push) => sync::push(),

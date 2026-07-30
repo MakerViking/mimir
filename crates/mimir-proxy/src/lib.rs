@@ -26,7 +26,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 mod optimize;
-pub use optimize::{optimize_request, Optimization, OptimizeOpts};
+pub use optimize::{optimize_request, CacheTtl, Optimization, OptimizeOpts};
 
 /// Upper bound on a buffered request body (the messages JSON).
 const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -41,6 +41,9 @@ pub struct ProxyConfig {
     pub upstream: String,
     pub dry_run: bool,
     pub cache: bool,
+    /// Lifetime of the breakpoints we add. Only meaningful when `cache` is on
+    /// AND the client set none itself — we never restamp someone else's.
+    pub cache_ttl: CacheTtl,
     pub dedup: bool,
     pub prune: bool,
     pub db_path: Option<PathBuf>,
@@ -250,6 +253,7 @@ fn optimize_messages_body(state: &AppState, body_bytes: &[u8]) -> (Vec<u8>, bool
         json,
         OptimizeOpts {
             cache: state.cfg.cache,
+            cache_ttl: state.cfg.cache_ttl,
             dedup: state.cfg.dedup,
             prune: state.cfg.prune,
         },

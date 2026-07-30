@@ -525,7 +525,10 @@ dashboard panel and a `/m-savings` command.
   `~/.config/systemd/user/`, then `systemctl --user enable --now
   mimir-daemon`); `mimir doctor` reports whether it's actually reachable.
 - **Optional API proxy** (`mimir proxy`, off by default) — adds prompt-cache
-  breakpoints and lossless repeated-block dedup to Anthropic API traffic. See
+  breakpoints and lossless repeated-block dedup to Anthropic API traffic. The
+  breakpoint TTL is configurable (`--cache-ttl 5m|1h`); 5m is the default
+  because a 1h write costs 2x input vs 1.25x, so it only pays off when turns
+  idle more than 5 minutes apart. See
   [docs/proxy.md](docs/proxy.md) and [docs/benchmarks.md](docs/benchmarks.md).
 
 ## Optional: centralized sync
