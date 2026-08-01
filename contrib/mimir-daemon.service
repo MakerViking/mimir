@@ -12,7 +12,21 @@ ExecStart=%h/.cargo/bin/mimir daemon
 # call and resumes delegation automatically once the daemon is back.
 RuntimeMaxSec=86400
 Restart=always
-RestartSec=5
+# Every restart is a window in which a starting MCP session cannot reach the
+# daemon, and that decision is sticky: such a session eager-loads its own
+# reranker ([rerank] auto = "warm") and holds it for its whole life — several
+# hundred MB per session. Keep this as low as possible so the daily recycle
+# is a blip rather than a trap for anything starting at that moment.
+RestartSec=1
+
+# EXPECTED, not a fault: because the daily recycle is enforced by
+# RuntimeMaxSec, systemd stops the unit with SIGTERM and records
+#   mimir-daemon.service: Service reached runtime time limit. Stopping.
+#   mimir-daemon.service: Failed with result 'timeout'.
+# and `systemctl --user status mimir-daemon` shows a rising "restart counter".
+# That is systemd's vocabulary for a deliberate runtime cap; there is no exit
+# status that marks it successful. A genuine problem looks different: repeated
+# restarts *between* the 24h marks, or a non-timeout result.
 
 [Install]
 WantedBy=default.target

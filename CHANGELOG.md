@@ -4,6 +4,34 @@ All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
+### Fixed
+- **The daemon no longer delegates inference to itself.** A process
+  serving `mimir mcp --http` (i.e. `mimir daemon`) installed a
+  `DaemonClient` pointed at its own endpoint on its background engines.
+  Because the auto-sync thread starts before the HTTP listener binds,
+  every daemon start with pending embed work logged
+  `WARN daemon embed failed; falling back to local embedder ...
+  Connection refused` — a spurious fault in the journal, plus a doomed
+  round-trip per background tick. Delegation is now skipped when this
+  process *is* the daemon.
+- **Each MCP session now records which inference path it took.** The
+  delegate-vs-local decision is made once at session start and is sticky
+  for the session's entire life, but nothing logged it — so a session
+  that fell back and eager-loaded a ~150MB reranker was indistinguishable
+  at runtime from one that delegated, and the only symptom was
+  unattributable resident memory days later. Falling back now logs at
+  WARN (visible at the default log level, which is `warn`); delegating
+  logs at INFO.
+
+### Changed
+- **`contrib/mimir-daemon.service`: `RestartSec` 5 → 1.** The daily
+  `RuntimeMaxSec` recycle (which guards a real WebGPU/Dawn VRAM leak and
+  stays) opens a window where a *starting* MCP session cannot reach the
+  daemon and therefore eager-loads its own reranker for its whole life.
+  Narrowing the gap makes that trap five times less likely. Also
+  documented in the unit that systemd reporting `Failed with result
+  'timeout'` on each recycle is expected, not a fault — there is no exit
+  status that marks a `RuntimeMaxSec` stop successful.
 ### Added
 - **Runaway circuit breaker on the proxy (`--max-request-tokens`, `[proxy]
   max_request_tokens`).** Off by default. Above the cap, `mimir proxy`

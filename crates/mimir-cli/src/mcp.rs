@@ -778,7 +778,15 @@ pub fn run(
     // session run their embedder on CPU and route bulk embeds/reranks to a
     // running `mimir daemon`, so GPU device create/teardown happens in ONE
     // process instead of every session and background tick.
-    let delegate = engine.config.daemon.inference == "auto";
+    //
+    // `http.is_none()` because a process serving `--http` IS the daemon:
+    // delegating would point its own background engines back at its own
+    // endpoint. That "works" (the client fails and falls back to local), but
+    // it costs a doomed HTTP round-trip per tick and — because the background
+    // auto-sync thread starts before the listener binds — logs a spurious
+    // `daemon embed failed ... Connection refused` on every single daemon
+    // start, which reads like a real fault in the journal.
+    let delegate = engine.config.daemon.inference == "auto" && http.is_none();
     let project_id = match server_cwd() {
         Some(d) => match engine.detect_project(&d) {
             Ok((node, detection)) => {
@@ -928,6 +936,30 @@ pub fn run(
                 let daemon_alive = crate::infer::attach(&mut engine);
                 if delegate {
                     engine.set_embedder_device("cpu");
+                }
+                // Record which path this session took. Both outcomes "work",
+                // so at runtime they are indistinguishable — the only visible
+                // symptom of a fallback is a few hundred MB of resident
+                // reranker that nobody can attribute to a cause days later.
+                // The decision is made once, here, and is sticky for the life
+                // of the session, which is exactly why it needs a record.
+                if !delegate {
+                    tracing::info!(
+                        inference = %engine.config.daemon.inference,
+                        "inference: local only (delegation not enabled)"
+                    );
+                } else if daemon_alive {
+                    tracing::info!(
+                        "inference: delegating to daemon (CPU embedder, no local reranker)"
+                    );
+                } else {
+                    let eager = matches!(engine.config.rerank.auto.as_str(), "warm" | "always");
+                    tracing::warn!(
+                        rerank_auto = %engine.config.rerank.auto,
+                        loads_local_reranker = eager,
+                        "inference: daemon unreachable at session start; this session stays \
+                         local for its entire life (delegation is not re-probed)"
+                    );
                 }
                 if !daemon_alive {
                     eager_load_reranker_if_auto(&mut engine);
