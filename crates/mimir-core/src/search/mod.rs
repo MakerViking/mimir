@@ -41,7 +41,11 @@ pub struct SearchQuery {
     /// Sub-1.0 multiplier for `Kind::CodeChunk` hits (config
     /// scoring.code_damp); 1.0 = off. See `ScoringConfig::code_damp`.
     pub code_damp: f64,
-    /// Include superseded nodes in results (default false hides them).
+    /// Include *retired* nodes in results (default false hides them). Retired
+    /// means either superseded by a replacement, or past a declared
+    /// `meta.expires_at`. Both are "kept as history, not current truth", so
+    /// they share one archaeology flag. Note `resolves_when` does NOT retire a
+    /// node — an unevaluatable condition can't gate.
     pub include_superseded: bool,
 }
 
@@ -175,9 +179,11 @@ pub fn search_hybrid_with_legs_scored(
         .into_iter()
         .filter_map(|node| {
             // A stale vector cache may still hold soft-deleted nodes; they (and,
-            // unless explicitly asked for, superseded memories) must never surface.
+            // unless explicitly asked for, retired memories — superseded or
+            // past their declared expiry) must never surface.
             if node.deleted_at.is_some()
-                || (node.superseded_by.is_some() && !query.include_superseded)
+                || ((node.superseded_by.is_some() || node.is_expired(now))
+                    && !query.include_superseded)
             {
                 return None;
             }
@@ -267,6 +273,14 @@ mod tests {
         store::insert_node(conn, new).unwrap()
     }
 
+    fn set_meta(conn: &Connection, id: i64, meta: serde_json::Value) {
+        conn.execute(
+            "UPDATE node SET meta = ?1 WHERE id = ?2",
+            rusqlite::params![meta.to_string(), id],
+        )
+        .unwrap();
+    }
+
     fn q(text: &str) -> SearchQuery {
         SearchQuery {
             text: text.into(),
@@ -311,6 +325,73 @@ mod tests {
         assert!(
             hits.iter().any(|h| h.node.id == old),
             "include_superseded did not surface the superseded node"
+        );
+    }
+
+    #[test]
+    fn expired_is_hidden_but_resolves_when_alone_is_not() {
+        use crate::model::now_unix;
+        let conn = db::open_in_memory().unwrap();
+        let now = now_unix();
+
+        let fresh = add(&conn, Kind::Memory, None, "beta runbook", "still true").id;
+        let expired = add(&conn, Kind::Memory, None, "beta runbook", "no longer true").id;
+        let conditional = add(&conn, Kind::Memory, None, "beta runbook", "true for now").id;
+
+        // Expired an hour ago.
+        set_meta(
+            &conn,
+            expired,
+            serde_json::json!({ "expires_at": now - 3600 }),
+        );
+        // Carries only an unevaluatable end condition — must NOT be gated.
+        set_meta(
+            &conn,
+            conditional,
+            serde_json::json!({ "resolves_when": "when upstream ships the fix" }),
+        );
+
+        let hits = search(&conn, &q("beta runbook")).unwrap();
+        assert!(
+            hits.iter().all(|h| h.node.id != expired),
+            "expired node leaked into recall"
+        );
+        assert!(
+            hits.iter().any(|h| h.node.id == fresh),
+            "fresh node missing"
+        );
+        assert!(
+            hits.iter().any(|h| h.node.id == conditional),
+            "resolves_when must not gate — the condition cannot be evaluated, so \
+             the memory has to keep surfacing with its caveat attached"
+        );
+
+        // Archaeology opt-in surfaces the expired node again.
+        let mut with = q("beta runbook");
+        with.include_superseded = true;
+        let hits = search(&conn, &with).unwrap();
+        assert!(
+            hits.iter().any(|h| h.node.id == expired),
+            "include_superseded did not surface the expired node"
+        );
+    }
+
+    #[test]
+    fn expiry_in_the_future_does_not_gate() {
+        use crate::model::now_unix;
+        let conn = db::open_in_memory().unwrap();
+        let now = now_unix();
+        let later = add(&conn, Kind::Memory, None, "gamma runbook", "valid a while").id;
+        set_meta(
+            &conn,
+            later,
+            serde_json::json!({ "expires_at": now + 86_400 }),
+        );
+
+        let hits = search(&conn, &q("gamma runbook")).unwrap();
+        assert!(
+            hits.iter().any(|h| h.node.id == later),
+            "a memory whose expiry has not yet arrived must still surface"
         );
     }
 

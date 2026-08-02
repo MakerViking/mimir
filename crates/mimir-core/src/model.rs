@@ -125,6 +125,40 @@ impl Node {
     pub fn tags(&self) -> Vec<&str> {
         self.tags_text.split_whitespace().collect()
     }
+
+    /// Unix time after which this memory stops being true, if it declared one.
+    ///
+    /// Stored in `meta.expires_at` rather than as a column, deliberately:
+    /// `meta` already replicates (see `replicate::SyncRecord`) while new
+    /// columns do not, so this crosses machines for free and needs no schema
+    /// bump — which also means no `SchemaTooNew` risk for a peer running an
+    /// older binary.
+    pub fn expires_at(&self) -> Option<i64> {
+        self.meta.get("expires_at")?.as_i64()
+    }
+
+    /// Free-text condition under which this memory stops being true, e.g.
+    /// "when Deluge ships libtorrent 2.1 support".
+    ///
+    /// Deliberately NOT machine-evaluated and deliberately NOT a gate: we
+    /// cannot know whether the condition has been met, so a memory carrying
+    /// one still surfaces normally. Its job is to travel *with* the memory so
+    /// the reader knows what would falsify it, instead of silently trusting a
+    /// fact whose expiry nobody recorded.
+    pub fn resolves_when(&self) -> Option<&str> {
+        self.meta.get("resolves_when")?.as_str()
+    }
+
+    /// True once a declared `expires_at` has passed.
+    ///
+    /// This is a *gate*, unlike strength decay — see `learn::effective_strength`,
+    /// where decay is explicitly "a tiebreaker multiplier, never a burier". Decay
+    /// models "gradually less relevant"; it cannot model "became false on a
+    /// specific date", so an expired memory would otherwise keep winning its
+    /// query forever at a fractionally lower score.
+    pub fn is_expired(&self, now: i64) -> bool {
+        self.expires_at().is_some_and(|t| t <= now)
+    }
 }
 
 /// Fields for inserting a new node; everything not listed gets a default.

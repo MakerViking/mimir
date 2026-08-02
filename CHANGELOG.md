@@ -4,6 +4,28 @@ All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
+### Added
+- **Memories can declare when they stop being true.** `mimir remember
+  --expires-in 90d` (units `h`/`d`/`w`; months and years are refused
+  because they have no fixed length — use `365d`) sets a machine-checkable
+  `expires_at`, and a memory past it is hidden from recall exactly like a
+  superseded one. `--resolves-when "when upstream ships the fix"` records
+  a free-text falsifier that deliberately does **not** gate recall —
+  nothing can evaluate it, so the memory keeps surfacing and carries its
+  own falsification condition instead of silently being trusted or
+  silently being dropped. Both are also parameters on the MCP `remember`
+  tool. An unparseable duration is rejected before anything is written:
+  a memory stored without the deadline its author asked for is worse than
+  an error, because nothing later reveals the omission.
+
+### Fixed
+- **`link` no longer accepts `rel = "supersedes"`.** The `supersedes`
+  *edge* and the `superseded_by` *column* are independent, and only the
+  column suppresses recall — so a `supersedes` link read exactly like a
+  retirement while retiring nothing. One such edge sat in a real store for
+  six weeks while the "retired" memory kept ranking first on the queries
+  it was supposed to have been replaced for. Both the CLI and the MCP tool
+  now refuse the rel and point at `supersede`, which sets both.
 ### Fixed
 - **The daemon no longer delegates inference to itself.** A process
   serving `mimir mcp --http` (i.e. `mimir daemon`) installed a

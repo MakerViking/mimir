@@ -84,6 +84,35 @@ pub fn sanitize_fires_when(phrases: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+/// Parse a relative expiry like `"90d"` into an absolute `expires_at` unix
+/// timestamp, `now + duration`.
+///
+/// Relative-only, and units stop at weeks, on purpose. "Months" and "years"
+/// have no fixed length, so accepting them would mean either a lie (30d) or
+/// calendar math and a date dependency — for a field whose whole job is to be
+/// a coarse "stops being true around then", neither is worth it. A year is
+/// `365d`.
+///
+/// Returns `None` for anything unparseable, zero, or negative: callers reject
+/// loudly rather than silently storing an expiry the author didn't mean. A
+/// memory that quietly expired early is indistinguishable from one that was
+/// never written.
+pub fn parse_expires_in(spec: &str, now: i64) -> Option<i64> {
+    let s = spec.trim().to_lowercase();
+    let (digits, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit())?);
+    let n: i64 = digits.parse().ok()?;
+    if n <= 0 {
+        return None;
+    }
+    let secs = match unit {
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3_600,
+        "d" | "day" | "days" => 86_400,
+        "w" | "wk" | "wks" | "week" | "weeks" => 604_800,
+        _ => return None,
+    };
+    n.checked_mul(secs)?.checked_add(now)
+}
+
 fn find_duplicate(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<Node>> {
     // Exact (normalized) content match, any scope.
     let exact = conn
@@ -392,5 +421,35 @@ mod tests {
         let long = "x".repeat(100);
         let title = derive_title(&long);
         assert_eq!(title.chars().count(), 81); // 80 + ellipsis
+    }
+
+    #[test]
+    fn parse_expires_in_accepts_hours_days_weeks() {
+        let now = 1_000_000;
+        assert_eq!(parse_expires_in("12h", now), Some(now + 43_200));
+        assert_eq!(parse_expires_in("90d", now), Some(now + 7_776_000));
+        assert_eq!(parse_expires_in("2w", now), Some(now + 1_209_600));
+        // Forgiving about spelling and padding, since this is hand-typed.
+        assert_eq!(parse_expires_in("  3 DAYS ", now), None); // inner space is not
+        assert_eq!(parse_expires_in("3days", now), Some(now + 259_200));
+        assert_eq!(parse_expires_in(" 1W ", now), Some(now + 604_800));
+    }
+
+    #[test]
+    fn parse_expires_in_rejects_rather_than_guesses() {
+        let now = 1_000_000;
+        // No unit: "30" could be seconds, days, anything. Refuse.
+        assert_eq!(parse_expires_in("30", now), None);
+        // Ambiguous-length units are deliberately unsupported.
+        assert_eq!(parse_expires_in("6m", now), None);
+        assert_eq!(parse_expires_in("1y", now), None);
+        // Zero/negative would store an already-passed expiry, hiding the
+        // memory the instant it was written.
+        assert_eq!(parse_expires_in("0d", now), None);
+        assert_eq!(parse_expires_in("-5d", now), None);
+        assert_eq!(parse_expires_in("", now), None);
+        assert_eq!(parse_expires_in("soon", now), None);
+        // Overflow must not wrap into the past.
+        assert_eq!(parse_expires_in("999999999999999999999d", now), None);
     }
 }

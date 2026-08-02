@@ -134,6 +134,18 @@ enum Command {
         /// `mimir_core::anchors`.
         #[arg(long = "anchor")]
         anchors: Vec<String>,
+        /// Declare when this memory stops being true, relative to now —
+        /// e.g. `90d`, `2w`, `12h`. Units: h/d/w only (months and years
+        /// have no fixed length; use `365d`). Once passed, the memory is
+        /// hidden from recall exactly like a superseded one.
+        #[arg(long = "expires-in", value_name = "DURATION")]
+        expires_in: Option<String>,
+        /// Free-text condition that would falsify this memory — e.g.
+        /// "when upstream ships the fix". Deliberately does NOT gate
+        /// recall (nothing can evaluate it); it travels with the memory
+        /// so the reader can see what would make it wrong.
+        #[arg(long = "resolves-when", value_name = "CONDITION")]
+        resolves_when: Option<String>,
     },
     /// Search memories (and later docs/code) with hybrid ranking.
     Recall {
@@ -665,6 +677,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             link,
             fires_when,
             anchors,
+            expires_in,
+            resolves_when,
         } => commands::remember(
             cli.json,
             text.join(" "),
@@ -675,6 +689,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             link,
             fires_when,
             anchors,
+            expires_in,
+            resolves_when,
         ),
         Command::Recall {
             query,

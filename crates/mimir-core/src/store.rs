@@ -377,6 +377,38 @@ pub fn set_fires_when(conn: &Connection, id: i64, phrases: &[String]) -> Result<
     Ok(())
 }
 
+/// Declare when a memory stops being true. Both fields are optional and
+/// independent; passing `None` for one leaves any existing value untouched.
+///
+/// `expires_at` (unix seconds) is machine-checkable and GATES recall once
+/// passed — see `Node::is_expired` and the filter in `search`. `resolves_when`
+/// is a free-text end condition that deliberately does NOT gate: we can't
+/// evaluate "when upstream ships the fix", so the memory keeps surfacing and
+/// carries its own falsification condition instead.
+///
+/// Stored in `meta` (same mechanism as `set_fires_when`) so it replicates —
+/// `replicate::SyncRecord` carries `meta` but not arbitrary new columns.
+pub fn set_expiry(
+    conn: &Connection,
+    id: i64,
+    expires_at: Option<i64>,
+    resolves_when: Option<&str>,
+) -> Result<()> {
+    if let Some(ts) = expires_at {
+        conn.execute(
+            "UPDATE node SET meta = json_set(meta, '$.expires_at', ?2) WHERE id = ?1",
+            params![id, ts],
+        )?;
+    }
+    if let Some(cond) = resolves_when {
+        conn.execute(
+            "UPDATE node SET meta = json_set(meta, '$.resolves_when', ?2) WHERE id = ?1",
+            params![id, cond],
+        )?;
+    }
+    Ok(())
+}
+
 /// Bind an existing keyed (possibly synced-shadow) project to this machine's
 /// local path + display name, clearing the shadow marker. Used when a project
 /// that first arrived via sync is opened locally.

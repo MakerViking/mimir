@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use mimir_core::config::{Config, Paths};
 use mimir_core::format::agent_line;
 use mimir_core::memory::{self, Remember, RememberOutcome};
@@ -957,9 +957,22 @@ pub fn remember(
     link_ref: Option<String>,
     fires_when: Vec<String>,
     anchors: Vec<String>,
+    expires_in: Option<String>,
+    resolves_when: Option<String>,
 ) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let mtype: MemoryType = mtype.parse()?;
+    // Parse BEFORE writing anything: a bad duration should cost the user an
+    // error message, not a stored memory that silently never expires.
+    let expires_at = match expires_in.as_deref() {
+        Some(spec) => Some(memory::parse_expires_in(spec, now_unix()).ok_or_else(|| {
+            anyhow!(
+                "invalid --expires-in {spec:?}: expected a positive duration \
+                     like 90d, 2w or 12h (units: h/d/w — use 365d for a year)"
+            )
+        })?),
+        None => None,
+    };
     let project = if global {
         None
     } else {
@@ -1002,6 +1015,18 @@ pub fn remember(
                 let patterns = mimir_core::anchors::sanitize_anchors(anchors);
                 if !patterns.is_empty() {
                     mimir_core::anchors::set_anchors(&mimir.conn, node.id, &patterns)?;
+                }
+            }
+            if expires_at.is_some() || resolves_when.is_some() {
+                store::set_expiry(&mimir.conn, node.id, expires_at, resolves_when.as_deref())?;
+                if let Some(ts) = expires_at {
+                    println!(
+                        "expires in {} (at {ts})",
+                        expires_in.as_deref().unwrap_or("")
+                    );
+                }
+                if let Some(c) = resolves_when.as_deref() {
+                    println!("resolves when: {c}");
                 }
             }
             // Keep semantic recall fresh; harmless no-op without a model.
@@ -1411,6 +1436,17 @@ pub fn reproject(json: bool, reference: &str, project: Option<String>, global: b
 pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
     let mimir = Mimir::open()?;
     let rel: Rel = rel.parse()?;
+    // See the same guard in the MCP `link` tool: the `supersedes` edge and the
+    // `superseded_by` column are independent, and only the column hides a node
+    // from recall. Allowing it here would silently record a retirement that
+    // retires nothing.
+    if rel == Rel::Supersedes {
+        bail!(
+            "`--rel supersedes` records an edge but does NOT retire the old node — \
+             it would look like a supersede and change nothing. Use `mimir supersede \
+             <old> <new>` instead (it sets both)."
+        );
+    }
     let src = resolve_any(&mimir, a)?;
     let dst = resolve_any(&mimir, b)?;
     store::link(&mimir.conn, src.id, dst.id, rel, 1.0)?;

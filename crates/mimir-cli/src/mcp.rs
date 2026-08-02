@@ -89,6 +89,20 @@ pub struct RememberArgs {
     /// 200 chars each; oversized/empty dropped. Optional "file:" prefix.
     #[serde(default)]
     pub anchors: Vec<String>,
+    /// Relative duration after which this memory stops being true — e.g.
+    /// "90d", "2w", "12h". Units h/d/w only (months/years have no fixed
+    /// length; use "365d"). Once passed the memory is hidden from recall
+    /// like a superseded one. Only set it when the fact genuinely has a
+    /// deadline; a wrong expiry silently deletes something still true.
+    #[serde(default)]
+    pub expires_in: Option<String>,
+    /// Free-text condition that would falsify this memory — e.g. "when
+    /// upstream ships the fix". Does NOT hide the memory (nothing can
+    /// evaluate it); it rides along so a future reader sees what would
+    /// make it wrong. Prefer this over expires_in whenever the end
+    /// condition is an event rather than a date.
+    #[serde(default)]
+    pub resolves_when: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -327,6 +341,30 @@ impl MimirServer {
                                 .map_err(engine_err)?;
                         }
                     }
+                    // Reject a bad duration instead of storing a memory that
+                    // silently never expires — the caller asked for a deadline
+                    // and has no other way to learn it wasn't applied.
+                    let expires_at = match args.expires_in.as_deref() {
+                        Some(spec) => Some(
+                            memory::parse_expires_in(spec, mimir_core::model::now_unix())
+                                .ok_or_else(|| {
+                                    engine_err(mimir_core::error::Error::Invalid(format!(
+                                        "invalid expires_in {spec:?}: expected a positive \
+                                         duration like 90d, 2w or 12h (units h/d/w)"
+                                    )))
+                                })?,
+                        ),
+                        None => None,
+                    };
+                    if expires_at.is_some() || args.resolves_when.is_some() {
+                        store::set_expiry(
+                            &m.conn,
+                            node.id,
+                            expires_at,
+                            args.resolves_when.as_deref(),
+                        )
+                        .map_err(engine_err)?;
+                    }
                     let mut msg = format!("stored {}", line(&node));
                     if let Some(target) = args.link.as_deref() {
                         let resolved = store::resolve_ref(&m.conn, target).ok().or_else(|| {
@@ -377,7 +415,9 @@ impl MimirServer {
         .await
     }
 
-    #[tool(description = "Link two nodes (memory/doc/code) so context surfaces together.")]
+    #[tool(
+        description = "Link two nodes (memory/doc/code) so context surfaces together. Note: `supersedes` is NOT accepted here — use the `supersede` tool, which also retires the old node."
+    )]
     async fn link(&self, Parameters(args): Parameters<LinkArgs>) -> String {
         self.blocking(move |m| {
             let rel: Rel = args
@@ -386,6 +426,19 @@ impl MimirServer {
                 .unwrap_or("relates")
                 .parse()
                 .map_err(engine_err)?;
+            // A `supersedes` EDGE and the `superseded_by` COLUMN are separate
+            // mechanisms and only the column suppresses recall. Accepting the
+            // rel here produced a link that reads exactly like a retirement
+            // and silently did nothing — one such edge sat in the store for
+            // six weeks while the "retired" memory kept ranking first.
+            if rel == Rel::Supersedes {
+                return Err(engine_err(mimir_core::error::Error::Invalid(
+                    "link does not accept rel=\"supersedes\": it records an edge but does \
+                     NOT retire the old node, so it would look like a supersede and change \
+                     nothing. Use the `supersede` tool instead (it sets both)."
+                        .into(),
+                )));
+            }
             let src = store::resolve_ref(&m.conn, &args.a).map_err(engine_err)?;
             let dst = store::resolve_ref(&m.conn, &args.b).map_err(engine_err)?;
             store::link(&m.conn, src.id, dst.id, rel, 1.0).map_err(engine_err)?;
@@ -1601,6 +1654,8 @@ mod tests {
             link: None,
             fires_when: Vec::new(),
             anchors: Vec::new(),
+            expires_in: None,
+            resolves_when: None,
         }
     }
 
@@ -1632,6 +1687,62 @@ mod tests {
         assert!(body.contains("SCRAM"), "get: {body}");
     }
 
+    /// `link` must refuse `supersedes`. The edge and the `superseded_by`
+    /// column are independent and only the column suppresses recall, so
+    /// accepting the rel here records something that reads as a retirement
+    /// and retires nothing — the exact shape of a real six-week-old bug.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn link_refuses_the_supersedes_rel() {
+        let (_dir, s) = server();
+        let a = s
+            .remember(Parameters(remember_args("first fact here", "note")))
+            .await;
+        let b = s
+            .remember(Parameters(remember_args("second fact here", "note")))
+            .await;
+        let (a, b) = (
+            a.split_whitespace().nth(1).unwrap().to_string(),
+            b.split_whitespace().nth(1).unwrap().to_string(),
+        );
+
+        let refused = s
+            .link(Parameters(LinkArgs {
+                a: a.clone(),
+                b: b.clone(),
+                rel: Some("supersedes".into()),
+            }))
+            .await;
+        assert!(
+            refused.contains("supersede") && refused.contains("NOT retire"),
+            "expected a pointer at the supersede tool, got: {refused}"
+        );
+
+        // The neighbouring rel still works — this is a targeted refusal, not
+        // a broken link tool.
+        let ok = s
+            .link(Parameters(LinkArgs {
+                a,
+                b,
+                rel: Some("relates".into()),
+            }))
+            .await;
+        assert!(ok.contains("relates"), "relates should still link: {ok}");
+    }
+
+    /// `remember` with an unparseable `expires_in` must fail loudly rather
+    /// than storing a memory whose requested deadline was silently dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn remember_rejects_a_bad_expires_in() {
+        let (_dir, s) = server();
+        let mut args = remember_args("this fact has a bogus deadline", "note");
+        args.expires_in = Some("soon".into());
+        let out = s.remember(Parameters(args)).await;
+        assert!(
+            out.contains("invalid expires_in"),
+            "expected a rejection, got: {out}"
+        );
+    }
+
     /// Anchors passed to the MCP `remember` tool land in `meta.anchors` —
     /// the agent-facing path to the same guard the CLI `--anchor` flag sets.
     #[tokio::test(flavor = "multi_thread")]
@@ -1646,6 +1757,8 @@ mod tests {
                 link: None,
                 fires_when: Vec::new(),
                 anchors: vec!["deploy.sh".into()],
+                expires_in: None,
+                resolves_when: None,
             }))
             .await;
         assert!(stored.starts_with("stored"), "remember: {stored}");
@@ -1694,6 +1807,8 @@ mod tests {
                 link: None,
                 fires_when: Vec::new(),
                 anchors: Vec::new(),
+                expires_in: None,
+                resolves_when: None,
             }))
             .await;
         assert!(
