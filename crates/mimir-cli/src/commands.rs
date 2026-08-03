@@ -123,7 +123,7 @@ jq -n --argjson updated "$UPDATED" '{
 /// Silent if `git` isn't on PATH or the cwd isn't a repo — enrichment is a
 /// nice-to-have, not a requirement.
 const MIMIR_RECALL_SH: &str = r#"#!/usr/bin/env bash
-# mimir-hook-version: 3
+# mimir-hook-version: 4
 # Mimir UserPromptSubmit hook — prints at most one relevant memory (or
 # nothing) as extra context for this turn. Tries the warm HTTP endpoint
 # (fast; requires `mimir mcp --http` to be running) first, falls back to
@@ -136,6 +136,12 @@ command -v mimir >/dev/null 2>&1 || exit 0
 INPUT=$(cat)
 PROMPT=$(printf '%s' "$INPUT" | jq -r '.prompt // empty')
 [ -z "$PROMPT" ] && exit 0
+# Claude Code supplies session_id on every hook payload. Passing it through
+# is what makes per-session dedup work: without it the ledger key is empty,
+# nothing is ever recorded as already-injected, and the SAME memory can be
+# re-injected on every prompt of a long session — the exact "flooded by
+# stale crap" failure the relevance floor exists to prevent.
+SESSION=$(printf '%s' "$INPUT" | jq -r '.session_id // empty')
 INJECT_URL="${MIMIR_INJECT_URL:-__MIMIR_INJECT_URL_DEFAULT__}"
 PROJECT_DIR=$(printf '%s' "$INPUT" | jq -r '.cwd // empty')
 [ -z "$PROJECT_DIR" ] && PROJECT_DIR="$PWD"
@@ -151,16 +157,19 @@ if command -v curl >/dev/null 2>&1; then
         ENC_ENRICH=$(printf '%s' "$ENRICH" | jq -sRr @uri)
         URL="${URL}&enrich=${ENC_ENRICH}"
     fi
+    if [ -n "$SESSION" ]; then
+        ENC_SESSION=$(printf '%s' "$SESSION" | jq -sRr @uri)
+        URL="${URL}&session=${ENC_SESSION}"
+    fi
     if WARM=$(curl -sf --max-time 2 "$URL" 2>/dev/null); then
         [ -n "$WARM" ] && printf '%s\n' "$WARM"
         exit 0
     fi
 fi
-if [ -n "$ENRICH" ]; then
-    mimir recall-inject --enrich "$ENRICH" -- "$PROMPT" 2>/dev/null
-else
-    mimir recall-inject -- "$PROMPT" 2>/dev/null
-fi
+COLD=(mimir recall-inject)
+[ -n "$ENRICH" ] && COLD+=(--enrich "$ENRICH")
+[ -n "$SESSION" ] && COLD+=(--session "$SESSION")
+"${COLD[@]}" -- "$PROMPT" 2>/dev/null
 exit 0
 "#;
 
@@ -1454,6 +1463,26 @@ pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
         "{} —{rel}→ {}",
         short_uid(src.kind, &src.uid),
         short_uid(dst.kind, &dst.uid)
+    );
+    Ok(())
+}
+
+/// Set guard anchors on an existing memory. `remember --anchor` only covers
+/// capture time, which is why anchor adoption tends to sit at zero: by the
+/// time you know which file a memory guards, the memory already exists.
+/// Patterns REPLACE any existing set (same semantics as `set_anchors`).
+pub fn anchor(reference: &str, patterns: Vec<String>) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let node = resolve_any(&mimir, reference)?;
+    let clean = mimir_core::anchors::sanitize_anchors(patterns);
+    if clean.is_empty() {
+        bail!("no usable anchor patterns after sanitizing (empty or oversized are dropped)");
+    }
+    mimir_core::anchors::set_anchors(&mimir.conn, node.id, &clean)?;
+    println!(
+        "{} anchored to {}",
+        short_uid(node.kind, &node.uid),
+        clean.join(", ")
     );
     Ok(())
 }

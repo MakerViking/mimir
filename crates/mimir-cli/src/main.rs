@@ -217,6 +217,18 @@ enum Command {
         #[arg(long)]
         by: String,
     },
+    /// Set guard anchors on an EXISTING memory, so it surfaces at act-time
+    /// (PreToolUse) when a matching file is edited or command is run.
+    /// `--anchor` on `remember` only covers capture time; this is how a
+    /// memory written before you knew which file it guards gets wired up.
+    Anchor {
+        /// Memory reference (m:ABCDEF or ULID).
+        reference: String,
+        /// Pattern(s), repeatable — e.g. `--pattern "store.rs"`,
+        /// `--pattern "file:deploy.sh"`. Replaces any existing set.
+        #[arg(long = "pattern", required = true)]
+        patterns: Vec<String>,
+    },
     /// Update a memory's text, title, type, or tags.
     Edit {
         reference: String,
@@ -728,6 +740,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         } => commands::list(cli.json, mtype, tag, global, all, limit),
         Command::Forget { reference, hard } => commands::forget(&reference, hard),
         Command::Supersede { old, by } => commands::supersede(&old, &by),
+        Command::Anchor {
+            reference,
+            patterns,
+        } => commands::anchor(&reference, patterns),
         Command::Edit {
             reference,
             text,

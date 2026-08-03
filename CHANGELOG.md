@@ -5,6 +5,23 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **`mimir anchor <ref> --pattern ...`** sets guard anchors on an
+  *existing* memory. `remember --anchor` only covered capture time, which
+  is why anchor adoption sits at zero in practice: by the time you know
+  which file a memory guards, the memory already exists. Patterns replace
+  the existing set.
+
+### Fixed
+- **The auto-recall hook now passes `session_id`,** so per-session dedup
+  actually engages. Claude Code supplies it on every hook payload, but the
+  script never read it — leaving the ledger key empty, `injection_log`
+  permanently empty, and the same memory eligible for re-injection on
+  every prompt of a long session. That is precisely the "flooded by stale
+  crap" failure the relevance floor exists to prevent. With it wired,
+  a repeat prompt in the same session rotates to the next unseen memory
+  instead of repeating the first. Hook script version 3 → 4; re-run
+  `mimir init --hooks --auto-recall` to pick it up.
+### Added
 - **Memories can declare when they stop being true.** `mimir remember
   --expires-in 90d` (units `h`/`d`/`w`; months and years are refused
   because they have no fixed length — use `365d`) sets a machine-checkable
