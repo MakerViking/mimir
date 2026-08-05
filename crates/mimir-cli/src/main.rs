@@ -619,6 +619,11 @@ enum CodeCmd {
     },
 }
 
+/// Stack for the worker thread the CLI actually runs on. Generous on
+/// purpose: it costs address space, not memory, and the alternative is an
+/// abort with no diagnostic.
+const WORKER_STACK: usize = 16 * 1024 * 1024;
+
 fn main() {
     // Behave like a normal Unix tool when piped into head/grep: die on
     // SIGPIPE instead of panicking on a failed stdout write.
@@ -627,21 +632,18 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
-    let cli = Cli::parse();
-    let code = match run(cli) {
-        Ok(()) => 0,
-        Err(err) => {
-            eprintln!("Error: {err:#}");
-            1
-        }
-    };
+    // Windows hands the main thread a 1 MiB stack (Linux/macOS give 8).
+    // clap's derived builder for our ~50 subcommands needs more than that
+    // in debug builds, so `mimir --version` aborted with a stack overflow
+    // before parsing a single argument. Do the work on a thread whose
+    // stack size we set ourselves rather than on the one the OS picked.
+    let worker = std::thread::Builder::new()
+        .stack_size(WORKER_STACK)
+        .spawn(cli_main)
+        .expect("spawn CLI worker thread");
+    // A panic already printed its own message via the default hook; 101 is
+    // what rustc's own binaries exit with in that case.
+    let code = worker.join().unwrap_or(101);
 
     // GPU builds: Dawn/onnxruntime process-teardown destructors are known
     // to segfault (ort 2.0-rc). All work is flushed and SQLite-committed
@@ -657,6 +659,25 @@ fn main() {
     }
     #[cfg(not(any(feature = "gpu-webgpu", feature = "gpu-cuda")))]
     std::process::exit(code)
+}
+
+/// The actual entry point. Runs on the worker thread spawned by `main`.
+fn cli_main() -> i32 {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
+    let cli = Cli::parse();
+    match run(cli) {
+        Ok(()) => 0,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            1
+        }
+    }
 }
 
 fn run(cli: Cli) -> anyhow::Result<()> {

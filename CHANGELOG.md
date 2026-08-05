@@ -12,6 +12,13 @@ the `mimir-mem` crate, and the on-disk schema move together.
   the existing set.
 
 ### Fixed
+- **The CLI no longer overflows the stack on Windows.** Windows gives the
+  main thread a 1 MiB stack where Linux and macOS give 8, and clap's
+  derived builder for Mimir's ~50 subcommands outgrew it in debug builds:
+  `mimir --version` aborted with `thread 'main' has overflowed its stack`
+  before parsing a single argument, taking the whole Windows e2e suite
+  down with it. The CLI now runs on a worker thread with a 16 MiB stack
+  it sets itself, instead of on whatever the OS happened to hand it.
 - **The auto-recall hook now passes `session_id`,** so per-session dedup
   actually engages. Claude Code supplies it on every hook payload, but the
   script never read it — leaving the ledger key empty, `injection_log`
