@@ -1,12 +1,15 @@
 //! Agent-format output: one token-lean line per hit, shared by the CLI
 //! and the MCP server. Shape: `m:ABCDEF [gotcha pr:mimir 06-11 ↑7] title — snippet`
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 use rusqlite::Connection;
 
 use crate::error::Result;
+use crate::memory::tokens;
 use crate::model::{short_uid, Node};
+use crate::search::fts::is_stopword;
 use crate::store;
 
 /// `MM-DD` of a unix timestamp (UTC). Compact by design: recall output is
@@ -49,9 +52,174 @@ pub fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Chars of lead-in kept before a matched term when the snippet window is
+/// shifted, so the match lands in context rather than flush at the edge.
+const MATCH_LEAD_CHARS: usize = 32;
+
+/// Shortest query token worth centring on. Below this, prefix matching is
+/// noise ("id" hits "identity", "video", …).
+const MIN_MATCH_TOKEN: usize = 3;
+
+/// Prefix length used to approximate the FTS5 porter stemmer: "splitting"
+/// and "splits" both reduce to "split". Cheap and one-directional — it can
+/// over-match slightly, which only costs us a differently-placed window.
+const STEM_PREFIX: usize = 5;
+
+/// How far into a body we hunt for a window. Recall is a hot path and the
+/// scan is O(body × stems): measured at 7.4 ms on the largest chunk in a
+/// real store (215k chars), enough on its own to blow a single-digit-ms
+/// warm recall. 20k covers all but 83 of ~19k chunks whole; past it we
+/// simply head-truncate, which is what this code replaced anyway.
+const MATCH_SCAN_CHARS: usize = 20_000;
+
+/// Content-bearing query stems, sharing `tokens`/`is_stopword` with the FTS
+/// leg so the snippet can't drift from what actually matched.
+fn query_stems(query: &str) -> Vec<String> {
+    tokens(query)
+        .into_iter()
+        .filter(|t| t.chars().any(char::is_alphanumeric))
+        .filter(|t| !is_stopword(t))
+        .filter(|t| t.chars().count() >= MIN_MATCH_TOKEN)
+        .map(|t| t.chars().take(STEM_PREFIX).collect())
+        .collect()
+}
+
+/// Lowercased char view of `text`'s first `limit` chars, index-aligned 1:1
+/// with the original. Deliberately ASCII-only: `char::to_lowercase` can emit
+/// more chars than it consumes (U+0130 'İ' becomes two), which desyncs every
+/// index we then slice the original with. Non-ASCII uppercase simply fails to
+/// match, which costs a differently-placed window — not a panic, and not a
+/// wrong one.
+fn lower_chars(text: &str, limit: usize) -> Vec<char> {
+    text.chars()
+        .take(limit)
+        .map(|c| c.to_ascii_lowercase())
+        .collect()
+}
+
+/// Every char offset in `hay` where `needle` begins.
+///
+/// Deliberately plain substring matching, not word-anchored. Anchoring was
+/// tried and measured worse: it removes the ~3% of matches that land inside
+/// an unrelated word ("use" in "because"), but also drops legitimate ones
+/// inside compound identifiers, costing 2pp of memory previews for no gain
+/// on docs. Density scoring already tolerates the occasional stray match.
+fn occurrences(hay: &[char], needle: &[char]) -> Vec<usize> {
+    let Some(last) = hay.len().checked_sub(needle.len()) else {
+        return Vec::new();
+    };
+    if needle.is_empty() {
+        return Vec::new();
+    }
+    (0..=last)
+        .filter(|&i| hay[i..].starts_with(needle))
+        .collect()
+}
+
+/// Whether any offset in the sorted list `occ` places a `needle_len`-long
+/// match wholly inside `[start, end)`. Binary search, so scoring a candidate
+/// costs O(log occurrences) rather than a fresh O(window × needle) rescan of
+/// text we already indexed — the difference between 1.6 ms and ~60 µs on a
+/// repetitive body where a stem recurs thousands of times.
+fn covers(occ: &[usize], needle_len: usize, start: usize, end: usize) -> bool {
+    let Some(last) = end.checked_sub(needle_len) else {
+        return false;
+    };
+    let i = occ.partition_point(|&at| at < start);
+    occ.get(i).is_some_and(|&at| at <= last)
+}
+
+/// The `snippet_chars`-wide window over `text` covering the most *distinct*
+/// query stems, ties going to the earliest window. Density beats
+/// first-match: a window holding three of the query's terms tells the reader
+/// far more than one holding the earliest single term, which is often an
+/// incidental mention well before the passage that actually answers.
+///
+/// Returns `None` when the leading window already wins, so hits that read
+/// fine today are left byte-identical.
+fn match_window(text: &str, stems: &[String], snippet_chars: usize) -> Option<String> {
+    if stems.is_empty() || snippet_chars == 0 {
+        return None;
+    }
+    let lc = lower_chars(text, MATCH_SCAN_CHARS);
+    // Each stem indexed once as (match length, sorted offsets), then reused
+    // for both candidate generation and scoring.
+    let index: Vec<(usize, Vec<usize>)> = stems
+        .iter()
+        .map(|s| {
+            let needle: Vec<char> = s.chars().collect();
+            (needle.len(), occurrences(&lc, &needle))
+        })
+        .collect();
+
+    // Candidates: the head, plus a lead-in ahead of each stem occurrence.
+    let mut starts = vec![0usize];
+    for (_, offsets) in &index {
+        starts.extend(offsets.iter().map(|at| at.saturating_sub(MATCH_LEAD_CHARS)));
+    }
+    // Scoring below is O(candidates × stems), so it is worth paying a sort to
+    // drop duplicates — nearby stems collapse to the same start.
+    starts.sort_unstable();
+    starts.dedup();
+
+    let best = starts.into_iter().max_by_key(|&s| {
+        let end = (s + snippet_chars).min(lc.len());
+        let hits = index
+            .iter()
+            .filter(|(len, offsets)| covers(offsets, *len, s, end))
+            .count();
+        (hits, Reverse(s))
+    })?;
+    if best == 0 {
+        return None;
+    }
+
+    // `lower_chars` is index-aligned, so `best` indexes the original safely.
+    // Collect only as far as the window plus its word-boundary lead-in can
+    // reach — bodies run to hundreds of thousands of chars.
+    let chars: Vec<char> = text
+        .chars()
+        .take(best + MATCH_LEAD_CHARS + snippet_chars)
+        .collect();
+    // Step forward to a word boundary so the window doesn't open mid-word.
+    // Bounded by the lead-in, so this can never step past the match itself.
+    let start = chars[best..]
+        .iter()
+        .take(MATCH_LEAD_CHARS)
+        .position(|c| c.is_whitespace())
+        .map_or(best, |off| best + off + 1);
+    // Already bounded to `snippet_chars` by the take, so no truncation here.
+    let window: String = chars[start..].iter().take(snippet_chars).collect();
+    Some(format!("…{window}"))
+}
+
 /// One-line agent format for a node.
 /// `project` is the display name of the node's project, if scoped.
 pub fn agent_line(node: &Node, project: Option<&str>, snippet_chars: usize) -> String {
+    agent_line_for_query(node, project, snippet_chars, None)
+}
+
+/// [`agent_line`], but with the search query in hand so the snippet can be
+/// centred on what matched instead of always starting at the body's first
+/// character. Only worth passing a query where one exists — ranked recall
+/// results; a `remember` echo or an anchor trigger has none.
+///
+/// Why this matters for docs: a memory's title is a self-contained claim,
+/// but a doc chunk's is a breadcrumb ("Doc › Section › Sub"), so the body
+/// snippet is the only thing telling the reader why the hit came back. Head
+/// truncation frequently spends it on the section's opening sentence.
+///
+/// Deliberately left alone: the breadcrumb titles themselves, which spend
+/// ~75 chars on location rather than content. Fixing that belongs in
+/// `index::chunker`, where they're built — and would shift ranking, since
+/// `title` carries the heaviest BM25 weight. Revisit if snippet-only proves
+/// insufficient.
+pub fn agent_line_for_query(
+    node: &Node,
+    project: Option<&str>,
+    snippet_chars: usize,
+    query: Option<&str>,
+) -> String {
     let id = short_uid(node.kind, &node.uid);
     let tag = node.subkind.as_deref().unwrap_or(node.kind.as_str());
     let scope = project.map(|p| format!(" pr:{p}")).unwrap_or_default();
@@ -65,6 +233,12 @@ pub fn agent_line(node: &Node, project: Option<&str>, snippet_chars: usize) -> S
     let mut line = format!("{id} [{tag}{scope} {date}{uses}] {title}");
     if let Some(body) = node.body.as_deref() {
         let flat = collapse_ws(body);
+        let stems = query.map(query_stems).unwrap_or_default();
+        // Centre on the match when there is one; otherwise head-truncate.
+        let excerpt = |text: &str| {
+            match_window(text, &stems, snippet_chars)
+                .unwrap_or_else(|| truncate_chars(text, snippet_chars))
+        };
         // Skip the part of the body the (possibly truncated) title covers.
         let covered = title.trim_end_matches('…');
         let rest = flat.strip_prefix(covered).map(str::trim_start);
@@ -72,11 +246,11 @@ pub fn agent_line(node: &Node, project: Option<&str>, snippet_chars: usize) -> S
             Some("") => {} // title covers everything
             Some(rest) => {
                 line.push_str(" — ");
-                line.push_str(&truncate_chars(rest, snippet_chars));
+                line.push_str(&excerpt(rest));
             }
             None if flat.len() > title.len() => {
                 line.push_str(" — ");
-                line.push_str(&truncate_chars(&flat, snippet_chars));
+                line.push_str(&excerpt(&flat));
             }
             None => {}
         }
@@ -181,5 +355,112 @@ mod tests {
         let node = store::insert_node(&conn, new).unwrap();
         let line = agent_line(&node, None, 120);
         assert!(!line.contains('—'), "no snippet expected: {line}");
+    }
+
+    /// The defect this exists to prevent: a doc chunk whose breadcrumb title
+    /// says only where it lives, and whose matching text sits past the head
+    /// window — so plain truncation shows nothing about why it was returned.
+    fn breadcrumb_chunk() -> Node {
+        let conn = crate::db::open_in_memory().unwrap();
+        let mut new = NewNode::new(Kind::Chunk);
+        new.title = Some("proxy › mimir proxy › What it actually does".into());
+        new.body = Some(format!(
+            "proxy › mimir proxy › What it actually does {}the proxy adds ephemeral \
+             breakpoints on the system prompt and the last message.",
+            "You cannot compress text and have the API bill fewer tokens. ".repeat(4)
+        ));
+        store::insert_node(&conn, new).unwrap()
+    }
+
+    #[test]
+    fn query_aware_snippet_centres_on_the_match() {
+        let node = breadcrumb_chunk();
+
+        let blind = agent_line(&node, None, 120);
+        assert!(
+            !blind.contains("breakpoints"),
+            "head truncation should miss the match: {blind}"
+        );
+
+        let aware = agent_line_for_query(&node, None, 120, Some("prompt cache breakpoints"));
+        assert!(
+            aware.contains("breakpoints"),
+            "snippet should be centred on the match: {aware}"
+        );
+        assert!(aware.contains("— …"), "shifted window is elided: {aware}");
+    }
+
+    #[test]
+    fn query_aware_snippet_falls_back_when_nothing_matches() {
+        let node = breadcrumb_chunk();
+        assert_eq!(
+            agent_line_for_query(&node, None, 120, Some("kubernetes ingress")),
+            agent_line(&node, None, 120),
+            "a query with no lexical match must not change the line"
+        );
+    }
+
+    #[test]
+    fn query_aware_snippet_leaves_early_matches_alone() {
+        let node = breadcrumb_chunk();
+        // "compress" is inside the head window, which already shows it.
+        assert_eq!(
+            agent_line_for_query(&node, None, 120, Some("compress")),
+            agent_line(&node, None, 120),
+        );
+    }
+
+    #[test]
+    fn query_stems_drop_stopwords_and_short_tokens() {
+        assert_eq!(query_stems("how is it   split"), vec!["split"]);
+        // Stemmed to a shared prefix, so "splitting" finds "splits".
+        assert_eq!(query_stems("splitting"), vec!["split"]);
+    }
+
+    #[test]
+    fn match_window_is_char_safe_on_multibyte_text() {
+        let text = format!("{}naïve café — chunking rules apply", "ø".repeat(200));
+        let stems = query_stems("chunking");
+        let win = match_window(&text, &stems, 40).expect("match past the window");
+        assert!(win.contains("chunking"), "{win}");
+        assert!(win.starts_with('…'), "{win}");
+    }
+
+    #[test]
+    fn match_window_survives_chars_that_grow_when_lowercased() {
+        // U+0130 lowercases to TWO chars, so a char index computed in the
+        // lowercased text can run past the original's char count.
+        let text = format!("{}chunking rules apply", "İ".repeat(200));
+        let stems = query_stems("chunking");
+        let win = match_window(&text, &stems, 40).expect("match past the window");
+        assert!(win.contains("chunking"), "{win}");
+    }
+
+    #[test]
+    fn match_window_prefers_density_over_the_earliest_match() {
+        // "cache" appears early and alone; the passage that answers the
+        // query — all three terms together — sits much later.
+        let text = format!(
+            "the cache is warm. {} prompt cache breakpoints are set here.",
+            "filler prose that says nothing useful. ".repeat(12)
+        );
+        let stems = query_stems("prompt cache breakpoints");
+        let win = match_window(&text, &stems, 80).expect("a denser window exists");
+        assert!(win.contains("breakpoints"), "{win}");
+        assert!(win.contains("prompt"), "{win}");
+    }
+
+    #[test]
+    fn match_window_keeps_the_head_when_it_is_already_densest() {
+        let text = format!(
+            "prompt cache breakpoints explained up front. {}",
+            "later filler with no query terms at all. ".repeat(12)
+        );
+        let stems = query_stems("prompt cache breakpoints");
+        assert_eq!(
+            match_window(&text, &stems, 80),
+            None,
+            "head already wins — must not churn the line"
+        );
     }
 }
