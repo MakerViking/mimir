@@ -8,7 +8,7 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use mimir_core::format::agent_line;
+use mimir_core::format::{agent_line, agent_line_for_query};
 use mimir_core::memory::{self, RememberOutcome};
 use mimir_core::model::{short_uid, Kind, MemoryType, Rel, Scope};
 use mimir_core::search::SearchQuery;
@@ -274,10 +274,11 @@ impl MimirServer {
                     .project_id
                     .and_then(|id| projects.get(&id))
                     .map(String::as_str);
-                out.push(agent_line(
+                out.push(agent_line_for_query(
                     &hit.node,
                     project,
                     m.config.output.snippet_chars,
+                    Some(&query.text),
                 ));
             }
             Ok(out.join("\n"))

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 
 use anyhow::{anyhow, bail, Context, Result};
 use mimir_core::config::{Config, Paths};
-use mimir_core::format::agent_line;
 use mimir_core::memory::{self, Remember, RememberOutcome};
 use mimir_core::model::{now_unix, short_uid, Kind, MemoryType, Node, Rel, Scope};
 use mimir_core::search::SearchQuery;
@@ -1120,7 +1119,12 @@ pub fn recall(
         } else {
             println!(
                 "{}",
-                line(&hit.node, &projects, mimir.config.output.snippet_chars)
+                line_q(
+                    &hit.node,
+                    &projects,
+                    mimir.config.output.snippet_chars,
+                    Some(&query.text)
+                )
             );
         }
         if linked && !json {
@@ -1899,11 +1903,22 @@ fn parse_since(s: &str) -> Result<i64> {
 }
 
 fn line(node: &Node, projects: &HashMap<i64, String>, snippet_chars: usize) -> String {
+    line_q(node, projects, snippet_chars, None)
+}
+
+/// [`line`] for ranked recall results, where the query is available and the
+/// snippet can be centred on what matched.
+fn line_q(
+    node: &Node,
+    projects: &HashMap<i64, String>,
+    snippet_chars: usize,
+    query: Option<&str>,
+) -> String {
     let project = node
         .project_id
         .and_then(|id| projects.get(&id))
         .map(String::as_str);
-    agent_line(node, project, snippet_chars)
+    mimir_core::format::agent_line_for_query(node, project, snippet_chars, query)
 }
 
 fn print_full(node: &Node, mimir: &Mimir, projects: &HashMap<i64, String>) -> Result<()> {
