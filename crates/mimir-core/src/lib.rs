@@ -15,6 +15,7 @@ pub mod error;
 #[cfg(any(test, feature = "eval"))]
 pub mod eval;
 pub mod format;
+pub mod grounding;
 pub mod import;
 pub mod index;
 pub mod inject;

@@ -883,6 +883,50 @@ pub fn doctor(check_only: bool) -> Result<()> {
                     }),
                 &mut failures,
             );
+            // Informational, and never a failure: a refusal is the guard
+            // working. What's worth seeing is a *retry* — one value offered
+            // repeatedly means something upstream keeps trying to store it
+            // and doesn't know it's being turned away.
+            let month_ago = mimir_core::model::now_unix() - 30 * 86_400;
+            if let Ok((distinct, offers)) = mimir_core::secrets::refusal_counts(&conn, month_ago) {
+                if distinct > 0 {
+                    check(
+                        "secret guard",
+                        true,
+                        format!(
+                            "{distinct} value(s) refused in the last 30d over {offers} attempt(s)\
+                             {} (fingerprints only — the values were never stored; \
+                             `mimir refusals` for detail)",
+                            if offers > distinct {
+                                " — something is retrying"
+                            } else {
+                                ""
+                            }
+                        ),
+                        &mut failures,
+                    );
+                }
+            }
+            // Also informational. Stale grounding is the one signal here
+            // that Mimir derived by checking rather than by policy: the
+            // memory said it was about a symbol, and the symbol is gone.
+            if let Ok((grounded, stale, ungrounded)) = mimir_core::grounding::tally(&conn) {
+                if grounded + stale > 0 {
+                    check(
+                        "grounding",
+                        true,
+                        format!(
+                            "{grounded} grounded, {stale} stale, {ungrounded} ungrounded{}",
+                            if stale > 0 {
+                                " — `mimir grounding --stale` to review"
+                            } else {
+                                ""
+                            }
+                        ),
+                        &mut failures,
+                    );
+                }
+            }
         }
         Err(e) => check("db", false, e.to_string(), &mut failures),
     }
@@ -987,6 +1031,13 @@ pub fn remember(
         mimir.project_for_cwd(&std::env::current_dir()?)?
     };
     if let Some(kind) = mimir_core::secrets::scan_capture(&text, &tags, &fires_when) {
+        mimir_core::secrets::record_refusal(
+            &mimir.conn,
+            &mimir_core::secrets::capture_hash(&text, &tags, &fires_when),
+            kind,
+            mimir_core::secrets::Surface::CliRemember,
+            mimir_core::model::now_unix(),
+        );
         bail!(mimir_core::error::Error::Secret(kind));
     }
     let outcome = memory::remember(
@@ -1009,7 +1060,7 @@ pub fn remember(
                 println!("{}", line(&node, &projects, snippet));
             }
             if let Some(r) = link_ref {
-                let target = store::resolve_ref(&mimir.conn, &r)?;
+                let target = resolve_link_target(&mimir.conn, &r, project.as_ref().map(|p| p.id))?;
                 store::link(&mimir.conn, node.id, target.id, Rel::Relates, 1.0)?;
                 println!("linked → {}", line(&target, &projects, 0));
             }
@@ -1314,6 +1365,96 @@ pub fn mark(reference: &str, useful: bool) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a `--link` / `link:` target by node id *or* by symbol name.
+///
+/// Both surfaces advertise "a code symbol or node", but only ever called
+/// `store::resolve_ref`, which resolves ids and nothing else — so linking a
+/// memory to `retry_with_backoff` failed with "no node matching", and the
+/// only links anyone could make by hand were between things they already
+/// had ids for. Since a link to an indexed symbol is exactly what makes a
+/// memory *grounded* (see `mimir_core::grounding`), leaving this broken
+/// would have shipped a grounding feature that nearly nothing could reach —
+/// the same shape as the anchors that sat at zero adoption because the only
+/// way to set one was at capture time.
+fn resolve_link_target(
+    conn: &rusqlite::Connection,
+    reference: &str,
+    project_id: Option<i64>,
+) -> Result<Node> {
+    match store::resolve_ref(conn, reference) {
+        Ok(node) => Ok(node),
+        Err(err) => {
+            let Some(pid) = project_id else {
+                return Err(err.into());
+            };
+            // Symbol lookup is project-scoped; outside a project there is
+            // nothing to search, so report the original id-shaped error.
+            mimir_graph::resolve_symbol(conn, pid, reference).map_err(|_| err.into())
+        }
+    }
+}
+
+pub fn grounding(stale_only: bool, limit: usize) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let (grounded, stale, ungrounded) = mimir_core::grounding::tally(&mimir.conn)?;
+    println!("{grounded} grounded, {stale} stale, {ungrounded} ungrounded");
+    if !stale_only {
+        println!(
+            "\nGrounded means the memory links to something Mimir indexes and can \
+             re-check.\nUngrounded is normal — most notes aren't about a specific \
+             symbol or file."
+        );
+        return Ok(());
+    }
+    let rows = mimir_core::grounding::stale_memories(&mimir.conn, limit)?;
+    if rows.is_empty() {
+        println!("\nnothing stale");
+        return Ok(());
+    }
+    let projects = store::project_titles(&mimir.conn)?;
+    println!();
+    for (node, target) in &rows {
+        println!(
+            "{}",
+            line(node, &projects, mimir.config.output.snippet_chars)
+        );
+        println!("    was about: {target} (no longer indexed)");
+    }
+    println!(
+        "\nStale means the thing it pointed at is gone, not that the memory is \
+         wrong.\nRe-link with `mimir link`, retire with `mimir supersede`, or leave it."
+    );
+    Ok(())
+}
+
+pub fn refusals(limit: usize) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let rows = mimir_core::secrets::refusals(&mimir.conn, limit)?;
+    if rows.is_empty() {
+        println!("nothing refused");
+        return Ok(());
+    }
+    println!(
+        "{:<24} {:<14} {:>6}  {:<12} {:<12}",
+        "kind", "surface", "offers", "first", "last"
+    );
+    for r in &rows {
+        println!(
+            "{:<24} {:<14} {:>6}  {:<12} {:<12}",
+            r.kind,
+            r.surface,
+            r.count,
+            mimir_core::format::full_date(r.first_seen),
+            mimir_core::format::full_date(r.last_seen)
+        );
+    }
+    println!(
+        "\nfingerprints only — the refused values were never written to disk, \
+         so there is nothing here to recover them from."
+    );
+    Ok(())
+}
+
 pub fn consolidate(dry_run: bool) -> Result<()> {
     let mimir = Mimir::open()?;
     let report =
@@ -1380,6 +1521,13 @@ pub fn edit(
     if let Some(kind) =
         mimir_core::secrets::scan_capture(&text, tags.as_deref().unwrap_or(&[]), &[])
     {
+        mimir_core::secrets::record_refusal(
+            &mimir.conn,
+            &mimir_core::secrets::capture_hash(&text, tags.as_deref().unwrap_or(&[]), &[]),
+            kind,
+            mimir_core::secrets::Surface::CliEdit,
+            mimir_core::model::now_unix(),
+        );
         bail!(mimir_core::error::Error::Secret(kind));
     }
     let edit = memory::Edit {
@@ -2245,5 +2393,45 @@ mod inject_addr_tests {
     fn empty_url_is_an_error_not_a_panic() {
         assert!(inject_addr("").is_err());
         assert!(inject_addr("http://").is_err());
+    }
+}
+
+#[cfg(test)]
+mod link_target_tests {
+    use super::resolve_link_target;
+    use mimir_core::model::{Kind, NewNode};
+    use mimir_core::store;
+
+    /// `--link` advertises "a code symbol or node" but only ever resolved
+    /// ids, so linking a memory to a symbol by name failed outright — and a
+    /// link to an indexed symbol is precisely what makes a memory grounded.
+    #[test]
+    fn resolves_a_symbol_by_bare_name_not_just_by_id() {
+        let conn = mimir_core::db::open_in_memory().unwrap();
+        let mut proj = NewNode::new(Kind::Project);
+        proj.title = Some("probe".into());
+        let project = store::insert_node(&conn, proj).unwrap();
+
+        let mut sym = NewNode::new(Kind::Symbol);
+        sym.title = Some("retry_with_backoff".into());
+        sym.project_id = Some(project.id);
+        let symbol = store::insert_node(&conn, sym).unwrap();
+
+        let found =
+            resolve_link_target(&conn, "retry_with_backoff", Some(project.id)).expect("by name");
+        assert_eq!(found.id, symbol.id);
+
+        // The id form must keep working, and must not need a project.
+        let by_id = resolve_link_target(&conn, &symbol.uid, None).expect("by id");
+        assert_eq!(by_id.id, symbol.id);
+    }
+
+    /// Outside a project there is nothing to search, so the caller should
+    /// see the id-shaped error rather than a confusing symbol-lookup one.
+    #[test]
+    fn unknown_name_still_errors() {
+        let conn = mimir_core::db::open_in_memory().unwrap();
+        assert!(resolve_link_target(&conn, "nope_not_here", None).is_err());
+        assert!(resolve_link_target(&conn, "nope_not_here", Some(1)).is_err());
     }
 }
