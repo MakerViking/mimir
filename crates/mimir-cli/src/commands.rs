@@ -1047,6 +1047,11 @@ pub fn remember(
             "refused: near-duplicate of\n  {}\nuse --force to store anyway",
             line(&existing, &projects, snippet)
         ),
+        RememberOutcome::Forgotten(gone) => bail!(
+            "refused: this was forgotten on {}\n  {}\nuse --force to bring it back deliberately",
+            mimir_core::format::full_date(gone.deleted_at.unwrap_or(gone.updated_at)),
+            line(&gone, &projects, snippet)
+        ),
     }
 }
 
@@ -1816,6 +1821,13 @@ fn finish_import(mimir: &mut Mimir, stats: mimir_core::import::ImportStats) -> R
         "imported {} memorie(s), skipped {} duplicate(s)",
         stats.imported, stats.skipped_duplicates
     );
+    if stats.skipped_forgotten > 0 {
+        println!(
+            "skipped {} previously forgotten memorie(s) — re-add with \
+             `mimir remember --force` if that was wrong",
+            stats.skipped_forgotten
+        );
+    }
     let embedded = mimir.embed_pending()?;
     if embedded > 0 {
         println!("embedded {embedded} node(s)");

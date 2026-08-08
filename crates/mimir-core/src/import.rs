@@ -13,6 +13,12 @@ use crate::model::MemoryType;
 pub struct ImportStats {
     pub imported: usize,
     pub skipped_duplicates: usize,
+    /// Deliberately forgotten before, and not resurrected by an import.
+    /// Counted separately from duplicates because it means something
+    /// different: a duplicate is redundant, this one someone deleted on
+    /// purpose. Silently folding it into the duplicate count is how the
+    /// deletion becomes invisible.
+    pub skipped_forgotten: usize,
 }
 
 /// One parsed memory ready for insertion.
@@ -48,6 +54,7 @@ fn store_all(conn: &Connection, items: Vec<Incoming>) -> Result<ImportStats> {
                 stats.imported += 1;
             }
             RememberOutcome::Duplicate(_) => stats.skipped_duplicates += 1,
+            RememberOutcome::Forgotten(_) => stats.skipped_forgotten += 1,
         }
     }
     Ok(stats)
