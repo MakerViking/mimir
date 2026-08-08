@@ -103,6 +103,14 @@ pub struct RememberArgs {
     /// condition is an event rather than a date.
     #[serde(default)]
     pub resolves_when: Option<String>,
+    /// How sure you are that this is true: "certain", "likely" or
+    /// "unsure". Record what you actually knew when you wrote it — this is
+    /// tracked separately from how often the memory gets used, so a guess
+    /// stays legible as a guess however much it is later recalled. Leave
+    /// unset rather than guessing a level; absent means undeclared, not
+    /// medium. Does not affect ranking.
+    #[serde(default)]
+    pub confidence: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -376,6 +384,18 @@ impl MimirServer {
                             args.resolves_when.as_deref(),
                         )
                         .map_err(engine_err)?;
+                    }
+                    // Same contract as expires_in: an unparseable level is
+                    // an error, not a silently undeclared memory.
+                    if let Some(spec) = args.confidence.as_deref() {
+                        let level: mimir_core::model::MemoryConfidence =
+                            spec.parse().map_err(|_| {
+                                engine_err(mimir_core::error::Error::Invalid(format!(
+                                    "invalid confidence {spec:?}: expected certain, likely \
+                                     or unsure"
+                                )))
+                            })?;
+                        store::set_confidence(&m.conn, node.id, level).map_err(engine_err)?;
                     }
                     let mut msg = format!("stored {}", line(&node));
                     if let Some(target) = args.link.as_deref() {
@@ -1674,6 +1694,7 @@ mod tests {
             anchors: Vec::new(),
             expires_in: None,
             resolves_when: None,
+            confidence: None,
         }
     }
 
@@ -1777,6 +1798,7 @@ mod tests {
                 anchors: vec!["deploy.sh".into()],
                 expires_in: None,
                 resolves_when: None,
+                confidence: None,
             }))
             .await;
         assert!(stored.starts_with("stored"), "remember: {stored}");
@@ -1827,6 +1849,7 @@ mod tests {
                 anchors: Vec::new(),
                 expires_in: None,
                 resolves_when: None,
+                confidence: None,
             }))
             .await;
         assert!(

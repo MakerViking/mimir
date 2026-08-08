@@ -230,7 +230,16 @@ pub fn agent_line_for_query(
         String::new()
     };
     let title = node.title.as_deref().unwrap_or("(untitled)");
-    let mut line = format!("{id} [{tag}{scope} {date}{uses}] {title}");
+    // Only `unsure` rides the compact line, and it costs one word. The
+    // asymmetry is deliberate: this line is the one an agent reads before
+    // acting, so the case worth spending tokens on is the one where acting
+    // without checking would be a mistake. Printing "certain" everywhere
+    // would be reassurance nobody asked for, at a cost per recall.
+    let doubt = match node.confidence() {
+        Some(crate::model::MemoryConfidence::Unsure) => " unsure",
+        _ => "",
+    };
+    let mut line = format!("{id} [{tag}{scope} {date}{uses}{doubt}] {title}");
     if let Some(body) = node.body.as_deref() {
         let flat = collapse_ws(body);
         let stems = query.map(query_stems).unwrap_or_default();
@@ -316,6 +325,16 @@ pub fn full_record(
     // the artifact), and stamping "ungrounded" on every ordinary note would
     // read as a defect rather than the normal case that it is.
     if node.kind == crate::model::Kind::Memory {
+        // The three axes a reader has to keep apart, and which a single
+        // `strength` number silently merges: what the author claimed, how
+        // much the store has used it, and whether the link it rests on
+        // still holds. Only printed when declared — see MemoryConfidence
+        // on why absent is not the middle.
+        if let Some(c) = node.confidence() {
+            out.push_str(&format!(
+                "\nconfidence: {c} (author-declared; not a ranking signal)"
+            ));
+        }
         if let crate::grounding::Grounding::Stale { kind, label } =
             crate::grounding::grounding(conn, node.id)?
         {
@@ -357,6 +376,81 @@ mod tests {
                 "m:{tail} [gotcha pr:mimir {}] watch out — for the thing",
                 month_day(node.created_at)
             )
+        );
+    }
+
+    /// Only doubt is worth the tokens on the line an agent acts from.
+    /// Certainty is the assumption already; spending a word per recall to
+    /// restate it would be pure cost.
+    #[test]
+    fn only_unsure_reaches_the_compact_line() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let make = |level: Option<crate::model::MemoryConfidence>| {
+            let mut new = NewNode::new(Kind::Memory);
+            new.subkind = Some("note".into());
+            new.title = Some("dns is the cause".into());
+            new.body = Some("dns is the cause".into());
+            let node = store::insert_node(&conn, new).unwrap();
+            if let Some(l) = level {
+                store::set_confidence(&conn, node.id, l).unwrap();
+            }
+            let node = store::get_node(&conn, node.id).unwrap();
+            agent_line(&node, None, 120)
+        };
+        assert!(make(Some(crate::model::MemoryConfidence::Unsure)).contains("unsure"));
+        assert!(!make(Some(crate::model::MemoryConfidence::Certain)).contains("certain"));
+        assert!(!make(Some(crate::model::MemoryConfidence::Likely)).contains("likely"));
+        let bare = make(None);
+        assert!(!bare.contains("unsure") && !bare.contains("certain"));
+    }
+
+    /// Confidence must be readable in full, and must be legibly the
+    /// author's claim rather than something Mimir computed.
+    #[test]
+    fn full_record_attributes_confidence_to_the_author() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.subkind = Some("insight".into());
+        new.title = Some("the flake is dns".into());
+        new.body = Some("the flake is dns".into());
+        let node = store::insert_node(&conn, new).unwrap();
+        store::set_confidence(&conn, node.id, crate::model::MemoryConfidence::Unsure).unwrap();
+        let node = store::get_node(&conn, node.id).unwrap();
+        let out = full_record(&conn, &node, &HashMap::new()).unwrap();
+        assert!(out.contains("confidence: unsure"), "{out}");
+        assert!(out.contains("author-declared"), "{out}");
+        assert!(out.contains("not a ranking signal"), "{out}");
+    }
+
+    /// The separation that makes this worth having: recall a guess as much
+    /// as you like and it is still marked a guess. `strength` moves,
+    /// `confidence` does not — one records use, the other a claim.
+    #[test]
+    fn recall_raises_strength_without_touching_confidence() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.subkind = Some("insight".into());
+        new.title = Some("probably a cache issue".into());
+        new.body = Some("probably a cache issue".into());
+        let node = store::insert_node(&conn, new).unwrap();
+        store::set_confidence(&conn, node.id, crate::model::MemoryConfidence::Unsure).unwrap();
+
+        let before = store::get_node(&conn, node.id).unwrap();
+        for _ in 0..8 {
+            crate::learn::record_opened(&conn, node.id).unwrap();
+        }
+        let after = store::get_node(&conn, node.id).unwrap();
+
+        assert!(
+            after.strength > before.strength,
+            "being used should move strength ({} -> {})",
+            before.strength,
+            after.strength
+        );
+        assert_eq!(
+            after.confidence(),
+            Some(crate::model::MemoryConfidence::Unsure),
+            "being used must NOT promote a guess"
         );
     }
 

@@ -409,6 +409,23 @@ pub fn set_expiry(
     Ok(())
 }
 
+/// Record the author's own certainty. Stored in `meta` for the same reason
+/// as `set_expiry`: it replicates without a schema bump.
+///
+/// No gate and no score — see [`crate::model::MemoryConfidence`]. Writing
+/// this changes what a reader sees, never what recall returns.
+pub fn set_confidence(
+    conn: &Connection,
+    id: i64,
+    confidence: crate::model::MemoryConfidence,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE node SET meta = json_set(meta, '$.confidence', ?2) WHERE id = ?1",
+        params![id, confidence.as_str()],
+    )?;
+    Ok(())
+}
+
 /// Bind an existing keyed (possibly synced-shadow) project to this machine's
 /// local path + display name, clearing the shadow marker. Used when a project
 /// that first arrived via sync is opened locally.

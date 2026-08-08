@@ -5,6 +5,20 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **`--confidence certain|likely|unsure` separates how sure the author was
+  from how often the memory gets used.** `strength` conflated the two: a
+  guess recalled enough times outranked things that had been checked, with
+  nothing left to show it was ever uncertain. Confidence is author-declared
+  at capture, on the same argument `expires_at` and `resolves_when` are
+  built on — the person writing it is the only one who knows, they know it
+  at write time, and nobody backfills. A level inferred later by a model
+  would be exactly the unfalsifiable label this replaces: computed from the
+  text, so incapable of contradicting it. Absent is a real state and is
+  **not** a synonym for `likely`; an unparseable level is rejected before
+  anything is written. Shown in full on `get`, and on the compact recall
+  line only when `unsure` — that line is what an agent acts from, so the
+  case worth a token is the one where acting without checking is a mistake.
+  Does not gate and does not score: the drift-eval baseline is byte-identical.
 - **`mimir grounding` — which memories are attached to something Mimir can
   re-check, and which of those attachments have broken.** A memory linked
   to an indexed artifact (code symbol, source chunk, doc chunk, file) makes

@@ -146,6 +146,12 @@ enum Command {
         /// so the reader can see what would make it wrong.
         #[arg(long = "resolves-when", value_name = "CONDITION")]
         resolves_when: Option<String>,
+        /// How sure you are: certain | likely | unsure. Records the
+        /// author's certainty, which is a different thing from how often
+        /// the memory gets used — so a guess stays visibly a guess no
+        /// matter how much it is recalled. Does not affect ranking.
+        #[arg(long, value_name = "LEVEL")]
+        confidence: Option<String>,
     },
     /// Search memories (and later docs/code) with hybrid ranking.
     Recall {
@@ -729,6 +735,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             anchors,
             expires_in,
             resolves_when,
+            confidence,
         } => commands::remember(
             cli.json,
             text.join(" "),
@@ -741,6 +748,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             anchors,
             expires_in,
             resolves_when,
+            confidence,
         ),
         Command::Recall {
             query,

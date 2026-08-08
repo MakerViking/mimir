@@ -1011,6 +1011,7 @@ pub fn remember(
     anchors: Vec<String>,
     expires_in: Option<String>,
     resolves_when: Option<String>,
+    confidence: Option<String>,
 ) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let mtype: MemoryType = mtype.parse()?;
@@ -1025,6 +1026,18 @@ pub fn remember(
         })?),
         None => None,
     };
+    // Same rule: reject before writing. A memory stored without the
+    // certainty its author asked to record is worse than an error, because
+    // nothing afterwards reveals the omission.
+    let confidence = confidence
+        .as_deref()
+        .map(|c| {
+            c.parse::<mimir_core::model::MemoryConfidence>()
+                .map_err(|_| {
+                    anyhow!("invalid --confidence {c:?}: expected certain, likely or unsure")
+                })
+        })
+        .transpose()?;
     let project = if global {
         None
     } else {
@@ -1087,6 +1100,10 @@ pub fn remember(
                 if let Some(c) = resolves_when.as_deref() {
                     println!("resolves when: {c}");
                 }
+            }
+            if let Some(c) = confidence {
+                store::set_confidence(&mimir.conn, node.id, c)?;
+                println!("confidence: {c}");
             }
             // Keep semantic recall fresh; harmless no-op without a model.
             if let Err(err) = mimir.embed_pending() {
