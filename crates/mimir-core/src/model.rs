@@ -66,6 +66,34 @@ str_enum!(MemoryType {
     Summary => "summary",
 });
 
+// How sure the *author* was when they wrote it — never how useful it has
+// since proved.
+//
+// Mimir already tracks how often a memory gets used (`strength`, which
+// decays) and whether it has been retired (`superseded_by`, `expires_at`,
+// and `grounding`). What it had no way to say is "I was guessing." Those
+// are different questions, and folding them into one number is how a guess
+// becomes canon: recall it enough and it outranks things that were checked,
+// with nothing left to show it was ever uncertain.
+//
+// Author-declared at capture, deliberately — the same argument
+// `expires_at` and `resolves_when` are built on. The person writing the
+// memory is the only one who knows how sure they were, they know it at
+// write time, and nobody ever backfills. The alternative, a confidence
+// score inferred later by a model, is precisely the unfalsifiable policy
+// label this is meant to replace: it would be computed from the text, so
+// it could never contradict the text.
+//
+// Absent is a real state and is NOT the same as `Likely`. Defaulting an
+// undeclared memory to the middle would put words in the author's mouth,
+// the same "reject, don't mangle" call `parse_expires_in` and
+// `sanitize_fires_when` already make.
+str_enum!(MemoryConfidence {
+    Certain => "certain",
+    Likely => "likely",
+    Unsure => "unsure",
+});
+
 str_enum!(Rel {
     Links => "links",
     Mentions => "mentions",
@@ -147,6 +175,18 @@ impl Node {
     /// fact whose expiry nobody recorded.
     pub fn resolves_when(&self) -> Option<&str> {
         self.meta.get("resolves_when")?.as_str()
+    }
+
+    /// What the author said about their own certainty, if they said
+    /// anything. `None` means undeclared, which is the common case and is
+    /// not a synonym for medium confidence.
+    ///
+    /// Read-only as far as ranking is concerned: nothing in `search` or
+    /// `learn` consults this. It exists so a reader — human or agent — can
+    /// tell a checked fact from a guess that has merely been recalled a
+    /// lot, which `strength` alone can never distinguish.
+    pub fn confidence(&self) -> Option<MemoryConfidence> {
+        self.meta.get("confidence")?.as_str()?.parse().ok()
     }
 
     /// True once a declared `expires_at` has passed.
