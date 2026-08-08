@@ -5,6 +5,40 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **`mimir grounding` — which memories are attached to something Mimir can
+  re-check, and which of those attachments have broken.** A memory linked
+  to an indexed artifact (code symbol, source chunk, doc chunk, file) makes
+  a claim that code can test: the indexer and `graph build` soft-delete
+  what stops existing, so "this note is about `retry_with_backoff`" becomes
+  *stale* the moment the symbol goes. Unlike strength, marks or type
+  priors — all opinions computed from how people treated a claim — this is
+  the one signal on a memory that Mimir can prove wrong about itself.
+  Surfaced in `doctor`, in `mimir grounding --stale`, and inline on `get`
+  (so an agent reading the memory sees it too). Stale does **not** mean
+  wrong: a note about a renamed function is usually still good. It means
+  nothing has revisited it since the ground moved, which is why it is
+  reported and deliberately **not** scored — making grounding a ranking
+  input is a separate decision that would need the drift-eval baseline
+  re-cut, not smuggled in behind a display field.
+- **`mimir refusals` — an audit trail for the secret guard that is not
+  itself a pile of secrets.** Refusals now record a blake3 fingerprint of
+  what was offered, the detector's label, the surface, and first/last seen
+  with a count — never the value. Repeat offers increment one row rather
+  than inserting, because one secret offered forty times is an agent in a
+  loop and forty rows would hide that. `doctor` says so when offers exceed
+  distinct values. Guarded by a test that sweeps every column of every
+  table for the plaintext: a record of a leak must never become a second
+  copy of it.
+
+### Fixed
+- **`mimir remember --link <symbol>` now resolves symbol names.** Both the
+  CLI and MCP advertise "a code symbol or node", but the CLI only ever
+  called `resolve_ref`, which resolves ids — so linking a memory to
+  `retry_with_backoff` failed with "no node matching" and the only links
+  anyone could make by hand were between things they already had ids for.
+  MCP had the fallback already; the CLI is now at parity. Found while
+  building grounding, which this is the main path into: shipping it broken
+  would have repeated the anchors-at-zero-adoption failure exactly.
 - **The retrieval eval is now a gate, not just a report.** The hermetic
   corpus was committed and deterministic but nothing failed when the
   numbers moved: the only assertions were well-formedness checks with an

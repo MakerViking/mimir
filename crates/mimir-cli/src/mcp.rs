@@ -301,6 +301,17 @@ impl MimirServer {
             if let Some(kind) =
                 mimir_core::secrets::scan_capture(&args.text, &args.tags, &args.fires_when)
             {
+                mimir_core::secrets::record_refusal(
+                    &m.conn,
+                    &mimir_core::secrets::capture_hash(
+                        &args.text,
+                        &args.tags,
+                        &args.fires_when,
+                    ),
+                    kind,
+                    mimir_core::secrets::Surface::McpRemember,
+                    mimir_core::model::now_unix(),
+                );
                 return Err(engine_err(mimir_core::error::Error::Secret(kind)));
             }
             let outcome = memory::remember(

@@ -311,6 +311,21 @@ pub fn full_record(
             ));
         }
     }
+    // Only annotate memories, and only when there is something to say. A
+    // "grounded" badge on a doc chunk is noise (of course it is — it *is*
+    // the artifact), and stamping "ungrounded" on every ordinary note would
+    // read as a defect rather than the normal case that it is.
+    if node.kind == crate::model::Kind::Memory {
+        if let crate::grounding::Grounding::Stale { kind, label } =
+            crate::grounding::grounding(conn, node.id)?
+        {
+            out.push_str(&format!(
+                "\n! grounding stale: {} {label} is no longer indexed \
+                 (the note may still be right; nothing has revisited it since)",
+                kind.as_str()
+            ));
+        }
+    }
     Ok(out)
 }
 

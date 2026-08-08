@@ -198,6 +198,27 @@ CREATE TABLE session_state (
 );
 CREATE INDEX session_state_at ON session_state(updated_at);
 "#,
+    // Refusal ledger: what the secret guard turned away, WITHOUT the thing
+    // it turned away. `hash` is blake3 over the normalized text — enough to
+    // recognize the same value being offered again, useless for recovering
+    // it. Storing the value would make the record of a leak a copy of the
+    // leak, which is the one outcome worse than having no record.
+    //
+    // `kind` is the detector's own label ("an AWS access key"), never a
+    // fragment of the match. Repeat offers update `last_seen`/`count`
+    // rather than inserting, so a looping agent shows up as one row with a
+    // high count instead of flooding the table.
+    r#"
+CREATE TABLE refusal (
+    hash       BLOB PRIMARY KEY,
+    kind       TEXT NOT NULL,
+    surface    TEXT NOT NULL,
+    first_seen INTEGER NOT NULL,
+    last_seen  INTEGER NOT NULL,
+    count      INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX refusal_last_seen ON refusal(last_seen);
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -282,6 +303,54 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1, "old rows must be searchable (stemmed) after rebuild");
+    }
+
+    /// An existing store must pick up the newest table without losing what
+    /// it already had. Written generically against `MIGRATIONS.len() - 1`
+    /// so it keeps guarding the upgrade path for whatever the latest
+    /// migration happens to be, rather than rotting the moment one lands
+    /// after it.
+    #[test]
+    fn existing_store_gains_the_latest_table_and_keeps_its_rows() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        let previous = MIGRATIONS.len() - 1;
+        let sql: String = MIGRATIONS[..previous].join("\n");
+        conn.execute_batch(&format!(
+            "BEGIN;\n{sql}\nPRAGMA user_version = {previous};\nCOMMIT;"
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO node (uid, kind, body, created_at, updated_at)
+             VALUES ('Z', 'memory', 'a fact from before the upgrade', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, SCHEMA_VERSION);
+        let kept: i64 = conn
+            .query_row("SELECT count(*) FROM node WHERE uid = 'Z'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kept, 1, "migration must not drop existing rows");
+        // The table this migration added is usable, not merely present.
+        crate::secrets::record_refusal(
+            &conn,
+            b"fingerprint",
+            "a JWT",
+            crate::secrets::Surface::CliRemember,
+            1_700_000_000,
+        );
+        assert_eq!(
+            crate::secrets::refusal_counts(&conn, 0).unwrap(),
+            (1, 1),
+            "upgraded store must be able to write the refusal ledger"
+        );
     }
 
     #[test]

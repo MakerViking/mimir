@@ -322,6 +322,23 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Whether memories are attached to something Mimir can re-check, and
+    /// which of those attachments have since broken.
+    Grounding {
+        /// List the memories whose linked artifact is gone.
+        #[arg(long)]
+        stale: bool,
+        /// How many to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// What the secret guard turned away — fingerprints and counts, never
+    /// the refused values.
+    Refusals {
+        /// How many rows to show (most recently offered first).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Import memories from the tools Mimir replaces.
     Import {
         #[command(subcommand)]
@@ -829,6 +846,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             commands::mark(&reference, useful)
         }
         Command::Consolidate { dry_run } => commands::consolidate(dry_run),
+        Command::Refusals { limit } => commands::refusals(limit),
+        Command::Grounding { stale, limit } => commands::grounding(stale, limit),
         Command::Import { cmd } => match cmd {
             ImportCmd::Openbrain { file } => commands::import_openbrain(&file),
             ImportCmd::ClaudeMemory { dir } => commands::import_claude_memory(&dir),
