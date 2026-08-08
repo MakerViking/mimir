@@ -393,6 +393,12 @@ impl MimirServer {
                     "refused: near-duplicate of\n{}\n(edit that entry instead, or rephrase if genuinely different)",
                     line(&existing)
                 )),
+                RememberOutcome::Forgotten(gone) => Ok(format!(
+                    "refused: a human forgot this on {}\n{}\n(it was deleted on purpose — do not re-add it \
+                     unless the user asks; if they do, they can run `mimir remember --force`)",
+                    mimir_core::format::full_date(gone.deleted_at.unwrap_or(gone.updated_at)),
+                    line(&gone)
+                )),
             }
         })
         .await

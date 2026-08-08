@@ -5,6 +5,22 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **The retrieval eval is now a gate, not just a report.** The hermetic
+  corpus was committed and deterministic but nothing failed when the
+  numbers moved: the only assertions were well-formedness checks with an
+  `MRR > 0.2` floor, and every actual baseline was `#[ignore]`d. Two tests
+  now run on plain `cargo test` — a committed per-set baseline that must
+  reproduce **exactly** (in both directions, so an improvement also has to
+  be written down), and an ablation asserting each scoring knob still beats
+  its own absence. Verified by zeroing `type_prior_alpha`: previously
+  green, now two failures naming the metric and the delta.
+  - Fell out of writing it: **`scoring.code_damp` changes nothing on the
+    corpus** — same numbers in every category, including the
+    `code-vs-memory` scenario that exists to guard it, whose single
+    question ranks the memory first either way. Pinned by a test rather
+    than papered over, so authoring a fixture that finally exercises the
+    knob will fail loudly and move it into the ablation where it belongs.
+
 - **`mimir anchor <ref> --pattern ...`** sets guard anchors on an
   *existing* memory. `remember --anchor` only covered capture time, which
   is why anchor adoption sits at zero in practice: by the time you know
@@ -12,6 +28,19 @@ the `mimir-mem` crate, and the on-disk schema move together.
   the existing set.
 
 ### Fixed
+- **A forgotten memory can no longer come back on its own.** `forget` set a
+  tombstone, but duplicate detection only ever looked at live nodes — so
+  offering the same text again created a fresh node with no warning, and
+  the deletion left nothing behind that could catch it. An importer re-run,
+  an extractor re-reading an unchanged source, or an agent that saw the
+  fact twice would each quietly undo the delete. `remember` now refuses
+  with the date it was forgotten on, and takes `--force` to override; the
+  MCP tool has no `force` parameter at all, so an agent cannot resurrect
+  something a human deleted. Matching is by exact normalized hash *and* by
+  token overlap, because a reword is the common shape of re-extraction.
+  Decay-archived nodes (`meta.archived`) are deliberately excluded — nobody
+  decided those, and refusing them would train everyone to pass `--force`
+  by reflex.
 - **The CLI no longer overflows the stack on Windows.** Windows gives the
   main thread a 1 MiB stack where Linux and macOS give 8, and clap's
   derived builder for Mimir's ~50 subcommands outgrew it in debug builds:

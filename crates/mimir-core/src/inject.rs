@@ -475,7 +475,9 @@ mod tests {
         )
         .unwrap();
         match out {
-            RememberOutcome::Created(node) | RememberOutcome::Duplicate(node) => node.id,
+            RememberOutcome::Created(node)
+            | RememberOutcome::Duplicate(node)
+            | RememberOutcome::Forgotten(node) => node.id,
         }
     }
 

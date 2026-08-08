@@ -207,12 +207,9 @@ fn evaluate_all(
     ids: &fixtures::FixtureIds,
     k: usize,
     model: &str,
+    scoring: &crate::config::ScoringConfig,
     mut query_vec: impl FnMut(&fixtures::Question) -> Result<Vec<f32>>,
 ) -> Result<Vec<(Category, QuestionSet, Metrics)>> {
-    // Score with the same weights a real user gets (config defaults), so a
-    // ranking-config change (recency_alpha, type_prior_alpha, ...) actually
-    // shows up here instead of the eval scoring silently diverging from it.
-    let scoring = crate::config::ScoringConfig::default();
     let mut cache = None;
     let mut rows = Vec::new();
     for q in fixtures::questions() {
@@ -423,11 +420,22 @@ pub fn run_inject_eval_real_model() -> Result<Option<InjectConfusion>> {
 /// Hermetic baseline: synthetic vectors, no model, no network. Safe for
 /// normal `cargo test`.
 pub fn run_hermetic(k: usize) -> Result<EvalResult> {
+    // The same weights a real user gets, so a ranking-config change
+    // (recency_alpha, type_prior_alpha, ...) actually shows up here instead
+    // of the eval scoring silently diverging from the product's.
+    run_hermetic_with(k, &crate::config::ScoringConfig::default())
+}
+
+/// [`run_hermetic`] with the scoring weights supplied, so an ablation can
+/// ask what a knob is actually buying. Nothing in the product calls this
+/// with a non-default config — if it did, the defaults would no longer be
+/// what the baseline measures.
+pub fn run_hermetic_with(k: usize, scoring: &crate::config::ScoringConfig) -> Result<EvalResult> {
     let conn = db::open_in_memory()?;
     let ids = fixtures::insert_fixture_nodes(&conn)?;
     fixtures::seed_synthetic_vectors(&conn, &ids)?;
 
-    let rows = evaluate_all(&conn, &ids, k, fixtures::SYNTHETIC_MODEL, |q| {
+    let rows = evaluate_all(&conn, &ids, k, fixtures::SYNTHETIC_MODEL, scoring, |q| {
         Ok(fixtures::synthetic_query_vector(q.topic, q.query))
     })?;
     Ok(build_result(k, rows))
@@ -474,7 +482,8 @@ pub fn run_real_model(k: usize) -> Result<Option<EvalResult>> {
     }
 
     let model_name = embedder.name.clone();
-    let rows = evaluate_all(&conn, &ids, k, &model_name, |q| {
+    let scoring = crate::config::ScoringConfig::default();
+    let rows = evaluate_all(&conn, &ids, k, &model_name, &scoring, |q| {
         Ok(embedder.embed(vec![q.query.to_string()])?.remove(0))
     })?;
     Ok(Some(build_result(k, rows)))
@@ -492,6 +501,145 @@ mod tests {
     /// `fixtures.rs` are deliberately hard so a future ranking change has
     /// headroom to prove a win. The floor here only catches "the harness
     /// itself is broken" (empty results, ids not resolving, etc.).
+    /// Landed hermetic numbers at k=5, by question set. Committed so a
+    /// ranking change has to show up as a deliberate edit to this table in
+    /// the diff, rather than as a number nobody reads drifting quietly.
+    ///
+    /// The hermetic mode is fully deterministic (synthetic vectors, fixed
+    /// corpus), so these reproduce exactly — which is why the gate below
+    /// compares in *both* directions. An improvement failing the build is
+    /// the point: it means someone made ranking better and should say so
+    /// here, where the next person can see what the number used to be.
+    const HERMETIC_BASELINE: &[(&str, f64, f64)] = &[
+        // (set, mrr, recall)
+        ("core", 1.0000, 1.0000),
+        ("tuning", 0.9000, 0.9000),
+        ("holdout", 1.0000, 1.0000),
+        ("overall (k=5)", 0.9565, 0.9565),
+    ];
+
+    const BASELINE_TOL: f64 = 5e-4;
+
+    #[test]
+    fn hermetic_baseline_reproduces_exactly() {
+        let result = run_hermetic(5).unwrap();
+        for (label, want_mrr, want_recall) in HERMETIC_BASELINE {
+            let got = result
+                .by_set
+                .iter()
+                .find(|r| &r.label == label)
+                .unwrap_or_else(|| panic!("no '{label}' row in by_set"));
+            for (metric, want, have) in [
+                ("mrr", *want_mrr, got.mrr),
+                ("recall", *want_recall, got.recall),
+            ] {
+                assert!(
+                    (have - want).abs() <= BASELINE_TOL,
+                    "{label} {metric}: baseline {want:.4}, now {have:.4}.\n\
+                     If this change was intended, update HERMETIC_BASELINE in this file \
+                     and say why in the commit — a ranking change that edits no baseline \
+                     is a ranking change nobody reviewed."
+                );
+            }
+        }
+    }
+
+    /// The ablation memsem-style: every scoring knob must pay for itself on
+    /// the corpus, and the stack as a whole must beat scoring with all of
+    /// them off. Without this, a knob can rot into a no-op — or worse, into
+    /// a net negative — while its config field and docs still claim a job.
+    #[test]
+    fn every_ranking_knob_earns_its_place() {
+        use crate::config::ScoringConfig;
+        let d = ScoringConfig::default();
+        let mrr = |cfg: &ScoringConfig| {
+            run_hermetic_with(5, cfg)
+                .unwrap()
+                .by_category
+                .last()
+                .unwrap()
+                .mrr
+        };
+        let base = mrr(&d);
+
+        for (knob, cfg) in [
+            (
+                "strength_alpha",
+                ScoringConfig {
+                    strength_alpha: 0.0,
+                    ..d.clone()
+                },
+            ),
+            (
+                "recency_alpha",
+                ScoringConfig {
+                    recency_alpha: 0.0,
+                    ..d.clone()
+                },
+            ),
+            (
+                "type_prior_alpha",
+                ScoringConfig {
+                    type_prior_alpha: 0.0,
+                    ..d.clone()
+                },
+            ),
+        ] {
+            let without = mrr(&cfg);
+            assert!(
+                base > without,
+                "{knob} buys nothing: MRR {base:.4} with it, {without:.4} without. \
+                 Either it stopped working or the corpus stopped testing it — \
+                 both need a human, neither should pass silently."
+            );
+        }
+
+        let all_off = mrr(&ScoringConfig {
+            strength_alpha: 0.0,
+            recency_alpha: 0.0,
+            type_prior_alpha: 0.0,
+            code_damp: 1.0,
+            ..d.clone()
+        });
+        assert!(
+            base > all_off,
+            "the whole scoring stack buys nothing: {base:.4} vs {all_off:.4} unscored"
+        );
+    }
+
+    /// `code_damp` is deliberately absent from the ablation above, because
+    /// it currently changes *nothing* on this corpus — including the
+    /// `code-vs-memory` category that exists to guard it. That is a gap in
+    /// the fixtures, not proof the knob is useless: the one scenario there
+    /// ranks the memory first with or without the damp, so it never
+    /// exercises the tie the damp is meant to break.
+    ///
+    /// Pinned rather than ignored, so the day someone authors a fixture
+    /// that does exercise it, this test fails and forces the knob into the
+    /// ablation above where it belongs.
+    #[test]
+    fn code_damp_is_still_inert_on_this_corpus() {
+        use crate::config::ScoringConfig;
+        let d = ScoringConfig::default();
+        let with = run_hermetic_with(5, &d).unwrap();
+        let without = run_hermetic_with(
+            5,
+            &ScoringConfig {
+                code_damp: 1.0,
+                ..d.clone()
+            },
+        )
+        .unwrap();
+        let overall = |r: &EvalResult| r.by_category.last().unwrap().mrr;
+        assert!(
+            (overall(&with) - overall(&without)).abs() <= BASELINE_TOL,
+            "code_damp now moves the corpus ({:.4} vs {:.4}) — good. Move it into \
+             every_ranking_knob_earns_its_place and delete this test.",
+            overall(&with),
+            overall(&without)
+        );
+    }
+
     #[test]
     fn hermetic_scores_are_well_formed() {
         let result = run_hermetic(5).unwrap();

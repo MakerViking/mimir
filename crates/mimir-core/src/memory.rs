@@ -13,11 +13,24 @@ use crate::store::{self, row_to_node, NODE_COLS};
 /// as a near-duplicate (without --force).
 const NEAR_DUP_JACCARD: f64 = 0.85;
 
+/// How many deliberate tombstones the reword pass compares against. A bound
+/// so `remember` can never turn into a table scan on a store where someone
+/// has forgotten a great deal; newest-first, because a recent deletion is
+/// the one a re-add is most likely to be undoing.
+const FORGOTTEN_SCAN_LIMIT: usize = 500;
+
 #[derive(Debug)]
 pub enum RememberOutcome {
     Created(Node),
     /// Refused: the contained node is the existing near-duplicate.
     Duplicate(Node),
+    /// Refused: this text was deliberately forgotten and the tombstone is
+    /// still there. Re-adding it silently is how a deleted fact creeps
+    /// back in — an extractor re-reading the same source produces the same
+    /// text, and without this the only trace of the deletion is a node the
+    /// dedup path can't see. Takes `--force`, which is the point: coming
+    /// back has to be a decision someone made, not a default.
+    Forgotten(Node),
 }
 
 #[derive(Debug)]
@@ -33,7 +46,20 @@ pub struct Remember {
 pub fn remember(conn: &Connection, args: Remember) -> Result<RememberOutcome> {
     let hash = content_hash(&args.text);
     if !args.force {
-        if let Some(dup) = find_duplicate(conn, &args.text, &hash)? {
+        // Precedence matters. An exact *live* copy is an ordinary duplicate
+        // even when an older tombstone of the same text also exists — that
+        // is the shape of a fact someone deliberately brought back, and
+        // refusing it as "forgotten" forever would make `--force` a
+        // one-way door. Only when nothing live matches does the tombstone
+        // get to refuse. Near-duplicates rank last: a loose match against
+        // some other live memory must not mask an exact tombstone hit.
+        if let Some(dup) = find_exact(conn, &hash)? {
+            return Ok(RememberOutcome::Duplicate(dup));
+        }
+        if let Some(gone) = find_forgotten(conn, &args.text, &hash)? {
+            return Ok(RememberOutcome::Forgotten(gone));
+        }
+        if let Some(dup) = find_near_duplicate(conn, &args.text)? {
             return Ok(RememberOutcome::Duplicate(dup));
         }
     }
@@ -113,9 +139,67 @@ pub fn parse_expires_in(spec: &str, now: i64) -> Option<i64> {
     n.checked_mul(secs)?.checked_add(now)
 }
 
-fn find_duplicate(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<Node>> {
-    // Exact (normalized) content match, any scope.
+/// SQL for tombstones that represent a *deliberate* deletion.
+///
+/// `consolidate`'s decay pass also soft-deletes (with `meta.archived = 1`),
+/// but nobody decided that — it fell below a strength threshold while idle.
+/// Refusing to re-learn a fact because a background job archived it six
+/// months ago would be wrong, and would teach people to pass `--force` by
+/// reflex, which is exactly how the guard stops meaning anything.
+const DELIBERATE_TOMBSTONE: &str = "kind = 'memory' AND deleted_at IS NOT NULL \
+     AND COALESCE(json_extract(meta, '$.archived'), 0) != 1";
+
+/// A memory someone deliberately forgot, whose text is being offered again.
+///
+/// Two passes, because re-extraction takes two shapes. The exact
+/// `content_hash` catches a source re-read unchanged. The token-overlap pass
+/// catches a reword — a different extractor, or the same fact said again in
+/// other words — which the hash cannot, since `tokens` keeps `file.rs` and
+/// trailing punctuation whole and so treats "utc" and "utc." as different.
+///
+/// The scan is over deliberate tombstones only, which stay rare in a real
+/// store (people forget on purpose seldom, and decay archival is excluded),
+/// so this is a few dozen short strings, not a table sweep.
+fn find_forgotten(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<Node>> {
     let exact = conn
+        .query_row(
+            &format!(
+                "SELECT {NODE_COLS} FROM node
+                 WHERE {DELIBERATE_TOMBSTONE} AND content_hash = ?1
+                 ORDER BY deleted_at DESC LIMIT 1"
+            ),
+            [hash],
+            row_to_node,
+        )
+        .optional()?;
+    if exact.is_some() {
+        return Ok(exact);
+    }
+
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} FROM node
+         WHERE {DELIBERATE_TOMBSTONE}
+         ORDER BY deleted_at DESC LIMIT {FORGOTTEN_SCAN_LIMIT}"
+    ))?;
+    let rows = stmt.query_map([], row_to_node)?;
+    for row in rows {
+        let node = row?;
+        let existing = node
+            .body
+            .as_deref()
+            .filter(|b| !b.is_empty())
+            .or(node.title.as_deref())
+            .unwrap_or_default();
+        if jaccard(text, existing) >= NEAR_DUP_JACCARD {
+            return Ok(Some(node));
+        }
+    }
+    Ok(None)
+}
+
+/// Exact (normalized) content match against a *live* memory, any scope.
+fn find_exact(conn: &Connection, hash: &[u8]) -> Result<Option<Node>> {
+    Ok(conn
         .query_row(
             &format!(
                 "SELECT {NODE_COLS} FROM node
@@ -125,11 +209,11 @@ fn find_duplicate(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<N
             [hash],
             row_to_node,
         )
-        .optional()?;
-    if exact.is_some() {
-        return Ok(exact);
-    }
-    // Near-duplicate: high token overlap with the best FTS matches.
+        .optional()?)
+}
+
+/// Near-duplicate: high token overlap with the best FTS matches.
+fn find_near_duplicate(conn: &Connection, text: &str) -> Result<Option<Node>> {
     let query = SearchQuery {
         text: text.to_string(),
         scope: Scope::All,
@@ -330,6 +414,134 @@ mod tests {
         // Same content, different whitespace/case → still a duplicate.
         match remember_text(&conn, "scram auth  rejects\nnon-ascii passwords") {
             RememberOutcome::Duplicate(d) => assert_eq!(d.id, first.id),
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
+    /// The failure this closes: `forget` tombstones a memory, recall stops
+    /// returning it, and then the same text is offered again — by an
+    /// importer, an extractor re-reading an unchanged source, or an agent
+    /// that saw the fact a second time. Dedup only ever looked at live
+    /// nodes, so the deletion left nothing that could catch the re-add and
+    /// the fact came back silently under a fresh id.
+    #[test]
+    fn forgotten_memory_is_not_silently_re_added() {
+        let conn = db::open_in_memory().unwrap();
+        let text = "staging db password rotation runs from the ops cron at 03:00 UTC";
+        let first = match remember_text(&conn, text) {
+            RememberOutcome::Created(n) => n,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        store::soft_delete(&conn, first.id).unwrap();
+
+        // Same fact, reformatted the way a different extractor would emit it.
+        match remember_text(
+            &conn,
+            "Staging DB password rotation runs from the OPS cron at 03:00 utc",
+        ) {
+            RememberOutcome::Forgotten(gone) => {
+                assert_eq!(gone.id, first.id);
+                assert!(gone.deleted_at.is_some(), "must carry the tombstone date");
+            }
+            other => panic!("expected Forgotten, got {other:?}"),
+        }
+
+        // Refusing is not the same as making it impossible: a human who
+        // means it can still bring it back, and gets a new live node.
+        let forced = remember(
+            &conn,
+            Remember {
+                text: text.into(),
+                mtype: MemoryType::Note,
+                tags: vec![],
+                project_id: None,
+                force: true,
+            },
+        )
+        .unwrap();
+        let RememberOutcome::Created(revived) = forced else {
+            panic!("--force must override the tombstone");
+        };
+        assert_ne!(revived.id, first.id);
+        assert!(revived.deleted_at.is_none());
+    }
+
+    /// The hash pass alone would miss this: `tokens` keeps trailing
+    /// punctuation attached (so `file.rs` survives), which makes "utc" and
+    /// "utc." different tokens and the two texts different hashes. A
+    /// re-extraction that rewords even slightly is the common case, so the
+    /// guard has to survive it.
+    #[test]
+    fn forgotten_memory_is_not_re_added_under_a_reword() {
+        let conn = db::open_in_memory().unwrap();
+        let first = match remember_text(
+            &conn,
+            "The staging database password rotation is handled by the ops cron at 03:00 UTC",
+        ) {
+            RememberOutcome::Created(n) => n,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        store::soft_delete(&conn, first.id).unwrap();
+        match remember_text(
+            &conn,
+            "the STAGING database password rotation is handled by the ops cron at 03:00 utc.",
+        ) {
+            RememberOutcome::Forgotten(gone) => assert_eq!(gone.id, first.id),
+            other => panic!("expected Forgotten, got {other:?}"),
+        }
+    }
+
+    /// Decay archival is not a decision anyone made. Treating it as one
+    /// would refuse re-learning facts a background job retired while idle,
+    /// and train everyone to pass `--force` by reflex — at which point the
+    /// guard on real deletions stops meaning anything.
+    #[test]
+    fn auto_archived_memory_does_not_block_re_adding() {
+        let conn = db::open_in_memory().unwrap();
+        let text = "cargo nextest needs a separate install on the CI image";
+        let first = match remember_text(&conn, text) {
+            RememberOutcome::Created(n) => n,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        // Exactly what consolidate's decay pass does.
+        conn.execute(
+            "UPDATE node SET deleted_at = 1, meta = json_set(meta, '$.archived', 1) WHERE id = ?1",
+            [first.id],
+        )
+        .unwrap();
+        assert!(
+            matches!(remember_text(&conn, text), RememberOutcome::Created(_)),
+            "decay archival must not masquerade as a deliberate forget"
+        );
+    }
+
+    /// A tombstone must not outrank a live memory: once the fact is back,
+    /// remembering it again is an ordinary duplicate, not a resurrection.
+    #[test]
+    fn live_duplicate_wins_over_an_older_tombstone() {
+        let conn = db::open_in_memory().unwrap();
+        let text = "the proxy strips cache breakpoints above four";
+        let first = match remember_text(&conn, text) {
+            RememberOutcome::Created(n) => n,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        store::soft_delete(&conn, first.id).unwrap();
+        let revived = remember(
+            &conn,
+            Remember {
+                text: text.into(),
+                mtype: MemoryType::Note,
+                tags: vec![],
+                project_id: None,
+                force: true,
+            },
+        )
+        .unwrap();
+        let RememberOutcome::Created(revived) = revived else {
+            panic!("expected Created");
+        };
+        match remember_text(&conn, text) {
+            RememberOutcome::Duplicate(d) => assert_eq!(d.id, revived.id),
             other => panic!("expected Duplicate, got {other:?}"),
         }
     }
