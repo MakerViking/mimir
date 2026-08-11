@@ -1181,6 +1181,12 @@ pub fn recall(
         println!("no results");
         return Ok(());
     }
+    // One lookup for the whole page; see `grounding::stale_ids`.
+    let stale = mimir_core::grounding::stale_ids(
+        &mimir.conn,
+        &hits.iter().map(|h| h.node.id).collect::<Vec<_>>(),
+    )
+    .unwrap_or_default();
     for hit in &hits {
         if json {
             let mut value = node_json(&hit.node, &projects);
@@ -1192,11 +1198,12 @@ pub fn recall(
         } else {
             println!(
                 "{}",
-                line_q(
+                line_with_grounding(
                     &hit.node,
                     &projects,
                     mimir.config.output.snippet_chars,
-                    Some(&query.text)
+                    Some(&query.text),
+                    stale.contains(&hit.node.id)
                 )
             );
         }
@@ -2091,11 +2098,26 @@ fn line_q(
     snippet_chars: usize,
     query: Option<&str>,
 ) -> String {
+    line_with_grounding(node, projects, snippet_chars, query, false)
+}
+
+/// [`line_for_query`] plus the stale-grounding marker. Separate so the many
+/// callers that render a single echoed node (remember, mark, list …) don't
+/// have to run a grounding query they'd almost always get `false` from;
+/// only the recall paths, which already have the whole hit set in hand,
+/// pay for the one batch lookup.
+fn line_with_grounding(
+    node: &Node,
+    projects: &HashMap<i64, String>,
+    snippet_chars: usize,
+    query: Option<&str>,
+    stale: bool,
+) -> String {
     let project = node
         .project_id
         .and_then(|id| projects.get(&id))
         .map(String::as_str);
-    mimir_core::format::agent_line_for_query(node, project, snippet_chars, query)
+    mimir_core::format::agent_line_for_query(node, project, snippet_chars, query, stale)
 }
 
 fn print_full(node: &Node, mimir: &Mimir, projects: &HashMap<i64, String>) -> Result<()> {

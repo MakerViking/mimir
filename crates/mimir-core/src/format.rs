@@ -196,7 +196,7 @@ fn match_window(text: &str, stems: &[String], snippet_chars: usize) -> Option<St
 /// One-line agent format for a node.
 /// `project` is the display name of the node's project, if scoped.
 pub fn agent_line(node: &Node, project: Option<&str>, snippet_chars: usize) -> String {
-    agent_line_for_query(node, project, snippet_chars, None)
+    agent_line_for_query(node, project, snippet_chars, None, false)
 }
 
 /// [`agent_line`], but with the search query in hand so the snippet can be
@@ -219,6 +219,7 @@ pub fn agent_line_for_query(
     project: Option<&str>,
     snippet_chars: usize,
     query: Option<&str>,
+    stale_grounding: bool,
 ) -> String {
     let id = short_uid(node.kind, &node.uid);
     let tag = node.subkind.as_deref().unwrap_or(node.kind.as_str());
@@ -239,7 +240,14 @@ pub fn agent_line_for_query(
         Some(crate::model::MemoryConfidence::Unsure) => " unsure",
         _ => "",
     };
-    let mut line = format!("{id} [{tag}{scope} {date}{uses}{doubt}] {title}");
+    // Same reasoning as `doubt`, and the reason this is worth a parameter
+    // rather than a lookup: recall is where an agent decides what to act
+    // on, and until now a falsified grounding was only visible to whoever
+    // ran `get` on that exact hit afterwards — which, in a recall loop,
+    // is nobody. Costs a word on the hits that have it and nothing on the
+    // rest.
+    let stale = if stale_grounding { " stale-link" } else { "" };
+    let mut line = format!("{id} [{tag}{scope} {date}{uses}{doubt}{stale}] {title}");
     if let Some(body) = node.body.as_deref() {
         let flat = collapse_ws(body);
         let stems = query.map(query_stems).unwrap_or_default();
@@ -491,7 +499,7 @@ mod tests {
             "head truncation should miss the match: {blind}"
         );
 
-        let aware = agent_line_for_query(&node, None, 120, Some("prompt cache breakpoints"));
+        let aware = agent_line_for_query(&node, None, 120, Some("prompt cache breakpoints"), false);
         assert!(
             aware.contains("breakpoints"),
             "snippet should be centred on the match: {aware}"
@@ -503,7 +511,7 @@ mod tests {
     fn query_aware_snippet_falls_back_when_nothing_matches() {
         let node = breadcrumb_chunk();
         assert_eq!(
-            agent_line_for_query(&node, None, 120, Some("kubernetes ingress")),
+            agent_line_for_query(&node, None, 120, Some("kubernetes ingress"), false),
             agent_line(&node, None, 120),
             "a query with no lexical match must not change the line"
         );
@@ -514,7 +522,7 @@ mod tests {
         let node = breadcrumb_chunk();
         // "compress" is inside the head window, which already shows it.
         assert_eq!(
-            agent_line_for_query(&node, None, 120, Some("compress")),
+            agent_line_for_query(&node, None, 120, Some("compress"), false),
             agent_line(&node, None, 120),
         );
     }

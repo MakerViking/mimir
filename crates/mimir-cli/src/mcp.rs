@@ -275,6 +275,8 @@ impl MimirServer {
                 .collect();
             store::record_shown(&m.conn, query_hash.as_bytes(), &shown).map_err(engine_err)?;
             let projects = store::project_titles(&m.conn).map_err(engine_err)?;
+            let ids: Vec<i64> = hits.iter().map(|h| h.node.id).collect();
+            let stale = mimir_core::grounding::stale_ids(&m.conn, &ids).unwrap_or_default();
             let mut out = Vec::new();
             for hit in &hits {
                 let project = hit
@@ -287,6 +289,7 @@ impl MimirServer {
                     project,
                     m.config.output.snippet_chars,
                     Some(&query.text),
+                    stale.contains(&hit.node.id),
                 ));
             }
             Ok(out.join("\n"))

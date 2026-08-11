@@ -45,6 +45,14 @@ the `mimir-mem` crate, and the on-disk schema move together.
   copy of it.
 
 ### Fixed
+- **A stale grounding is now visible on the recall line.** It rendered only
+  in `full_record`, i.e. `get` — so an agent that recalls, reads the ranked
+  lines and acts on the top hits never saw it, which is every agent. The
+  compact line now carries `stale-link` in the bracket, the same one-word
+  treatment `unsure` gets, on affected hits only. Resolved for the whole
+  page in one query (`grounding::stale_ids`) rather than per hit, since
+  recall is a hot path and the marker is usually absent; a test asserts the
+  batch lookup and the per-node one can never disagree.
 - **`mimir remember --link <symbol>` now resolves symbol names.** Both the
   CLI and MCP advertise "a code symbol or node", but the CLI only ever
   called `resolve_ref`, which resolves ids — so linking a memory to
