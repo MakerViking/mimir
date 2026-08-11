@@ -133,6 +133,42 @@ pub fn tally(conn: &Connection) -> Result<(usize, usize, usize)> {
     Ok((grounded, stale, ungrounded))
 }
 
+/// Which of `ids` have a falsified grounding, in one query.
+///
+/// The per-node [`grounding`] call is fine for `get`, which looks at one
+/// record; recall renders a whole page of hits and is explicitly a hot
+/// path, so asking per hit would add a query per result to buy a word that
+/// is usually absent. One `IN` scan instead, over ids we already have.
+///
+/// Ids are `i64` straight from the row, so interpolating them cannot
+/// inject; there is no user-supplied text anywhere in this statement.
+pub fn stale_ids(conn: &Connection, ids: &[i64]) -> Result<std::collections::HashSet<i64>> {
+    if ids.is_empty() {
+        return Ok(std::collections::HashSet::new());
+    }
+    let kinds = GROUNDING_KINDS
+        .iter()
+        .map(|k| format!("'{}'", k.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let list = ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT m.id
+         FROM node m
+         JOIN edge e ON (e.src = m.id OR e.dst = m.id)
+         JOIN node n ON n.id = CASE WHEN e.src = m.id THEN e.dst ELSE e.src END
+         WHERE m.id IN ({list}) AND n.kind IN ({kinds})
+         GROUP BY m.id
+         HAVING MAX(CASE WHEN n.deleted_at IS NULL THEN 1 ELSE 0 END) = 0"
+    ))?;
+    let rows = stmt.query_map([], |r| r.get::<_, i64>(0))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
 /// Every live memory whose grounding has been falsified, newest first.
 pub fn stale_memories(
     conn: &Connection,
@@ -177,6 +213,37 @@ mod tests {
         let mut n = NewNode::new(kind);
         n.title = Some(title.into());
         store::insert_node(conn, n).unwrap().id
+    }
+
+    /// The batch lookup must agree with the per-node one, or recall and
+    /// `get` would disagree about the same memory — the exact split-brain
+    /// that made a `supersedes` edge read like a retirement for six weeks.
+    #[test]
+    fn stale_ids_agrees_with_per_node_grounding() {
+        let conn = db::open_in_memory().unwrap();
+        let ok = memory(&conn, "chunker splits on symbol boundaries");
+        let live = artifact(&conn, Kind::Symbol, "chunk_source");
+        store::link(&conn, ok, live, Rel::About, 1.0).unwrap();
+
+        let broken = memory(&conn, "the old pruner ran on every write");
+        let gone = artifact(&conn, Kind::Symbol, "prune_on_write");
+        store::link(&conn, broken, gone, Rel::About, 1.0).unwrap();
+        store::soft_delete(&conn, gone).unwrap();
+
+        let bare = memory(&conn, "prefer ripgrep over find on this box");
+
+        let ids = vec![ok, broken, bare];
+        let batch = stale_ids(&conn, &ids).unwrap();
+        assert_eq!(batch.len(), 1);
+        assert!(batch.contains(&broken));
+        for id in ids {
+            assert_eq!(
+                batch.contains(&id),
+                grounding(&conn, id).unwrap().is_stale(),
+                "batch and per-node disagree on {id}"
+            );
+        }
+        assert!(stale_ids(&conn, &[]).unwrap().is_empty());
     }
 
     #[test]
