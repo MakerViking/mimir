@@ -205,6 +205,7 @@ mimir graph callers resolve_ref   # who calls this?
 mimir graph impact $(git diff --name-only)   # blast radius of a change
 mimir graph viz --open            # interactive graph map (self-contained HTML)
 mimir link m:ABC123 my_function --rel about  # decisions ↔ code
+mimir link --scan --all-projects  # auto-link memories to symbols they name
 
 # code content (function/method bodies, not just signatures, in recall)
 mimir code add ~/src/myproject --name myproject
@@ -223,6 +224,43 @@ mimir export > backup.jsonl       # everything, always yours
 # agents (Claude Code etc.) — register once, works in every repo
 claude mcp add --scope user mimir -- mimir mcp
 ```
+
+### Grounding: which memories point at real code
+
+A memory linked to an indexed symbol makes a claim Mimir can re-check. When
+the symbol goes away, the link is *falsified* — not the memory, which is
+often still right, but the connection nobody has revisited since the code
+moved. That shows up wherever you meet the memory:
+
+```sh
+mimir grounding                   # 151 grounded, 0 stale, 577 ungrounded
+mimir grounding --stale           # the ones whose target is gone
+```
+
+```
+m:QJ18BM [gotcha pr:mimir 08-11 stale-link] retry_with_backoff doubles the delay …
+```
+
+It is reported, never scored: grounding changes what you can see about a
+memory, not which memories come back. Most memories are legitimately
+ungrounded — a note about a DNS quirk or a person names no code — so treat
+it as a signal on the code-referencing subset, not a number to maximise.
+
+**Grounding only exists if something creates the links.** `--all-projects`
+matters more than it looks: most memories are *global*, and a scan compares
+them against the graph of one project at a time, so scanning only where you
+happen to be standing leaves the rest unlinked. On a real 728-memory store,
+scanning one project moved grounding from 1.4% to 2.6%; scanning all 24 took
+it to 20.7%.
+
+```sh
+mimir graph build                        # in each project you care about
+mimir link --scan --all-projects --dry-run   # see what it would link
+mimir link --scan --all-projects             # ~600 links on a mature store
+```
+
+`mimir doctor` reminds you if you have code graphs and have never scanned,
+and goes quiet once you have.
 
 ### The fast path (recommended setup)
 
