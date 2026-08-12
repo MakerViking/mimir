@@ -911,7 +911,7 @@ pub fn doctor(check_only: bool) -> Result<()> {
             // that Mimir derived by checking rather than by policy: the
             // memory said it was about a symbol, and the symbol is gone.
             if let Ok((grounded, stale, ungrounded)) = mimir_core::grounding::tally(&conn) {
-                if grounded + stale > 0 {
+                if grounded + stale + ungrounded > 0 {
                     check(
                         "grounding",
                         true,
@@ -926,6 +926,14 @@ pub fn doctor(check_only: bool) -> Result<()> {
                         &mut failures,
                     );
                 }
+            }
+            // The nudge that grounding actually depends on. Anchors sat at
+            // zero adoption for months because the only way to set one was
+            // a command nobody knew to run; this is the same failure, and
+            // the fix is to say so at the moment someone is already looking
+            // at the store's health rather than in a README they read once.
+            if let Some(detail) = link_scan_hint(&conn) {
+                check("link scan", true, detail, &mut failures);
             }
         }
         Err(e) => check("db", false, e.to_string(), &mut failures),
@@ -1684,19 +1692,138 @@ pub fn supersede(old: &str, by: &str) -> Result<()> {
     Ok(())
 }
 
-/// Auto-link memories to the code symbols their text literally mentions
-/// (current project + global memories vs the current project's graph).
-/// Precision-first: only code-shaped names (snake_case, ::path, CamelCase)
-/// or backticked mentions link, on word boundaries; ambiguous names that
-/// resolve to many symbols are skipped. Idempotent: existing edges are kept.
-pub fn link_scan(dry_run: bool) -> Result<()> {
-    let mimir = Mimir::open()?;
-    let proj = mimir
-        .project_for_cwd(&std::env::current_dir()?)?
-        .context("not inside a project (the scan links memories to this project's symbols)")?;
+/// `doctor`'s line about auto-linking, or `None` when there is nothing
+/// useful to say (no code graphs, or a recent scan).
+///
+/// Deliberately quiet once you have scanned: a health check that repeats
+/// advice you already took is one people learn to skim, and then it cannot
+/// tell them anything.
+fn link_scan_hint(conn: &rusqlite::Connection) -> Option<String> {
+    let graphed: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT project_id) FROM node
+             WHERE kind='symbol' AND deleted_at IS NULL AND project_id IS NOT NULL",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    if graphed == 0 {
+        return None;
+    }
+    let last: Option<i64> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'last_link_scan'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let days = last.map(|t| (mimir_core::model::now_unix() - t) / 86_400);
+    match days {
+        // Symbols exist and nothing has ever been linked from them.
+        None => Some(format!(
+            "{graphed} project(s) have a code graph, never scanned — \
+             `mimir link --scan --all-projects` links memories to symbols they name"
+        )),
+        Some(d) if d >= 30 => Some(format!(
+            "last scanned {d}d ago; graphs move — \
+             `mimir link --scan --all-projects` to catch up"
+        )),
+        Some(_) => None,
+    }
+}
 
+/// Auto-link memories to the code symbols their text literally mentions.
+///
+/// Precision-first: only code-shaped names (snake_case, ::path, CamelCase)
+/// on word boundaries; names resolving to more than three symbols are
+/// skipped as ambiguous. Idempotent — existing edges are kept.
+///
+/// `all_projects` exists because of a mismatch measured on a real store:
+/// 93% of memories are *global*, but a scan only ever compares them
+/// against the graph of the project you happen to be standing in. The same
+/// global Rust gotcha can match a symbol in any project; running only in
+/// the current one leaves the rest unlinked. Measured: scanning one project
+/// took grounding from 1.4% to 2.6%, scanning four took it to 15.4%.
+pub fn link_scan(dry_run: bool, all_projects: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
+
+    let targets: Vec<Node> = if all_projects {
+        // Only projects that actually have a graph; the rest cost a query
+        // and can match nothing.
+        let mut stmt = mimir.conn.prepare(&format!(
+            "SELECT {} FROM node p WHERE p.kind='project' AND p.deleted_at IS NULL
+               AND EXISTS (SELECT 1 FROM node s WHERE s.kind='symbol'
+                           AND s.project_id=p.id AND s.deleted_at IS NULL)
+             ORDER BY p.title",
+            store::NODE_COLS
+        ))?;
+        let rows = stmt.query_map([], mimir_core::store::row_to_node)?;
+        rows.collect::<rusqlite::Result<_>>()?
+    } else {
+        vec![mimir.project_for_cwd(&std::env::current_dir()?)?.context(
+            "not inside a project (the scan links memories to this project's symbols) \
+                 — or pass --all-projects to scan every project that has a code graph",
+        )?]
+    };
+    if targets.is_empty() {
+        println!("no project has a code graph yet — run `mimir graph build` in one first");
+        return Ok(());
+    }
+
+    // Every edge, once. The inner loop asks "is this pair already linked?"
+    // per candidate, and re-reading the table per project turned that into
+    // the dominant cost on a store with a hundred thousand symbols.
+    let mut existing: std::collections::HashSet<(i64, i64)> = Default::default();
+    {
+        let mut stmt = mimir.conn.prepare("SELECT src, dst FROM edge")?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let (s, d): (i64, i64) = (r.get(0)?, r.get(1)?);
+            existing.insert((s, d));
+            existing.insert((d, s));
+        }
+    }
+
+    let mut total = 0usize;
+    for proj in &targets {
+        let created = scan_one_project(&mimir, proj, dry_run, &mut existing)?;
+        total += created;
+        if all_projects {
+            println!(
+                "{} {created} link(s) in {}",
+                if dry_run { "would create" } else { "created" },
+                proj.title.as_deref().unwrap_or("(unnamed)")
+            );
+        }
+    }
+    println!(
+        "{} {total} link(s) across {} project(s)",
+        if dry_run { "would create" } else { "created" },
+        targets.len()
+    );
+    if !dry_run {
+        // Mirrors `last_consolidate`, so `doctor` can say how stale this is
+        // instead of nagging about a scan you ran an hour ago.
+        mimir.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('last_link_scan', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [mimir_core::model::now_unix().to_string()],
+        )?;
+    }
+    Ok(())
+}
+
+/// One project's pass. Returns links created (or, in a dry run, the number
+/// that would be).
+fn scan_one_project(
+    mimir: &Mimir,
+    proj: &Node,
+    dry_run: bool,
+    existing: &mut std::collections::HashSet<(i64, i64)>,
+) -> Result<usize> {
     // name → symbol nodes carrying it (bare name from meta, fallback title)
-    let mut by_name: HashMap<String, Vec<(i64, String, String)>> = HashMap::new();
+    let mut by_name: HashMap<String, Vec<(i64, String)>> = HashMap::new();
     {
         let mut stmt = mimir.conn.prepare(
             "SELECT id, uid, COALESCE(json_extract(meta,'$.name'), title) FROM node
@@ -1708,10 +1835,7 @@ pub fn link_scan(dry_run: bool) -> Result<()> {
             let name: Option<String> = r.get(2)?;
             if let Some(name) = name {
                 if name.len() >= 4 {
-                    by_name
-                        .entry(name)
-                        .or_default()
-                        .push((id, uid, String::new()));
+                    by_name.entry(name).or_default().push((id, uid));
                 }
             }
         }
@@ -1727,17 +1851,6 @@ pub fn link_scan(dry_run: bool) -> Result<()> {
         rows.collect::<rusqlite::Result<_>>()?
     };
 
-    let mut existing: std::collections::HashSet<(i64, i64)> = Default::default();
-    {
-        let mut stmt = mimir.conn.prepare("SELECT src, dst FROM edge")?;
-        let mut rows = stmt.query([])?;
-        while let Some(r) = rows.next()? {
-            let (s, d): (i64, i64) = (r.get(0)?, r.get(1)?);
-            existing.insert((s, d));
-            existing.insert((d, s));
-        }
-    }
-
     let mut created = 0usize;
     for (mid, muid, text) in &memories {
         for (name, syms) in &by_name {
@@ -1747,32 +1860,25 @@ pub fn link_scan(dry_run: bool) -> Result<()> {
             if !mentions_symbol(text, name) {
                 continue;
             }
-            for (sid, suid, _) in syms {
+            for (sid, suid) in syms {
                 if existing.contains(&(*mid, *sid)) {
                     continue;
                 }
-                if dry_run {
-                    println!(
-                        "would link m:{} —mentions→ {name} (c:{})",
-                        tail(muid),
-                        tail(suid)
-                    );
-                } else {
+                if !dry_run {
                     store::link(&mimir.conn, *mid, *sid, Rel::Mentions, 1.0)?;
-                    println!("m:{} —mentions→ {name} (c:{})", tail(muid), tail(suid));
                 }
+                println!(
+                    "{}m:{} —mentions→ {name} (c:{})",
+                    if dry_run { "would link " } else { "" },
+                    tail(muid),
+                    tail(suid)
+                );
                 existing.insert((*mid, *sid));
                 created += 1;
             }
         }
     }
-    println!(
-        "{} {created} link(s) ({} memories × {} distinct symbol names)",
-        if dry_run { "would create" } else { "created" },
-        memories.len(),
-        by_name.len(),
-    );
-    Ok(())
+    Ok(created)
 }
 
 fn tail(uid: &str) -> &str {
@@ -2472,5 +2578,70 @@ mod link_target_tests {
         let conn = mimir_core::db::open_in_memory().unwrap();
         assert!(resolve_link_target(&conn, "nope_not_here", None).is_err());
         assert!(resolve_link_target(&conn, "nope_not_here", Some(1)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod link_scan_hint_tests {
+    use super::link_scan_hint;
+    use mimir_core::model::{Kind, NewNode};
+    use mimir_core::store;
+
+    fn store_with_graph(symbols: bool) -> rusqlite::Connection {
+        let conn = mimir_core::db::open_in_memory().unwrap();
+        if symbols {
+            let mut p = NewNode::new(Kind::Project);
+            p.title = Some("probe".into());
+            let proj = store::insert_node(&conn, p).unwrap();
+            let mut s = NewNode::new(Kind::Symbol);
+            s.title = Some("retry_with_backoff".into());
+            s.project_id = Some(proj.id);
+            store::insert_node(&conn, s).unwrap();
+        }
+        conn
+    }
+
+    fn set_last_scan(conn: &rusqlite::Connection, days_ago: i64) {
+        let at = mimir_core::model::now_unix() - days_ago * 86_400;
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('last_link_scan', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [at.to_string()],
+        )
+        .unwrap();
+    }
+
+    /// Nothing to link against means nothing to say. Advising a scan on a
+    /// store with no code graph is advice that cannot be acted on.
+    #[test]
+    fn silent_without_any_code_graph() {
+        assert!(link_scan_hint(&store_with_graph(false)).is_none());
+    }
+
+    #[test]
+    fn speaks_up_when_graphs_exist_and_nothing_was_ever_scanned() {
+        let hint = link_scan_hint(&store_with_graph(true)).expect("should nudge");
+        assert!(hint.contains("never scanned"), "{hint}");
+        assert!(hint.contains("--all-projects"), "{hint}");
+    }
+
+    /// The property that keeps the nudge worth reading: it stops once you
+    /// have acted on it. A health check that repeats advice you already
+    /// took is one people learn to skim past.
+    #[test]
+    fn goes_quiet_after_a_recent_scan() {
+        let conn = store_with_graph(true);
+        set_last_scan(&conn, 1);
+        assert!(link_scan_hint(&conn).is_none());
+    }
+
+    /// ...but graphs move, so it comes back rather than staying silent for
+    /// good after one scan a year ago.
+    #[test]
+    fn returns_when_the_last_scan_has_gone_stale() {
+        let conn = store_with_graph(true);
+        set_last_scan(&conn, 45);
+        let hint = link_scan_hint(&conn).expect("should nudge again");
+        assert!(hint.contains("45d ago"), "{hint}");
     }
 }

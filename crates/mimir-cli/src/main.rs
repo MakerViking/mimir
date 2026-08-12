@@ -283,6 +283,12 @@ enum Command {
         /// With --scan: show what would be linked without writing.
         #[arg(long)]
         dry_run: bool,
+        /// With --scan: scan every project that has a code graph, not just
+        /// the current one. Global memories (most of them) can match
+        /// symbols in any project, so scanning one at a time leaves the
+        /// rest unlinked.
+        #[arg(long)]
+        all_projects: bool,
     },
     /// Manage docs collections.
     Docs {
@@ -824,11 +830,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             rel,
             scan,
             dry_run,
+            all_projects,
         } => match (scan, a, b) {
-            (true, _, _) => commands::link_scan(dry_run),
+            (true, _, _) => commands::link_scan(dry_run, all_projects),
             (false, Some(a), Some(b)) => commands::link(&a, &b, &rel),
             _ => anyhow::bail!(
-                "usage: mimir link <A> <B> [--rel REL]  |  mimir link --scan [--dry-run]"
+                "usage: mimir link <A> <B> [--rel REL]  |  \
+                 mimir link --scan [--all-projects] [--dry-run]"
             ),
         },
         Command::Docs { cmd } => match cmd {

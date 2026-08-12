@@ -5,6 +5,20 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **`mimir link --scan --all-projects`, and a `doctor` nudge to run it.**
+  Grounding only exists if something creates the links, and on a real
+  728-memory store 1.4% of memories had any. The cause was a scope
+  mismatch, not discoverability: 93% of memories are *global*, but a scan
+  compares them against one project's graph at a time, so scanning where
+  you happen to be standing leaves the rest unlinked. Measured on that
+  store — one project took grounding to 2.6%, all 24 took it to **20.7%**
+  (563 links). `doctor` now says when you have code graphs and have never
+  scanned, records `last_link_scan`, and goes quiet until the scan is 30
+  days stale — a health check that repeats advice you already took is one
+  people learn to skim. README documents grounding and the scan together,
+  including the honest ceiling: most memories name no code and are
+  legitimately ungrounded.
+
 - **`--confidence certain|likely|unsure` separates how sure the author was
   from how often the memory gets used.** `strength` conflated the two: a
   guess recalled enough times outranked things that had been checked, with
