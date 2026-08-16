@@ -4,6 +4,23 @@ All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
+### Fixed
+- **`mimir mcp` no longer outlives the client that spawned it.** Fourteen
+  orphaned stdio servers had accumulated on one machine, the oldest fourteen
+  days old, ~2.9 GB resident between them, every one holding the SQLite
+  database open. The EOF handling was never at fault — rmcp returns `None` on
+  a zero-length read and the process exits in 0.3 s when stdin closes. The
+  EOF simply never arrived: MCP stdio is an `AF_UNIX` **socketpair**, not a
+  pipe, and a socketpair delivers EOF only once *every* descriptor for the
+  peer end is closed, so any unrelated process that inherited it pins the
+  server open forever. The trigger therefore cannot be a descriptor:
+  `PR_SET_PDEATHSIG` (Linux) plus a `getppid()` poll (macOS, and to close the
+  arming race) now end the process when its parent does, and SIGTERM/SIGHUP
+  route through the same path — cancel the service, drain in flight, drop the
+  engine and its database handle. `--http` is untouched: `mimir daemon` has
+  its own lifetime and arms none of this.
+
+## [Unreleased]
 ### Added
 - **`mimir link --scan --all-projects`, and a `doctor` nudge to run it.**
   Grounding only exists if something creates the links, and on a real

@@ -1236,3 +1236,139 @@ fn session_brief_fires_suppresses_and_respects_kill_switch() {
     let preview = h.ok(&["brief"]);
     assert!(preview.contains("candidates (score desc"), "{preview}");
 }
+
+/// Shutdown of the stdio server (`mimir mcp`).
+///
+/// These exist because fourteen orphaned servers accumulated on a real
+/// machine, the oldest fourteen days old, each holding the SQLite database
+/// open. The EOF path was never the bug — it works, and the first test here
+/// pins that — so a fix that only hardened EOF handling would have changed
+/// nothing. The other two cover the ways the client can vanish *without*
+/// producing an EOF.
+#[cfg(unix)]
+mod shutdown {
+    use super::*;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    /// Poll for exit rather than `wait()`, so a hang fails the test instead
+    /// of hanging the suite.
+    fn exits_within(child: &mut std::process::Child, secs: u64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        while Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        false
+    }
+
+    fn spawn_server(h: &Harness) -> std::process::Child {
+        Command::new(env!("CARGO_BIN_EXE_mimir"))
+            .arg("mcp")
+            .env("MIMIR_HOME", h.home.path())
+            .env("HOME", h.home.path())
+            .current_dir(h.cwd.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawns")
+    }
+
+    #[test]
+    fn exits_when_stdin_closes() {
+        let h = Harness::new();
+        h.ok(&["init", "--no-model"]);
+        let mut child = spawn_server(&h);
+        drop(child.stdin.take()); // client closed the pipe
+        assert!(
+            exits_within(&mut child, 10),
+            "server outlived its stdin closing"
+        );
+    }
+
+    /// The client is gone but something else still holds the descriptor, so
+    /// no EOF is ever delivered. Before the parent-death watchdog this ran
+    /// forever.
+    ///
+    /// `sh` spawns the server and exits immediately, which reparents it
+    /// exactly as a departing client does — after staying alive for a few
+    /// seconds first, which is the real shape of the bug: a client serves a
+    /// session and *then* exits. (A parent that dies during the server's own
+    /// startup is a genuine residual gap, documented on `watch_for_shutdown`;
+    /// it is a millisecond-wide window and not what produced the orphans.)
+    /// The server's stdin stays the pipe
+    /// whose write end this test holds for the whole run, so EOF cannot be
+    /// what ends it; the pid goes through a file rather than stdout, because
+    /// the server inherits `sh`'s stdout and reading that to EOF would block
+    /// until the server had already exited — which silently made an earlier
+    /// version of this test pass against the unfixed binary.
+    #[test]
+    fn exits_when_the_parent_dies_without_eof() {
+        let h = Harness::new();
+        h.ok(&["init", "--no-model"]);
+        let pidfile = h.cwd.path().join("server.pid");
+        let mut launcher = Command::new("sh")
+            .arg("-c")
+            // `exec 3<&0` then `<&3`: a non-interactive shell redirects a
+            // background job's stdin from /dev/null, which would hand the
+            // server an instant EOF and make this test pass against an
+            // unfixed binary. Duplicating the descriptor defeats that.
+            .arg(format!(
+                "exec 3<&0; {} mcp <&3 >/dev/null 2>&1 & echo $! > {}; sleep 4",
+                env!("CARGO_BIN_EXE_mimir"),
+                pidfile.display()
+            ))
+            .env("MIMIR_HOME", h.home.path())
+            .env("HOME", h.home.path())
+            .current_dir(h.cwd.path())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawns");
+        let stdin_holder = launcher.stdin.take().expect("piped"); // held open
+        launcher.wait().unwrap(); // sh exits; the server is reparented
+
+        let pid: i32 = std::fs::read_to_string(&pidfile)
+            .expect("pidfile")
+            .trim()
+            .parse()
+            .expect("pid");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut gone = false;
+        while Instant::now() < deadline {
+            // signal 0 probes liveness without delivering anything
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        drop(stdin_holder);
+        if !gone {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
+        }
+        assert!(gone, "server survived its parent with stdin still open");
+    }
+
+    #[test]
+    fn exits_on_sigterm() {
+        let h = Harness::new();
+        h.ok(&["init", "--no-model"]);
+        let mut child = spawn_server(&h);
+        let _stdin = child.stdin.take(); // keep it open: no EOF
+        std::thread::sleep(Duration::from_millis(500));
+        unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        assert!(
+            exits_within(&mut child, 10),
+            "server ignored SIGTERM — installing a handler removed the \
+             default action, so this must work"
+        );
+    }
+}
