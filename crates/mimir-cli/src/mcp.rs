@@ -1058,14 +1058,149 @@ pub fn run(
                 if !daemon_alive {
                     eager_load_reranker_if_auto(&mut engine);
                 }
+                // Armed BEFORE `serve`, which awaits the MCP `initialize`
+                // handshake and therefore blocks indefinitely against a client
+                // that spawns the server and dies without ever initializing —
+                // an orphan window that arming afterwards cannot see. Stdio
+                // only: the HTTP path is a daemon with its own lifetime.
+                #[cfg(unix)]
+                arm_shutdown_watchdog();
                 let service = MimirServer::new(engine, project_id)
                     .serve(rmcp::transport::stdio())
                     .await?;
+                #[cfg(unix)]
+                register_shutdown_token(service.cancellation_token());
                 service.waiting().await?;
                 Ok(())
             }
         }
     })
+}
+
+/// The parent pid as it was at process start.
+///
+/// Captured in `main`, microseconds after exec, and deliberately not where
+/// it is used. The stdio server spends a second or two loading models before
+/// it starts serving, and a client that exits during that window is already
+/// gone by then — a ppid read taken at that point returns the *reaper*, which
+/// then compares equal to itself forever and the watchdog never fires. That
+/// is not hypothetical: it is what the first version of this did, and the
+/// regression test caught it.
+#[cfg(unix)]
+static PARENT_AT_START: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Record the parent pid. Call once, as early in `main` as possible.
+#[cfg(unix)]
+pub fn record_parent_pid() {
+    PARENT_AT_START.store(
+        unsafe { libc::getppid() },
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+/// Set by the SIGTERM/SIGHUP handler. A relaxed store is the whole handler
+/// body on purpose — it is the only thing here that is async-signal-safe.
+#[cfg(unix)]
+static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn note_shutdown(_sig: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Exit when the client goes away, for the cases where stdin EOF never comes.
+///
+/// The stdio server's EOF handling is correct and needs no help: rmcp's
+/// transport returns `None` on a zero-length read and the service task ends.
+/// The problem is that the EOF can simply never arrive. Claude Code wires MCP
+/// stdio over an `AF_UNIX` **socketpair**, not a pipe, and a socketpair
+/// delivers EOF only once *every* descriptor for the peer end is closed. Any
+/// unrelated process that inherited that descriptor — a background command,
+/// another server spawned by the same client — pins it open, so when the
+/// client exits the kernel delivers nothing at all and the reader blocks
+/// forever. Measured before this existed: fourteen orphans, the oldest
+/// fourteen days old, ~2.9 GB resident between them, each holding the SQLite
+/// database open.
+///
+/// So the trigger cannot be a descriptor. It has to be the parent dying:
+///
+/// * `PR_SET_PDEATHSIG` (Linux) has the kernel send us SIGTERM the moment the
+///   parent does, regardless of who else holds the socket.
+/// * A `getppid()` poll covers macOS, which has no equivalent, and closes the
+///   race where the parent died in the window *before* `prctl` ran — that
+///   signal is never sent, so nothing but a check would catch it.
+///
+/// The poll compares against the ppid captured at startup rather than testing
+/// for `1`, because a server legitimately started by pid 1 would otherwise
+/// shut itself down immediately.
+///
+/// Cancelling the token ends the service task, which resolves the `waiting()`
+/// the caller is already parked on, so shutdown runs through exactly the same
+/// path as a clean EOF: in-flight work finishes, the transport closes, the
+/// engine drops and with it the database handle.
+/// Where `arm_shutdown_watchdog` finds the token once there is one. Empty
+/// until the handshake completes.
+#[cfg(unix)]
+static SHUTDOWN_TOKEN: std::sync::Mutex<Option<rmcp::service::RunningServiceCancellationToken>> =
+    std::sync::Mutex::new(None);
+
+/// Hand the watchdog a way to shut the service down gracefully. Before this,
+/// it can only exit the process — which is correct, because before the
+/// handshake there is no service to drain.
+#[cfg(unix)]
+fn register_shutdown_token(token: rmcp::service::RunningServiceCancellationToken) {
+    *SHUTDOWN_TOKEN.lock().unwrap() = Some(token);
+}
+
+#[cfg(unix)]
+fn arm_shutdown_watchdog() {
+    use std::sync::atomic::Ordering;
+
+    #[cfg(target_os = "linux")]
+    // SAFETY: prctl with PR_SET_PDEATHSIG only sets this process's
+    // parent-death signal; it touches no memory we own.
+    unsafe {
+        libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+    }
+
+    let handler = note_shutdown as extern "C" fn(libc::c_int);
+    // SAFETY: installing a handler whose body is a single relaxed atomic
+    // store, which is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGTERM, handler as libc::sighandler_t);
+        libc::signal(libc::SIGHUP, handler as libc::sighandler_t);
+    }
+
+    // Recorded in `main`, not here — see PARENT_AT_START. A zero means the
+    // recorder was never called; treat that as "cannot tell" and rely on the
+    // signal paths rather than shutting down on a bogus comparison.
+    let parent_at_start = PARENT_AT_START.load(Ordering::Relaxed);
+
+    std::thread::spawn(move || {
+        loop {
+            if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+                break;
+            }
+            if parent_at_start != 0 && unsafe { libc::getppid() } != parent_at_start {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        // A token exists only after the handshake. Before that there is no
+        // service, no in-flight request and nothing to drain, so exiting is
+        // the whole of a correct shutdown.
+        match SHUTDOWN_TOKEN.lock().unwrap().take() {
+            Some(token) => token.cancel(),
+            None => std::process::exit(0),
+        }
+        // Backstop. Installing a SIGTERM handler means the default "die now"
+        // action is gone, so a wedged shutdown would leave a process that
+        // ignores SIGTERM — strictly worse than the orphan this fixes. Give
+        // the graceful path time to finish, then leave anyway.
+        std::thread::sleep(std::time::Duration::from_secs(10));
+        std::process::exit(0);
+    });
 }
 
 /// Serve the same MCP tools over Streamable-HTTP for remote clients reached

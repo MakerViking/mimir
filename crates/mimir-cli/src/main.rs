@@ -661,6 +661,12 @@ fn main() {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
+    // Before anything slow. The stdio MCP server uses this to notice that the
+    // client that spawned it has died; read any later and a client that exits
+    // during startup is already gone, leaving nothing to compare against.
+    #[cfg(unix)]
+    mcp::record_parent_pid();
+
     // Windows hands the main thread a 1 MiB stack (Linux/macOS give 8).
     // clap's derived builder for our ~50 subcommands needs more than that
     // in debug builds, so `mimir --version` aborted with a stack overflow
