@@ -94,6 +94,37 @@ str_enum!(MemoryConfidence {
     Unsure => "unsure",
 });
 
+// Who performed a mutation. Threaded explicitly to the store functions that
+// change a memory rather than read from ambient state, because an audit whose
+// actor can be silently wrong is worse than no audit — the same argument
+// `MemoryConfidence` makes for refusing to infer a level nobody declared.
+//
+// `System` is a background pass (consolidation's decay, an indexer, a graph
+// rebuild). `Sync` is a change that arrived from another install, where the
+// actor is whoever acted on the machine it came from — recorded here as the
+// transport, since this store cannot know more than that.
+str_enum!(Actor {
+    Human => "human",
+    Agent => "agent",
+    System => "system",
+    Sync => "sync",
+});
+
+// What was done. A closed set: an open one drifts into free text, and then
+// nothing can be counted.
+str_enum!(MutationOp {
+    Create => "create",
+    Edit => "edit",
+    Supersede => "supersede",
+    Forget => "forget",
+    Archive => "archive",
+    HardDelete => "hard_delete",
+    Reproject => "reproject",
+    Pin => "pin",
+    Unpin => "unpin",
+    Restore => "restore",
+});
+
 str_enum!(Rel {
     Links => "links",
     Mentions => "mentions",

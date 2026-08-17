@@ -234,6 +234,7 @@ fn capture(
             tags: vec![],
             project_id,
             force: true,
+            actor: crate::model::Actor::System,
         },
     )? {
         RememberOutcome::Created(n) => n,
@@ -328,7 +329,7 @@ impl StoreFixture {
                     Some(proj.id),
                 )?;
                 backdate(&conn, old, 60, now)?;
-                store::set_superseded(&conn, old, new)?;
+                store::set_superseded(&conn, old, new, crate::model::Actor::System, None)?;
                 let deleted = capture(
                     &conn,
                     &mut ids,
@@ -338,7 +339,7 @@ impl StoreFixture {
                     MemoryType::Gotcha,
                     Some(proj.id),
                 )?;
-                store::soft_delete(&conn, deleted)?;
+                store::soft_delete(&conn, deleted, crate::model::Actor::System, None)?;
                 let dup = capture(
                     &conn,
                     &mut ids,
@@ -396,7 +397,7 @@ impl StoreFixture {
                     MemoryType::Gotcha,
                     None,
                 )?;
-                store::set_pinned(&conn, pinned, true)?;
+                store::set_pinned(&conn, pinned, true, crate::model::Actor::System, None)?;
                 backdate(&conn, pinned, 60, now)?;
                 // Verbatim the BookForge dogfood label: this global (from
                 // another project's world) must never be BookForge filler.
@@ -424,7 +425,7 @@ impl StoreFixture {
                     // (pin bypasses the gate) — remove it so this store
                     // isolates the "no signal ⇒ no globals" label.
                     let id = ids["bf_pin_force_push"];
-                    store::soft_delete(&conn, id)?;
+                    store::soft_delete(&conn, id, crate::model::Actor::System, None)?;
                     ids.remove("bf_pin_force_push");
                 }
                 (scope, None)
@@ -439,7 +440,7 @@ impl StoreFixture {
                     MemoryType::Gotcha,
                     None,
                 )?;
-                store::set_pinned(&conn, pinned, true)?;
+                store::set_pinned(&conn, pinned, true, crate::model::Actor::System, None)?;
                 set_strength(&conn, pinned, 2.0)?;
                 capture(
                     &conn,

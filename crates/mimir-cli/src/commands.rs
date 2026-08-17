@@ -1069,6 +1069,7 @@ pub fn remember(
             tags,
             project_id: project.as_ref().map(|p| p.id),
             force,
+            actor: mimir_core::model::Actor::Human,
         },
     )?;
     let projects = store::project_titles(&mimir.conn)?;
@@ -1487,6 +1488,66 @@ pub fn refusals(limit: usize) -> Result<()> {
     Ok(())
 }
 
+/// What was done to memories, and by whom. Reads the mutation ledger.
+///
+/// Prints hashes as short prefixes rather than in full: the point of the
+/// column is to tell two values apart and to match one you already hold, and
+/// 64 hex characters per row would make the table unreadable while adding
+/// nothing a `mimir audit --json` consumer can't get.
+pub fn audit(reference: Option<&str>, limit: usize, json: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let rows = match reference {
+        Some(r) => {
+            let node = store::resolve_ref_including_deleted(&mimir.conn, r)?;
+            mimir_core::audit::history(&mimir.conn, node.id)?
+        }
+        None => mimir_core::audit::recent(&mimir.conn, limit)?,
+    };
+    if rows.is_empty() {
+        println!("nothing recorded");
+        return Ok(());
+    }
+    if json {
+        for m in &rows {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "at": m.at,
+                    "node_id": m.node_id,
+                    "op": m.op.as_str(),
+                    "actor": m.actor.as_str(),
+                    "reason": m.reason,
+                    "before_hash": m.before_hash.as_deref().map(mimir_core::format::hex),
+                    "after_hash": m.after_hash.as_deref().map(mimir_core::format::hex),
+                })
+            );
+        }
+        return Ok(());
+    }
+    println!(
+        "{:<12} {:<10} {:<7} {:<10} why",
+        "when", "op", "actor", "value"
+    );
+    for m in &rows {
+        println!(
+            "{:<12} {:<10} {:<7} {:<10} {}",
+            mimir_core::format::full_date(m.at),
+            m.op.as_str(),
+            m.actor.as_str(),
+            m.before_hash
+                .as_ref()
+                .map(|h| mimir_core::format::hex(&h[..4]))
+                .unwrap_or_else(|| "-".into()),
+            m.reason.as_deref().unwrap_or("")
+        );
+    }
+    println!(
+        "\nthe `value` column is a hash prefix, not the text — a record of a \
+         deletion that quotes what was deleted is a second copy of it."
+    );
+    Ok(())
+}
+
 pub fn consolidate(dry_run: bool) -> Result<()> {
     let mimir = Mimir::open()?;
     let report =
@@ -1518,13 +1579,14 @@ fn print_consolidate_report(report: &mimir_core::consolidate::Report, dry_run: b
     }
 }
 
-pub fn forget(reference: &str, hard: bool) -> Result<()> {
+pub fn forget(reference: &str, hard: bool, reason: Option<&str>) -> Result<()> {
     let mimir = Mimir::open()?;
     let node = store::resolve_ref(&mimir.conn, reference)?;
+    let actor = mimir_core::model::Actor::Human;
     if hard {
-        store::hard_delete(&mimir.conn, node.id)?;
+        store::hard_delete(&mimir.conn, node.id, actor, reason)?;
     } else {
-        store::soft_delete(&mimir.conn, node.id)?;
+        store::soft_delete(&mimir.conn, node.id, actor, reason)?;
     }
     println!(
         "forgot {} {}{}",
@@ -1577,9 +1639,21 @@ pub fn edit(
         bail!("nothing to change: pass TEXT, --title, --type, --tags, or --pin/--unpin");
     }
     if let Some(pin) = pin {
-        store::set_pinned(&mimir.conn, node.id, pin)?;
+        store::set_pinned(
+            &mimir.conn,
+            node.id,
+            pin,
+            mimir_core::model::Actor::Human,
+            None,
+        )?;
     }
-    let updated = memory::edit(&mimir.conn, node.id, edit)?;
+    let updated = memory::edit(
+        &mimir.conn,
+        node.id,
+        edit,
+        mimir_core::model::Actor::Human,
+        None,
+    )?;
     let projects = store::project_titles(&mimir.conn)?;
     if json {
         println!("{}", node_json(&updated, &projects));
@@ -1617,7 +1691,13 @@ pub fn reproject(json: bool, reference: &str, project: Option<String>, global: b
         }
         None => None, // --global
     };
-    store::reproject(&mimir.conn, &node, target)?;
+    store::reproject(
+        &mimir.conn,
+        &node,
+        target,
+        mimir_core::model::Actor::Human,
+        None,
+    )?;
     let updated = store::get_node(&mimir.conn, node.id)?;
     let projects = store::project_titles(&mimir.conn)?;
     if json {
@@ -1678,11 +1758,17 @@ pub fn anchor(reference: &str, patterns: Vec<String>) -> Result<()> {
 
 /// Mark OLD as superseded by NEW: OLD stops surfacing in recall (kept as
 /// history) and a `supersedes` edge is recorded.
-pub fn supersede(old: &str, by: &str) -> Result<()> {
+pub fn supersede(old: &str, by: &str, reason: Option<&str>) -> Result<()> {
     let mimir = Mimir::open()?;
     let old = resolve_any(&mimir, old)?;
     let new = resolve_any(&mimir, by)?;
-    store::set_superseded(&mimir.conn, old.id, new.id)?;
+    store::set_superseded(
+        &mimir.conn,
+        old.id,
+        new.id,
+        mimir_core::model::Actor::Human,
+        reason,
+    )?;
     store::link(&mimir.conn, new.id, old.id, Rel::Supersedes, 1.0)?;
     println!(
         "{} superseded by {}",

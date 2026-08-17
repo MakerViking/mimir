@@ -98,6 +98,7 @@ mod tests {
                 tags: vec![],
                 project_id: None,
                 force: true,
+                actor: mimir_core::model::Actor::System,
             },
         )
         .unwrap();
@@ -130,7 +131,8 @@ mod tests {
             .conn
             .query_row("SELECT id FROM node WHERE kind='memory'", [], |r| r.get(0))
             .unwrap();
-        mimir_core::store::soft_delete(&a.conn, id).unwrap();
+        mimir_core::store::soft_delete(&a.conn, id, mimir_core::model::Actor::System, None)
+            .unwrap();
         sync(&mut a, &shared).unwrap();
         sync(&mut b, &shared).unwrap();
         assert_eq!(live_count(&b), 0, "delete propagated");

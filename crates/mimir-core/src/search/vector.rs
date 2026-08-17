@@ -319,7 +319,7 @@ mod tests {
 
         // Fresh cache after a delete excludes the deleted node. (With a
         // stale cache the leg may still return it; fusion filters those.)
-        store::soft_delete(&conn, a).unwrap();
+        store::soft_delete(&conn, a, crate::model::Actor::System, None).unwrap();
         cache = None;
         let ids = leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &q(), 10).unwrap();
         assert_eq!(ids, vec![b]);

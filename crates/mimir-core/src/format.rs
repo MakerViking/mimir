@@ -43,6 +43,18 @@ pub fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Lowercase hex. Used for content hashes on the wire (`replicate`) and in
+/// the mutation ledger's rendering, where the hash stands in for a value the
+/// store deliberately does not keep.
+pub fn hex(b: &[u8]) -> String {
+    use std::fmt::Write;
+    b.iter()
+        .fold(String::with_capacity(b.len() * 2), |mut s, byte| {
+            let _ = write!(s, "{byte:02x}");
+            s
+        })
+}
+
 pub fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -351,6 +363,25 @@ pub fn full_record(
                  (the note may still be right; nothing has revisited it since)",
                 kind.as_str()
             ));
+        }
+        // What was done to it. Only the changes, never the creation — the
+        // row already says when it was written and what it says. A memory
+        // nobody has touched prints nothing, which is the common case.
+        let changes = crate::audit::history(conn, node.id).unwrap_or_default();
+        if !changes.is_empty() {
+            out.push_str("\nhistory:");
+            for m in &changes {
+                out.push_str(&format!(
+                    "\n  {} {} by {}{}",
+                    full_date(m.at),
+                    m.op.as_str(),
+                    m.actor.as_str(),
+                    m.reason
+                        .as_deref()
+                        .map(|r| format!(" — {r}"))
+                        .unwrap_or_default()
+                ));
+            }
         }
     }
     Ok(out)

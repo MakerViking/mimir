@@ -77,7 +77,13 @@ pub fn set(text_parts: Vec<String>) -> Result<()> {
         new.project_id = Some(proj.id);
         new.tags = vec![RULES_TAG.into()];
         let node = store::insert_node(&mimir.conn, new)?;
-        store::set_pinned(&mimir.conn, node.id, true)?;
+        store::set_pinned(
+            &mimir.conn,
+            node.id,
+            true,
+            mimir_core::model::Actor::Human,
+            Some("rules pack"),
+        )?;
         println!(
             "stored rules pack for {proj_name} ({} chars) — pinned",
             text.len()
@@ -118,7 +124,12 @@ pub fn clear() -> Result<()> {
     let proj = project(&mimir)?;
     match find_rules(&mimir.conn, proj.id)? {
         Some(node) => {
-            store::soft_delete(&mimir.conn, node.id)?;
+            store::soft_delete(
+                &mimir.conn,
+                node.id,
+                mimir_core::model::Actor::Human,
+                Some("mimir rules clear"),
+            )?;
             println!(
                 "cleared rules pack for {}",
                 proj.title.as_deref().unwrap_or("project")
@@ -152,7 +163,14 @@ mod tests {
         new.project_id = Some(proj.id);
         new.tags = vec![RULES_TAG.into()];
         let node = store::insert_node(&mimir.conn, new).unwrap();
-        store::set_pinned(&mimir.conn, node.id, true).unwrap();
+        store::set_pinned(
+            &mimir.conn,
+            node.id,
+            true,
+            mimir_core::model::Actor::Human,
+            None,
+        )
+        .unwrap();
 
         let found = find_rules(&mimir.conn, proj.id).unwrap().unwrap();
         assert!(found.pinned);

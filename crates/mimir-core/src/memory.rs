@@ -44,11 +44,13 @@ pub struct Remember {
     pub tags: Vec<String>,
     pub project_id: Option<i64>,
     pub force: bool,
+    pub actor: crate::model::Actor,
 }
 
 /// Store a memory unless an exact or near duplicate already exists.
 pub fn remember(conn: &Connection, args: Remember) -> Result<RememberOutcome> {
     let hash = content_hash(&args.text);
+    let mut revived = false;
     if !args.force {
         // Precedence matters. An exact *live* copy is an ordinary duplicate
         // even when an older tombstone of the same text also exists — that
@@ -66,6 +68,13 @@ pub fn remember(conn: &Connection, args: Remember) -> Result<RememberOutcome> {
         if let Some(dup) = find_near_duplicate(conn, &args.text)? {
             return Ok(RememberOutcome::Duplicate(dup));
         }
+    } else {
+        // Forcing past a tombstone is the one creation worth recording.
+        // Ordinary capture needs no ledger row — `created_at` says when and
+        // the text is right there — but bringing back something a person
+        // deliberately deleted is a decision, and the deletion it reverses
+        // is already in the ledger above it.
+        revived = find_forgotten(conn, &args.text, &hash)?.is_some();
     }
     let mut new = NewNode::new(Kind::Memory);
     new.subkind = Some(args.mtype.to_string());
@@ -73,8 +82,21 @@ pub fn remember(conn: &Connection, args: Remember) -> Result<RememberOutcome> {
     new.body = Some(args.text);
     new.tags = sanitize_tags(args.tags);
     new.project_id = args.project_id;
-    new.content_hash = Some(hash);
-    Ok(RememberOutcome::Created(store::insert_node(conn, new)?))
+    new.content_hash = Some(hash.clone());
+    let node = store::insert_node(conn, new)?;
+    if revived {
+        crate::audit::record_for_kind(
+            conn,
+            Kind::Memory,
+            node.id,
+            crate::model::MutationOp::Restore,
+            args.actor,
+            Some("--force over a deliberate tombstone"),
+            None,
+            Some(&hash),
+        );
+    }
+    Ok(RememberOutcome::Created(node))
 }
 
 /// Tags surface as nodes in the graph visualization (HTML). Strip the
@@ -355,8 +377,20 @@ pub struct Edit {
 
 /// Apply field edits to an existing node; body edits refresh the derived
 /// title (unless one is given) and the content hash.
-pub fn edit(conn: &Connection, id: i64, edit: Edit) -> Result<Node> {
+///
+/// `actor`/`reason` go to the mutation ledger. An edit is the one mutation
+/// that changes what a memory *says* while leaving it live, so the pair of
+/// hashes it records is the only evidence that the text ever read differently.
+pub fn edit(
+    conn: &Connection,
+    id: i64,
+    edit: Edit,
+    actor: crate::model::Actor,
+    reason: Option<&str>,
+) -> Result<Node> {
     let node = store::get_node(conn, id)?;
+    let before = node.content_hash.clone();
+    let kind = node.kind;
     let body = edit.text.or(node.body);
     let title = match edit.title {
         Some(t) => Some(t),
@@ -382,6 +416,16 @@ pub fn edit(conn: &Connection, id: i64, edit: Edit) -> Result<Node> {
             crate::model::now_unix()
         ],
     )?;
+    crate::audit::record_for_kind(
+        conn,
+        kind,
+        id,
+        crate::model::MutationOp::Edit,
+        actor,
+        reason,
+        before.as_deref(),
+        hash.as_deref(),
+    );
     store::get_node(conn, id)
 }
 
@@ -465,6 +509,7 @@ mod tests {
                 tags: vec![],
                 project_id: None,
                 force: false,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap()
@@ -498,7 +543,7 @@ mod tests {
             RememberOutcome::Created(n) => n,
             other => panic!("expected Created, got {other:?}"),
         };
-        store::soft_delete(&conn, first.id).unwrap();
+        store::soft_delete(&conn, first.id, crate::model::Actor::System, None).unwrap();
 
         // Same fact, reformatted the way a different extractor would emit it.
         match remember_text(
@@ -522,6 +567,7 @@ mod tests {
                 tags: vec![],
                 project_id: None,
                 force: true,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap();
@@ -552,7 +598,7 @@ mod tests {
                 RememberOutcome::Created(n) => n,
                 other => panic!("expected Created, got {other:?}"),
             };
-        store::soft_delete(&conn, first.id).unwrap();
+        store::soft_delete(&conn, first.id, crate::model::Actor::System, None).unwrap();
         match remember_text(
             &conn,
             "scram auth rejects non-ascii passwords at 03:00 utc.",
@@ -579,7 +625,7 @@ mod tests {
                 RememberOutcome::Created(node) => node,
                 other => panic!("[n={n}] expected Created, got {other:?}"),
             };
-            store::soft_delete(&conn, first.id).unwrap();
+            store::soft_delete(&conn, first.id, crate::model::Actor::System, None).unwrap();
             match remember_text(&conn, &format!("{base}.")) {
                 RememberOutcome::Forgotten(gone) => assert_eq!(gone.id, first.id),
                 other => panic!(
@@ -601,7 +647,7 @@ mod tests {
             RememberOutcome::Created(n) => n,
             other => panic!("expected Created, got {other:?}"),
         };
-        store::soft_delete(&conn, first.id).unwrap();
+        store::soft_delete(&conn, first.id, crate::model::Actor::System, None).unwrap();
         assert!(
             matches!(
                 remember_text(&conn, "postgres port 5432"),
@@ -645,7 +691,7 @@ mod tests {
             RememberOutcome::Created(n) => n,
             other => panic!("expected Created, got {other:?}"),
         };
-        store::soft_delete(&conn, first.id).unwrap();
+        store::soft_delete(&conn, first.id, crate::model::Actor::System, None).unwrap();
         let revived = remember(
             &conn,
             Remember {
@@ -654,6 +700,7 @@ mod tests {
                 tags: vec![],
                 project_id: None,
                 force: true,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap();
@@ -688,6 +735,7 @@ mod tests {
                 tags: vec![],
                 project_id: None,
                 force: true,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap();
@@ -718,6 +766,8 @@ mod tests {
                 text: Some("completely new body".into()),
                 ..Default::default()
             },
+            crate::model::Actor::Human,
+            None,
         )
         .unwrap();
         assert_eq!(updated.title.as_deref(), Some("completely new body"));
@@ -735,6 +785,7 @@ mod tests {
                 tags: vec!["sqlite".into()],
                 project_id: None,
                 force: false,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap();

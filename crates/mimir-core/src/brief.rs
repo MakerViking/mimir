@@ -353,6 +353,7 @@ mod tests {
                 tags: vec![],
                 project_id,
                 force: true,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap()
@@ -407,7 +408,7 @@ mod tests {
         let conn = db::open_in_memory().unwrap();
         let old = remember(&conn, "old gotcha", MemoryType::Gotcha, None);
         let new = remember(&conn, "new gotcha replacing old", MemoryType::Gotcha, None);
-        store::set_superseded(&conn, old.id, new.id).unwrap();
+        store::set_superseded(&conn, old.id, new.id, crate::model::Actor::System, None).unwrap();
         let dead = remember(&conn, "deleted gotcha", MemoryType::Gotcha, None);
         conn.execute(
             "UPDATE node SET deleted_at = ?1 WHERE id = ?2",
@@ -727,6 +728,7 @@ mod tests {
                 tags: vec!["filament".into()],
                 project_id: Some(project.id),
                 force: true,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap()
@@ -742,6 +744,7 @@ mod tests {
                 tags: vec!["filament".into()],
                 project_id: None,
                 force: true,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap()

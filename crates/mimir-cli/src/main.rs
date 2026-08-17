@@ -214,6 +214,11 @@ enum Command {
         reference: String,
         #[arg(long)]
         hard: bool,
+        /// Why. Recorded in the mutation ledger (`mimir audit`), never the
+        /// value itself — a deletion nobody can account for is the thing the
+        /// ledger exists to prevent.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Mark OLD as superseded by NEW (OLD stops surfacing in recall, kept as history).
     Supersede {
@@ -222,6 +227,9 @@ enum Command {
         /// The new node reference that replaces it.
         #[arg(long)]
         by: String,
+        /// Why the replacement happened. Recorded in `mimir audit`.
+        #[arg(long)]
+        reason: Option<String>,
     },
     /// Set guard anchors on an EXISTING memory, so it surfaces at act-time
     /// (PreToolUse) when a matching file is edited or command is run.
@@ -348,6 +356,15 @@ enum Command {
     /// the refused values.
     Refusals {
         /// How many rows to show (most recently offered first).
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// What was done to a memory, and by whom: forgets, supersessions, edits,
+    /// archival. Records the change, never the changed value.
+    Audit {
+        /// One memory (id or `m:ABCDEF`). Omit for the whole store, newest first.
+        reference: Option<String>,
+        /// How many rows to show when no reference is given.
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
@@ -796,8 +813,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             all,
             limit,
         } => commands::list(cli.json, mtype, tag, global, all, limit),
-        Command::Forget { reference, hard } => commands::forget(&reference, hard),
-        Command::Supersede { old, by } => commands::supersede(&old, &by),
+        Command::Forget {
+            reference,
+            hard,
+            reason,
+        } => commands::forget(&reference, hard, reason.as_deref()),
+        Command::Supersede { old, by, reason } => commands::supersede(&old, &by, reason.as_deref()),
         Command::Anchor {
             reference,
             patterns,
@@ -869,6 +890,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         }
         Command::Consolidate { dry_run } => commands::consolidate(dry_run),
         Command::Refusals { limit } => commands::refusals(limit),
+        Command::Audit { reference, limit } => {
+            commands::audit(reference.as_deref(), limit, cli.json)
+        }
         Command::Grounding { stale, limit } => commands::grounding(stale, limit),
         Command::Import { cmd } => match cmd {
             ImportCmd::Openbrain { file } => commands::import_openbrain(&file),

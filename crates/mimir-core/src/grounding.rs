@@ -228,7 +228,7 @@ mod tests {
         let broken = memory(&conn, "the old pruner ran on every write");
         let gone = artifact(&conn, Kind::Symbol, "prune_on_write");
         store::link(&conn, broken, gone, Rel::About, 1.0).unwrap();
-        store::soft_delete(&conn, gone).unwrap();
+        store::soft_delete(&conn, gone, crate::model::Actor::System, None).unwrap();
 
         let bare = memory(&conn, "prefer ripgrep over find on this box");
 
@@ -276,7 +276,7 @@ mod tests {
         store::link(&conn, m, s, Rel::About, 1.0).unwrap();
         assert!(!grounding(&conn, m).unwrap().is_stale());
 
-        store::soft_delete(&conn, s).unwrap();
+        store::soft_delete(&conn, s, crate::model::Actor::System, None).unwrap();
         let g = grounding(&conn, m).unwrap();
         assert!(g.is_stale(), "symbol is gone; the claim is falsified");
         assert_eq!(g.target(), Some((Kind::Symbol, "retry_with_backoff")));
@@ -293,7 +293,7 @@ mod tests {
         let live = artifact(&conn, Kind::File, "src/index/mod.rs");
         store::link(&conn, m, dead, Rel::About, 1.0).unwrap();
         store::link(&conn, m, live, Rel::About, 1.0).unwrap();
-        store::soft_delete(&conn, dead).unwrap();
+        store::soft_delete(&conn, dead, crate::model::Actor::System, None).unwrap();
         assert!(matches!(
             grounding(&conn, m).unwrap(),
             Grounding::Grounded {
@@ -325,7 +325,7 @@ mod tests {
         let broken = memory(&conn, "the old pruner ran on every write");
         let gone = artifact(&conn, Kind::Symbol, "prune_on_write");
         store::link(&conn, broken, gone, Rel::About, 1.0).unwrap();
-        store::soft_delete(&conn, gone).unwrap();
+        store::soft_delete(&conn, gone, crate::model::Actor::System, None).unwrap();
 
         memory(&conn, "prefer ripgrep over find on this box");
 

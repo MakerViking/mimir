@@ -152,6 +152,7 @@ mod tests {
                 tags: vec![],
                 project_id: Some(proj.id),
                 force: false,
+                actor: mimir_core::model::Actor::System,
             },
         )
         .unwrap();

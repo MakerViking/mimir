@@ -2,7 +2,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use ulid::Ulid;
 
 use crate::error::{Error, Result};
-use crate::model::{now_unix, Edge, Kind, NewNode, Node, Rel};
+use crate::model::{now_unix, Actor, Edge, Kind, MutationOp, NewNode, Node, Rel};
 
 pub fn row_to_node(row: &Row) -> rusqlite::Result<Node> {
     let kind_text: String = row.get("kind")?;
@@ -161,6 +161,22 @@ pub fn get_node_by_uid(conn: &Connection, uid: &str) -> Result<Node> {
 /// Resolve a user-facing reference: full ULID, `m:ABCDEF` short form,
 /// or a bare uid tail (≥4 chars). Deleted nodes are excluded.
 pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Node> {
+    resolve_ref_inner(conn, reference, false)
+}
+
+/// As [`resolve_ref`], but tombstones resolve too.
+///
+/// For readers that are *about* the deletion rather than about the memory —
+/// `mimir audit` is the case: the thing you most want to look up is the one
+/// that was deleted, and refusing to resolve it makes the ledger unreachable
+/// exactly where it matters. Deliberately separate from `resolve_ref` so no
+/// path that edits, marks, or opens a node can pick it up by accident and
+/// hand back a ghost.
+pub fn resolve_ref_including_deleted(conn: &Connection, reference: &str) -> Result<Node> {
+    resolve_ref_inner(conn, reference, true)
+}
+
+fn resolve_ref_inner(conn: &Connection, reference: &str, include_deleted: bool) -> Result<Node> {
     let raw = reference.trim();
     // Strip a single-letter sigil prefix like "m:" if present.
     let tail = match raw.split_once(':') {
@@ -171,7 +187,7 @@ pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Node> {
         if let Ok(node) = get_node_by_uid(conn, &tail.to_uppercase()) {
             // Same contract as the short-tail path below: deleted nodes
             // resolve to NotFound, not to a ghost you can edit/mark/open.
-            if node.deleted_at.is_none() {
+            if include_deleted || node.deleted_at.is_none() {
                 return Ok(node);
             }
             return Err(Error::NotFound(format!("no node matching '{raw}'")));
@@ -188,19 +204,22 @@ pub fn resolve_ref(conn: &Connection, reference: &str) -> Result<Node> {
     // full-scans (≈66 ms at 500k nodes), so only fall back to it for the
     // uncommon non-6-char tail.
     let up = tail.to_uppercase();
+    let live = if include_deleted {
+        ""
+    } else {
+        " AND deleted_at IS NULL"
+    };
     let (sql, param) = if tail.len() == 6 {
         (
             format!(
                 "SELECT {NODE_COLS} FROM node
-                 WHERE substr(uid, -6) = ?1 AND deleted_at IS NULL LIMIT 3"
+                 WHERE substr(uid, -6) = ?1{live} LIMIT 3"
             ),
             up,
         )
     } else {
         (
-            format!(
-                "SELECT {NODE_COLS} FROM node WHERE uid LIKE ?1 AND deleted_at IS NULL LIMIT 3"
-            ),
+            format!("SELECT {NODE_COLS} FROM node WHERE uid LIKE ?1{live} LIMIT 3"),
             format!("%{up}"),
         )
     };
@@ -223,18 +242,65 @@ pub fn touch_updated(conn: &Connection, id: i64) -> Result<()> {
     Ok(())
 }
 
-pub fn soft_delete(conn: &Connection, id: i64) -> Result<()> {
+/// Read a node's kind and content hash before a mutation destroys or changes
+/// it, so the ledger can name *which* value moved without storing it.
+fn audit_subject(conn: &Connection, id: i64) -> (Kind, Option<Vec<u8>>) {
+    conn.query_row(
+        "SELECT kind, content_hash FROM node WHERE id = ?1",
+        [id],
+        |r| {
+            let kind: String = r.get(0)?;
+            let hash: Option<Vec<u8>> = r.get(1)?;
+            Ok((kind.parse().unwrap_or(Kind::Memory), hash))
+        },
+    )
+    .unwrap_or((Kind::Memory, None))
+}
+
+/// Soft-delete `id`. `actor` and `reason` go to the mutation ledger — see
+/// [`crate::audit`] for why they are arguments rather than ambient state.
+pub fn soft_delete(conn: &Connection, id: i64, actor: Actor, reason: Option<&str>) -> Result<()> {
+    let (kind, before) = audit_subject(conn, id);
     // Bump updated_at too: replication finds tombstones via updated_at, so a
     // delete that didn't advance it would never propagate.
-    conn.execute(
+    let changed = conn.execute(
         "UPDATE node SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
         params![id, now_unix()],
     )?;
+    // Deleting an already-deleted node changes nothing, so it records
+    // nothing: a ledger that grows on no-ops stops being a history of what
+    // happened.
+    if changed > 0 {
+        crate::audit::record_for_kind(
+            conn,
+            kind,
+            id,
+            MutationOp::Forget,
+            actor,
+            reason,
+            before.as_deref(),
+            None,
+        );
+    }
     Ok(())
 }
 
-pub fn hard_delete(conn: &Connection, id: i64) -> Result<()> {
-    conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
+pub fn hard_delete(conn: &Connection, id: i64, actor: Actor, reason: Option<&str>) -> Result<()> {
+    // Read the subject first — after the DELETE there is nothing left to ask.
+    let (kind, before) = audit_subject(conn, id);
+    let changed = conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
+    if changed > 0 {
+        crate::audit::record_for_kind(
+            conn,
+            kind,
+            id,
+            MutationOp::HardDelete,
+            actor,
+            reason,
+            before.as_deref(),
+            None,
+        );
+    }
     Ok(())
 }
 
@@ -244,7 +310,17 @@ pub fn hard_delete(conn: &Connection, id: i64) -> Result<()> {
 /// self-reference would hide the node unrecoverably) and pinned nodes
 /// (pinned means never decayed, never superseded — same invariant
 /// consolidation honors).
-pub fn set_superseded(conn: &Connection, id: i64, by: i64) -> Result<()> {
+///
+/// The ledger row this writes is what dates the supersession:
+/// `superseded_by` is a column with no timestamp of its own, and the
+/// `updated_at` bump below is overwritten by the next edit.
+pub fn set_superseded(
+    conn: &Connection,
+    id: i64,
+    by: i64,
+    actor: Actor,
+    reason: Option<&str>,
+) -> Result<()> {
     if id == by {
         return Err(Error::Invalid("a node cannot supersede itself".into()));
     }
@@ -255,10 +331,22 @@ pub fn set_superseded(conn: &Connection, id: i64, by: i64) -> Result<()> {
             "node #{id} is pinned; pinned nodes never get superseded (unpin it first)"
         )));
     }
+    let (kind, before) = audit_subject(conn, id);
+    let (_, after) = audit_subject(conn, by);
     conn.execute(
         "UPDATE node SET superseded_by = ?2, updated_at = ?3 WHERE id = ?1",
         params![id, by, now_unix()],
     )?;
+    crate::audit::record_for_kind(
+        conn,
+        kind,
+        id,
+        MutationOp::Supersede,
+        actor,
+        reason,
+        before.as_deref(),
+        after.as_deref(),
+    );
     Ok(())
 }
 
@@ -492,7 +580,13 @@ pub fn find_project_by_title(conn: &Connection, title: &str) -> Result<Option<No
 /// across the hub and every machine. Refuses non-memory nodes — files, symbols,
 /// and doc/code chunks derive their project from their source, so moving one
 /// would only desync it from the graph it belongs to.
-pub fn reproject(conn: &Connection, node: &Node, project_id: Option<i64>) -> Result<()> {
+pub fn reproject(
+    conn: &Connection,
+    node: &Node,
+    project_id: Option<i64>,
+    actor: Actor,
+    reason: Option<&str>,
+) -> Result<()> {
     if node.kind != Kind::Memory {
         return Err(Error::Invalid(format!(
             "node #{} is a {}, not a memory; only memories can be reprojected",
@@ -504,6 +598,16 @@ pub fn reproject(conn: &Connection, node: &Node, project_id: Option<i64>) -> Res
         "UPDATE node SET project_id = ?2, updated_at = ?3 WHERE id = ?1",
         params![node.id, project_id, now_unix()],
     )?;
+    crate::audit::record_for_kind(
+        conn,
+        node.kind,
+        node.id,
+        MutationOp::Reproject,
+        actor,
+        reason,
+        node.content_hash.as_deref(),
+        node.content_hash.as_deref(),
+    );
     Ok(())
 }
 
@@ -665,11 +769,32 @@ pub fn record_shown(
 }
 
 /// Pin/unpin: pinned nodes never decay and never get superseded.
-pub fn set_pinned(conn: &Connection, id: i64, pinned: bool) -> Result<()> {
+pub fn set_pinned(
+    conn: &Connection,
+    id: i64,
+    pinned: bool,
+    actor: Actor,
+    reason: Option<&str>,
+) -> Result<()> {
+    let (kind, hash) = audit_subject(conn, id);
     conn.execute(
         "UPDATE node SET pinned = ?2 WHERE id = ?1",
         params![id, pinned],
     )?;
+    crate::audit::record_for_kind(
+        conn,
+        kind,
+        id,
+        if pinned {
+            MutationOp::Pin
+        } else {
+            MutationOp::Unpin
+        },
+        actor,
+        reason,
+        hash.as_deref(),
+        hash.as_deref(),
+    );
     Ok(())
 }
 
@@ -751,7 +876,7 @@ mod tests {
         assert_eq!(m.project_id, Some(src.id));
 
         // Move to another project.
-        reproject(&c, &m, Some(dst.id)).unwrap();
+        reproject(&c, &m, Some(dst.id), crate::model::Actor::Human, None).unwrap();
         let moved = get_node(&c, m.id).unwrap();
         assert_eq!(moved.project_id, Some(dst.id));
         assert!(
@@ -760,7 +885,7 @@ mod tests {
         );
 
         // Move to global (no project).
-        reproject(&c, &m, None).unwrap();
+        reproject(&c, &m, None, crate::model::Actor::Human, None).unwrap();
         assert_eq!(get_node(&c, m.id).unwrap().project_id, None);
     }
 
@@ -769,7 +894,7 @@ mod tests {
         let c = conn();
         let dst = ensure_project(&c, "/abs/dst", "dst").unwrap();
         // A project node is not a memory.
-        let err = reproject(&c, &dst, None).unwrap_err();
+        let err = reproject(&c, &dst, None, crate::model::Actor::Human, None).unwrap_err();
         assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
     }
 
@@ -810,7 +935,7 @@ mod tests {
         let a = memory(&conn, "alpha", "x");
         let b = memory(&conn, "beta", "y");
         let c = memory(&conn, "gamma", "z");
-        soft_delete(&conn, c.id).unwrap(); // still fetchable by id, just flagged
+        soft_delete(&conn, c.id, crate::model::Actor::System, None).unwrap(); // still fetchable by id, just flagged
 
         let batch = get_nodes(&conn, &[a.id, b.id, c.id, 999_999]).unwrap();
         // Same set as calling get_node per id (999_999 simply absent, no error).
@@ -1018,18 +1143,20 @@ mod tests {
         let new = memory(&conn, "new", "y");
 
         // Self-supersession would hide a node with no un-supersede path.
-        let err = set_superseded(&conn, old.id, old.id).unwrap_err();
+        let err =
+            set_superseded(&conn, old.id, old.id, crate::model::Actor::System, None).unwrap_err();
         assert!(matches!(err, Error::Invalid(_)));
 
         // Pinned nodes never get superseded (same invariant consolidation honors).
-        set_pinned(&conn, old.id, true).unwrap();
-        let err = set_superseded(&conn, old.id, new.id).unwrap_err();
+        set_pinned(&conn, old.id, true, crate::model::Actor::System, None).unwrap();
+        let err =
+            set_superseded(&conn, old.id, new.id, crate::model::Actor::System, None).unwrap_err();
         assert!(matches!(err, Error::Invalid(_)));
         assert!(get_node(&conn, old.id).unwrap().superseded_by.is_none());
 
         // Unpinned, the normal path still works.
-        set_pinned(&conn, old.id, false).unwrap();
-        set_superseded(&conn, old.id, new.id).unwrap();
+        set_pinned(&conn, old.id, false, crate::model::Actor::System, None).unwrap();
+        set_superseded(&conn, old.id, new.id, crate::model::Actor::System, None).unwrap();
         assert_eq!(get_node(&conn, old.id).unwrap().superseded_by, Some(new.id));
     }
 
@@ -1082,7 +1209,7 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        soft_delete(&conn, id).unwrap();
+        soft_delete(&conn, id, crate::model::Actor::System, None).unwrap();
         let survivor = resolve_ref(&conn, "XYXYXY").unwrap();
         assert!(survivor.uid.starts_with("01BBB"));
     }
@@ -1091,11 +1218,11 @@ mod tests {
     fn soft_delete_hides_hard_delete_removes() {
         let conn = conn();
         let node = memory(&conn, "doomed", "x");
-        soft_delete(&conn, node.id).unwrap();
+        soft_delete(&conn, node.id, crate::model::Actor::System, None).unwrap();
         assert!(get_node(&conn, node.id).unwrap().deleted_at.is_some());
         assert!(count_by_kind(&conn).unwrap().is_empty());
 
-        hard_delete(&conn, node.id).unwrap();
+        hard_delete(&conn, node.id, crate::model::Actor::System, None).unwrap();
         assert!(matches!(get_node(&conn, node.id), Err(Error::NotFound(_))));
     }
 
@@ -1152,7 +1279,7 @@ mod tests {
         assert_eq!(hits("replacement_token"), 1);
 
         // DELETE removes from the index.
-        hard_delete(&conn, node.id).unwrap();
+        hard_delete(&conn, node.id, crate::model::Actor::System, None).unwrap();
         assert_eq!(hits("replacement_token"), 0);
 
         // Identifier-friendly tokenizer: snake_case stays one token.

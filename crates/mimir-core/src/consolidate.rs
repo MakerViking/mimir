@@ -103,9 +103,18 @@ fn consolidate_inner(conn: &Connection, model: &str, dry_run: bool) -> Result<Re
                         continue;
                     }
                     if !dry_run {
-                        conn.execute(
-                            "UPDATE node SET superseded_by = ?2 WHERE id = ?1",
-                            [older.id, newer.id],
+                        // Through the store function rather than raw SQL, so
+                        // the supersession is dated in the mutation ledger.
+                        // `superseded_by` alone carries no timestamp, and
+                        // `recall --as-of` reads that row. Pinned losers were
+                        // already skipped above, which is the one case
+                        // `set_superseded` refuses.
+                        store::set_superseded(
+                            conn,
+                            older.id,
+                            newer.id,
+                            crate::model::Actor::System,
+                            Some("consolidate: near-duplicate, newer wins"),
                         )?;
                         store::link(conn, newer.id, older.id, Rel::Supersedes, 1.0)?;
                     }
@@ -181,6 +190,22 @@ fn consolidate_inner(conn: &Connection, model: &str, dry_run: bool) -> Result<Re
                      WHERE id = ?1",
                     rusqlite::params![node.id, now],
                 )?;
+                // Recorded as `archive`, never `forget`. Nobody decided this
+                // — it fell below a strength threshold while idle — and the
+                // distinction is load-bearing twice over: `remember` lets an
+                // archived fact back in without `--force`, and "why did this
+                // memory disappear?" is the question the ledger most needs to
+                // answer for the deletions nobody can remember making.
+                crate::audit::record_for_kind(
+                    conn,
+                    node.kind,
+                    node.id,
+                    crate::model::MutationOp::Archive,
+                    crate::model::Actor::System,
+                    Some("consolidate: decayed below the strength floor while idle"),
+                    node.content_hash.as_deref(),
+                    None,
+                );
             }
         }
     }

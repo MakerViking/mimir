@@ -219,6 +219,43 @@ CREATE TABLE refusal (
 );
 CREATE INDEX refusal_last_seen ON refusal(last_seen);
 "#,
+    // Mutation ledger: who changed a memory, when, and why.
+    //
+    // Every other signal in the store describes a memory's *content*. This
+    // one describes what was done to it, which nothing recorded before —
+    // `deleted_at` and `superseded_by` are set in place, so a correction was
+    // structural but anonymous, and "who deleted this, and on whose say-so"
+    // had no answer.
+    //
+    // No values, only `before_hash`/`after_hash` (blake3 over normalized
+    // text, same as `memory::content_hash`). An audit that quotes what it
+    // audits is a second copy of a deleted fact in a table recall doesn't
+    // read but `export` does — the refusal ledger made this call first and
+    // for the same reason. The hashes are enough to prove *which* value was
+    // removed if you still hold it, and useless for recovering it.
+    //
+    // Memories only. Indexers soft-delete thousands of chunk and symbol rows
+    // on every reindex; recording those would bury the handful of rows a
+    // person would ever want to read.
+    //
+    // `at` is also the transaction-time index `recall --as-of` reads:
+    // `superseded_by` carries no timestamp of its own (`set_superseded`
+    // bumps `updated_at`, which the next edit clobbers), so this table is
+    // what makes "was it superseded as of March?" answerable at all.
+    r#"
+CREATE TABLE mutation (
+    id          INTEGER PRIMARY KEY,
+    at          INTEGER NOT NULL,
+    node_id     INTEGER NOT NULL,
+    op          TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    reason      TEXT,
+    before_hash BLOB,
+    after_hash  BLOB
+);
+CREATE INDEX mutation_node ON mutation(node_id, at);
+CREATE INDEX mutation_at   ON mutation(at);
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -350,6 +387,27 @@ mod tests {
             crate::secrets::refusal_counts(&conn, 0).unwrap(),
             (1, 1),
             "upgraded store must be able to write the refusal ledger"
+        );
+        // Same check for the migration that landed after it: present is not
+        // the same as usable, and a table nobody writes to on an upgraded
+        // store is a bug that only shows up on someone else's machine.
+        let node_id: i64 = conn
+            .query_row("SELECT id FROM node WHERE uid = 'Z'", [], |r| r.get(0))
+            .unwrap();
+        crate::audit::record_for_kind(
+            &conn,
+            crate::model::Kind::Memory,
+            node_id,
+            crate::model::MutationOp::Forget,
+            crate::model::Actor::Human,
+            Some("upgrade path"),
+            None,
+            None,
+        );
+        assert_eq!(
+            crate::audit::history(&conn, node_id).unwrap().len(),
+            1,
+            "upgraded store must be able to write the mutation ledger"
         );
     }
 

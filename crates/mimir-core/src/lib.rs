@@ -5,6 +5,7 @@
 //! BM25 + vector retrieval with reciprocal-rank fusion.
 
 pub mod anchors;
+pub mod audit;
 pub mod brief;
 pub mod config;
 pub mod consolidate;
@@ -686,6 +687,7 @@ mod tests {
                 tags: vec![],
                 project_id: None,
                 force: false,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap()

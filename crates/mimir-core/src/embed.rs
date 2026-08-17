@@ -572,6 +572,7 @@ mod tests {
                 tags: vec![],
                 project_id: None,
                 force: false,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap()

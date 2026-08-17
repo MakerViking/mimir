@@ -282,6 +282,7 @@ mod tests {
                 tags: vec!["session-handoff".into()],
                 project_id: None,
                 force: false,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap();
@@ -302,6 +303,7 @@ mod tests {
                 tags: vec!["session-handoff".into()],
                 project_id: None,
                 force: false,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap();

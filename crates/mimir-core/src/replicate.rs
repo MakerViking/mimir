@@ -235,6 +235,23 @@ pub fn apply_changes(conn: &Connection, batch: &SyncBatch) -> Result<ApplyStats>
             stats.nodes_upserted += 1;
             if n.deleted_at.is_some() {
                 stats.tombstones += 1;
+                // A tombstone that arrives over sync is a deletion someone
+                // made on another machine, and this store has no other record
+                // that it ever happened here. `Sync` is the honest actor: the
+                // transport is all this install can know — who acted, and why,
+                // lives in the ledger on the machine it came from.
+                if let Ok(node) = store::get_node_by_uid(&tx, &n.uid) {
+                    crate::audit::record_for_kind(
+                        &tx,
+                        node.kind,
+                        node.id,
+                        crate::model::MutationOp::Forget,
+                        crate::model::Actor::Sync,
+                        Some("tombstone arrived over sync"),
+                        node.content_hash.as_deref(),
+                        None,
+                    );
+                }
             }
         } else {
             stats.nodes_skipped += 1;
@@ -326,11 +343,7 @@ pub fn machine_id(conn: &Connection) -> Result<String> {
 }
 
 fn to_hex(b: &[u8]) -> String {
-    let mut s = String::with_capacity(b.len() * 2);
-    for byte in b {
-        s.push_str(&format!("{byte:02x}"));
-    }
-    s
+    crate::format::hex(b)
 }
 
 fn from_hex(s: &str) -> Option<Vec<u8>> {
@@ -359,6 +372,7 @@ mod tests {
                 tags: vec!["t".into()],
                 project_id: None,
                 force: true,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap()
@@ -383,6 +397,7 @@ mod tests {
                 tags: vec!["t".into()],
                 project_id: Some(pid),
                 force: true,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap()
@@ -521,7 +536,7 @@ mod tests {
         let b = db::open_in_memory().unwrap();
         apply_changes(&b, &snapshot(&a).unwrap()).unwrap();
 
-        store::soft_delete(&a, n.id).unwrap();
+        store::soft_delete(&a, n.id, crate::model::Actor::System, None).unwrap();
         let batch = snapshot(&a).unwrap();
         assert!(batch
             .nodes
@@ -607,7 +622,7 @@ mod tests {
             })
             .unwrap();
         std::thread::sleep(std::time::Duration::from_millis(1100));
-        store::soft_delete(&conn, n.id).unwrap();
+        store::soft_delete(&conn, n.id, crate::model::Actor::System, None).unwrap();
         let after: i64 = conn
             .query_row("SELECT updated_at FROM node WHERE id=?1", [n.id], |r| {
                 r.get(0)

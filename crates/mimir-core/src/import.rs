@@ -41,6 +41,11 @@ fn store_all(conn: &Connection, items: Vec<Incoming>) -> Result<ImportStats> {
                 tags: item.tags,
                 project_id: None, // imports land in the global scope
                 force: false,
+                // An import is a person running `mimir import`, but the
+                // memories are machine-produced from another tool's store —
+                // `System` says "a batch pass wrote this", which is what a
+                // reader needs to know.
+                actor: crate::model::Actor::System,
             },
         )?;
         match outcome {

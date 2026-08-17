@@ -308,7 +308,7 @@ mod tests {
         )
         .id;
         let new = add(&conn, Kind::Memory, None, "alpha runbook", "new final done").id;
-        store::set_superseded(&conn, old, new).unwrap();
+        store::set_superseded(&conn, old, new, crate::model::Actor::System, None).unwrap();
 
         // Default recall hides the superseded node, keeps its replacement.
         let hits = search(&conn, &q("alpha runbook")).unwrap();
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].node.kind, Kind::Memory);
 
-        store::soft_delete(&conn, chunk.id).unwrap();
+        store::soft_delete(&conn, chunk.id, crate::model::Actor::System, None).unwrap();
         let hits = search(&conn, &q("zebra")).unwrap();
         assert_eq!(hits.len(), 1);
     }

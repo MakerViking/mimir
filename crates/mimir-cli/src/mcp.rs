@@ -333,6 +333,7 @@ impl MimirServer {
                     tags: args.tags,
                     project_id: if args.global { None } else { project_id },
                     force: false,
+                    actor: mimir_core::model::Actor::Agent,
                 },
             )
             .map_err(engine_err)?;
@@ -763,7 +764,8 @@ impl MimirServer {
     async fn forget(&self, Parameters(args): Parameters<ForgetArgs>) -> String {
         self.blocking(move |m| {
             let node = store::resolve_ref(&m.conn, &args.r#ref).map_err(engine_err)?;
-            store::soft_delete(&m.conn, node.id).map_err(engine_err)?;
+            store::soft_delete(&m.conn, node.id, mimir_core::model::Actor::Agent, None)
+                .map_err(engine_err)?;
             Ok(format!(
                 "forgot {} {}",
                 short_uid(node.kind, &node.uid),
@@ -780,7 +782,14 @@ impl MimirServer {
         self.blocking(move |m| {
             let old = store::resolve_ref(&m.conn, &args.old).map_err(engine_err)?;
             let new = store::resolve_ref(&m.conn, &args.by).map_err(engine_err)?;
-            store::set_superseded(&m.conn, old.id, new.id).map_err(engine_err)?;
+            store::set_superseded(
+                &m.conn,
+                old.id,
+                new.id,
+                mimir_core::model::Actor::Agent,
+                None,
+            )
+            .map_err(engine_err)?;
             store::link(&m.conn, new.id, old.id, Rel::Supersedes, 1.0).map_err(engine_err)?;
             Ok(format!(
                 "{} superseded by {}",

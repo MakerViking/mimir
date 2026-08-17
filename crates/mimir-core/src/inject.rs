@@ -471,6 +471,7 @@ mod tests {
                 tags: tags.iter().map(|s| s.to_string()).collect(),
                 project_id: None,
                 force: false,
+                actor: crate::model::Actor::System,
             },
         )
         .unwrap();
@@ -511,7 +512,7 @@ mod tests {
             "pinned notes about scram authentication normalization details",
             &[],
         );
-        store::set_pinned(&mimir.conn, id, true).unwrap();
+        store::set_pinned(&mimir.conn, id, true, crate::model::Actor::System, None).unwrap();
         let out = compute(
             &mut mimir,
             "how does scram authentication normalization work",
