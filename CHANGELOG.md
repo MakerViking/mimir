@@ -5,6 +5,36 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Fixed
+- **The tombstone guard no longer depends on how much you wrote.** The reword
+  pass that stops a deliberately forgotten fact from being re-extracted used a
+  fixed similarity ratio, and a ratio is a function of length: at one differing
+  token, `jaccard >= 0.85` needs 13 unique tokens to clear. The same trailing
+  period that was caught on a 14-token memory walked straight through a
+  9-token one — measured at the boundary, `n=12` accepted and `n=13` refused.
+  Forget "SCRAM auth rejects non-ASCII passwords at 03:00 UTC", offer it back
+  lowercased with a full stop, and it returned with no warning. The failure
+  landed on terse one-line gotchas, which is the common shape of a
+  hand-written memory, and the committed test passed only because its fixture
+  was long enough.
+
+  The tombstone pass now asks three questions instead of one: equality under a
+  comparison view that strips leading/trailing `.`/`-`/`_` (so "utc." and "utc"
+  agree while `file.rs` still differs from `file`), containment within two
+  tokens (the same fact with a qualifier added or dropped), and then the ratio,
+  which still earns its keep on diffuse rewording of long text. Containment is
+  a *subset* test rather than a token distance on purpose: an unconditional
+  "differs by ≤2 tokens" would also swallow substitutions, and "redis port 6379
+  tcp" against "redis port 5432 tcp" is two tokens apart and a different fact.
+
+  Only the tombstone path changed. The live near-duplicate pass keeps the plain
+  ratio, because the costs are not symmetric — a false duplicate refusal is an
+  annoyance with `--force` one keystroke away, a missed tombstone silently
+  undoes a deletion someone meant. Re-fixtured the reword test to a 9-token
+  memory so it can no longer pass by length, and pinned the property itself
+  across five lengths from 5 to 20 tokens.
+
+## [Unreleased]
+### Fixed
 - **`mimir mcp` no longer outlives the client that spawned it.** Fourteen
   orphaned stdio servers had accumulated on one machine, the oldest fourteen
   days old, ~2.9 GB resident between them, every one holding the SQLite

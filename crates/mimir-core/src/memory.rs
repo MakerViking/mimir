@@ -13,6 +13,10 @@ use crate::store::{self, row_to_node, NODE_COLS};
 /// as a near-duplicate (without --force).
 const NEAR_DUP_JACCARD: f64 = 0.85;
 
+/// Most tokens a subset match may differ by and still count as the same fact
+/// reworded — see [`is_reword`].
+const REWORD_SUBSET_SLACK: usize = 2;
+
 /// How many deliberate tombstones the reword pass compares against. A bound
 /// so `remember` can never turn into a table scan on a store where someone
 /// has forgotten a great deal; newest-first, because a recent deletion is
@@ -152,10 +156,16 @@ const DELIBERATE_TOMBSTONE: &str = "kind = 'memory' AND deleted_at IS NOT NULL \
 /// A memory someone deliberately forgot, whose text is being offered again.
 ///
 /// Two passes, because re-extraction takes two shapes. The exact
-/// `content_hash` catches a source re-read unchanged. The token-overlap pass
+/// `content_hash` catches a source re-read unchanged. The [`is_reword`] pass
 /// catches a reword — a different extractor, or the same fact said again in
 /// other words — which the hash cannot, since `tokens` keeps `file.rs` and
 /// trailing punctuation whole and so treats "utc" and "utc." as different.
+///
+/// The reword test is deliberately more sensitive here than the live
+/// near-duplicate pass below, because the costs are not symmetric: a false
+/// duplicate refusal on a live memory is an annoyance with `--force` one
+/// keystroke away, while a missed tombstone silently undoes a deletion
+/// someone meant.
 ///
 /// The scan is over deliberate tombstones only, which stay rare in a real
 /// store (people forget on purpose seldom, and decay archival is excluded),
@@ -190,7 +200,7 @@ fn find_forgotten(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<N
             .filter(|b| !b.is_empty())
             .or(node.title.as_deref())
             .unwrap_or_default();
-        if jaccard(text, existing) >= NEAR_DUP_JACCARD {
+        if is_reword(text, existing) {
             return Ok(Some(node));
         }
     }
@@ -267,6 +277,62 @@ fn jaccard(a: &str, b: &str) -> f64 {
     let inter = sa.intersection(&sb).count() as f64;
     let union = sa.union(&sb).count() as f64;
     inter / union
+}
+
+/// `tokens` with leading/trailing `.`/`-`/`_` stripped, for *comparison only*.
+///
+/// `tokens` keeps those characters whole so `file.rs`, `snake_case` and
+/// `kebab-case` survive as single tokens — which is right for the content
+/// hash, and wrong when deciding whether two texts say the same thing: it
+/// makes "utc" and "utc." different words. Interior punctuation is untouched,
+/// so `file.rs` still differs from `file`.
+fn comparison_tokens(text: &str) -> HashSet<String> {
+    tokens(text)
+        .into_iter()
+        .map(|t| t.trim_matches(['.', '-', '_']).to_string())
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// Whether `text` is `existing` said again — the question the tombstone pass
+/// asks before letting a deliberately forgotten fact back in.
+///
+/// Three rules, because a single similarity ratio is a function of how much
+/// someone wrote. At one differing token, `jaccard >= 0.85` needs 13 unique
+/// tokens to clear, so the same trailing period that was caught on a long
+/// memory walked straight through a terse one — and terse is the common shape
+/// of a hand-written gotcha.
+///
+/// 1. Equal under [`comparison_tokens`] — a pure formatting reword (case,
+///    whitespace, trailing punctuation). Length-independent by construction.
+/// 2. One token set contains the other, differing by at most
+///    [`REWORD_SUBSET_SLACK`] — the same fact with a qualifier added or
+///    dropped ("redis port 6379" → "redis default port 6379").
+/// 3. The ratio, which still earns its keep on diffuse rewording of long text.
+///
+/// Rule 2 is a *subset* test rather than a token-distance one on purpose. An
+/// unconditional "differs by ≤2 tokens" would also swallow substitutions —
+/// "redis port 6379 tcp" against "redis port 5432 tcp" is two tokens apart and
+/// a completely different fact. Requiring containment keeps insertions and
+/// deletions in scope while leaving substitutions out.
+fn is_reword(text: &str, existing: &str) -> bool {
+    let a = comparison_tokens(text);
+    let b = comparison_tokens(existing);
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    if a == b {
+        return true;
+    }
+    let (small, large) = if a.len() <= b.len() {
+        (&a, &b)
+    } else {
+        (&b, &a)
+    };
+    if small.is_subset(large) && large.len() - small.len() <= REWORD_SUBSET_SLACK {
+        return true;
+    }
+    jaccard(text, existing) >= NEAR_DUP_JACCARD
 }
 
 /// First line of the text, truncated to 80 chars on a char boundary.
@@ -471,24 +537,78 @@ mod tests {
     /// "utc." different tokens and the two texts different hashes. A
     /// re-extraction that rewords even slightly is the common case, so the
     /// guard has to survive it.
+    ///
+    /// Deliberately fixtured *short* (9 unique tokens). An earlier version of
+    /// this test used a 14-token sentence, which passed under a ratio-only
+    /// rule for the wrong reason: at one differing token, `jaccard >= 0.85`
+    /// needs 13 unique tokens to clear. The terse one-line gotcha is the
+    /// common shape of a hand-written memory, so it is the case that has to
+    /// hold.
     #[test]
     fn forgotten_memory_is_not_re_added_under_a_reword() {
         let conn = db::open_in_memory().unwrap();
-        let first = match remember_text(
-            &conn,
-            "The staging database password rotation is handled by the ops cron at 03:00 UTC",
-        ) {
-            RememberOutcome::Created(n) => n,
-            other => panic!("expected Created, got {other:?}"),
-        };
+        let first =
+            match remember_text(&conn, "SCRAM auth rejects non-ASCII passwords at 03:00 UTC") {
+                RememberOutcome::Created(n) => n,
+                other => panic!("expected Created, got {other:?}"),
+            };
         store::soft_delete(&conn, first.id).unwrap();
         match remember_text(
             &conn,
-            "the STAGING database password rotation is handled by the ops cron at 03:00 utc.",
+            "scram auth rejects non-ascii passwords at 03:00 utc.",
         ) {
             RememberOutcome::Forgotten(gone) => assert_eq!(gone.id, first.id),
             other => panic!("expected Forgotten, got {other:?}"),
         }
+    }
+
+    /// The guard must not be a function of how much someone wrote. A fixed
+    /// similarity *ratio* is: at one differing token it needs 13 unique
+    /// tokens to fire, so the same trailing period that was caught on a long
+    /// memory walked straight through a short one. Both lengths, one
+    /// perturbation, same verdict.
+    #[test]
+    fn reword_guard_does_not_depend_on_memory_length() {
+        for n in [5usize, 9, 12, 13, 20] {
+            let conn = db::open_in_memory().unwrap();
+            let base: String = (1..n).fold(String::new(), |mut s, i| {
+                s.push_str(&format!("w{i} "));
+                s
+            }) + "tail";
+            let first = match remember_text(&conn, &base) {
+                RememberOutcome::Created(node) => node,
+                other => panic!("[n={n}] expected Created, got {other:?}"),
+            };
+            store::soft_delete(&conn, first.id).unwrap();
+            match remember_text(&conn, &format!("{base}.")) {
+                RememberOutcome::Forgotten(gone) => assert_eq!(gone.id, first.id),
+                other => panic!(
+                    "[n={n} unique tokens] a forgotten memory walked back in \
+                     under a one-token reword: {other:?}"
+                ),
+            }
+        }
+    }
+
+    /// The absolute-distance rule must not swallow genuinely different short
+    /// facts. Two tokens apart out of four is a different fact, not a reword,
+    /// and refusing it would train `--force` by reflex just as surely as
+    /// treating decay archival as a deletion would.
+    #[test]
+    fn short_distinct_facts_are_not_confused_for_a_reword() {
+        let conn = db::open_in_memory().unwrap();
+        let first = match remember_text(&conn, "redis port 6379") {
+            RememberOutcome::Created(n) => n,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        store::soft_delete(&conn, first.id).unwrap();
+        assert!(
+            matches!(
+                remember_text(&conn, "postgres port 5432"),
+                RememberOutcome::Created(_)
+            ),
+            "a different fact of the same shape must still be capturable"
+        );
     }
 
     /// Decay archival is not a decision anyone made. Treating it as one
