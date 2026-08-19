@@ -271,6 +271,12 @@ pub fn soft_delete(conn: &Connection, id: i64, actor: Actor, reason: Option<&str
     // nothing: a ledger that grows on no-ops stops being a history of what
     // happened.
     if changed > 0 {
+        // A deletion that leaves prior wordings in `node_revision` has not
+        // deleted anything: recall never reads that table, but `export` and
+        // every backup do. Decay archival deliberately does NOT come through
+        // here (it updates the row directly with `meta.archived`), so history
+        // survives the one case nobody decided.
+        let _ = crate::revision::purge(conn, id);
         crate::audit::record_for_kind(
             conn,
             kind,
@@ -290,6 +296,7 @@ pub fn hard_delete(conn: &Connection, id: i64, actor: Actor, reason: Option<&str
     let (kind, before) = audit_subject(conn, id);
     let changed = conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
     if changed > 0 {
+        let _ = crate::revision::purge(conn, id);
         crate::audit::record_for_kind(
             conn,
             kind,
@@ -497,9 +504,52 @@ pub fn set_expiry(
     Ok(())
 }
 
+/// Declare the *valid time* of the fact — when it began being true in the
+/// world and when it stopped — as distinct from when the store learned it.
+/// See [`crate::model::Node::valid_from`].
+///
+/// Both ends optional and independent; `None` leaves an existing value alone,
+/// so an author who only learns the end date later can add it without
+/// inventing a start. Refuses an inverted interval rather than storing it:
+/// "valid from 2024 to 2019" is a typo every time, and silently keeping it
+/// would make `valid_at` answer false for all time with nothing to show why —
+/// the same "reject, don't mangle" call `parse_expires_in` makes.
+///
+/// Stored in `meta`, so it replicates without a schema bump.
+pub fn set_valid_interval(
+    conn: &Connection,
+    id: i64,
+    valid_from: Option<i64>,
+    valid_to: Option<i64>,
+) -> Result<()> {
+    let existing = get_node(conn, id)?;
+    let from = valid_from.or(existing.valid_from());
+    let to = valid_to.or(existing.valid_to());
+    if let (Some(f), Some(t)) = (from, to) {
+        if t <= f {
+            return Err(Error::Invalid(format!(
+                "valid-to ({t}) must be after valid-from ({f})"
+            )));
+        }
+    }
+    if let Some(f) = valid_from {
+        conn.execute(
+            "UPDATE node SET meta = json_set(meta, '$.valid_from', ?2) WHERE id = ?1",
+            params![id, f],
+        )?;
+    }
+    if let Some(t) = valid_to {
+        conn.execute(
+            "UPDATE node SET meta = json_set(meta, '$.valid_to', ?2) WHERE id = ?1",
+            params![id, t],
+        )?;
+    }
+    touch_updated(conn, id)?;
+    Ok(())
+}
+
 /// Record the author's own certainty. Stored in `meta` for the same reason
 /// as `set_expiry`: it replicates without a schema bump.
-///
 /// No gate and no score — see [`crate::model::MemoryConfidence`]. Writing
 /// this changes what a reader sees, never what recall returns.
 pub fn set_confidence(

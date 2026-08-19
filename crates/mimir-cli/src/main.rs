@@ -152,6 +152,17 @@ enum Command {
         /// matter how much it is recalled. Does not affect ranking.
         #[arg(long, value_name = "LEVEL")]
         confidence: Option<String>,
+        /// When the fact became true in the world (YYYY-MM-DD) — its *valid*
+        /// time, which is not when you wrote it down. Pairs with
+        /// `--valid-to`; either may be given alone.
+        #[arg(long = "valid-from", value_name = "DATE")]
+        valid_from: Option<String>,
+        /// When the fact stopped being true (YYYY-MM-DD). Unlike
+        /// `--expires-in` this does NOT hide the memory: a fact that was true
+        /// until 2024 is still worth surfacing, labelled, because the reader
+        /// often needs exactly that. Use `--expires-in` to retire something.
+        #[arg(long = "valid-to", value_name = "DATE")]
+        valid_to: Option<String>,
     },
     /// Search memories (and later docs/code) with hybrid ranking.
     Recall {
@@ -188,6 +199,13 @@ enum Command {
         /// Include superseded memories (default hides them).
         #[arg(long)]
         include_superseded: bool,
+        /// Answer as the store stood on this date (YYYY-MM-DD) instead of
+        /// now: memories deleted or superseded since come back, and ones
+        /// written later are absent. This is transaction-time travel — what
+        /// you *knew* then — which is a different question from what was
+        /// *true* then (see `--valid-from`/`--valid-to` on `remember`).
+        #[arg(long, value_name = "DATE")]
+        as_of: Option<String>,
     },
     /// Show full records by reference (logs the access).
     Get {
@@ -367,6 +385,13 @@ enum Command {
         /// How many rows to show when no reference is given.
         #[arg(long, default_value_t = 20)]
         limit: usize,
+    },
+    /// A memory's life: every wording it has had, and every change made to
+    /// it. Correction is not amnesia — "what did this used to say?" keeps
+    /// working after a supersession or an edit.
+    History {
+        /// The memory (id or `m:ABCDEF`).
+        reference: String,
     },
     /// Import memories from the tools Mimir replaces.
     Import {
@@ -765,6 +790,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             expires_in,
             resolves_when,
             confidence,
+            valid_from,
+            valid_to,
         } => commands::remember(
             cli.json,
             text.join(" "),
@@ -778,6 +805,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             expires_in,
             resolves_when,
             confidence,
+            valid_from,
+            valid_to,
         ),
         Command::Recall {
             query,
@@ -791,6 +820,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             rerank,
             linked,
             include_superseded,
+            as_of,
         } => commands::recall(
             cli.json,
             query.join(" "),
@@ -804,6 +834,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             linked,
             min_score,
             include_superseded,
+            as_of
+                .map(|s| {
+                    mimir_core::format::parse_date(&s).ok_or_else(|| {
+                        anyhow::anyhow!("bad --as-of '{s}': expected a date like 2026-03-01")
+                    })
+                })
+                .transpose()?,
         ),
         Command::Get { refs } => commands::get(cli.json, refs),
         Command::List {
@@ -893,6 +930,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Audit { reference, limit } => {
             commands::audit(reference.as_deref(), limit, cli.json)
         }
+        Command::History { reference } => commands::history(&reference),
         Command::Grounding { stale, limit } => commands::grounding(stale, limit),
         Command::Import { cmd } => match cmd {
             ImportCmd::Openbrain { file } => commands::import_openbrain(&file),

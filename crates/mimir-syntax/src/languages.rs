@@ -525,6 +525,88 @@ impl Lang {
         }
     }
 
+    /// If this node is a call with an explicit receiver (`recv.callee(..)`,
+    /// `Type::callee(..)`), return the receiver expression as written. The
+    /// text is deliberately raw — turning `self.db` or an alias into a type
+    /// needs the project symbol table, which lives in the resolver.
+    pub fn call_receiver(&self, node: Node, src: &str) -> Option<String> {
+        let text = |n: Node| src[n.byte_range()].to_string();
+        match self {
+            Lang::Rust => {
+                let f = node.child_by_field_name("function")?;
+                match f.kind() {
+                    "field_expression" => f.child_by_field_name("value").map(text),
+                    "scoped_identifier" => f.child_by_field_name("path").map(text),
+                    "generic_function" => {
+                        let inner = f.child_by_field_name("function")?;
+                        (inner.kind() == "scoped_identifier")
+                            .then(|| inner.child_by_field_name("path").map(text))
+                            .flatten()
+                    }
+                    _ => None,
+                }
+            }
+            Lang::TypeScript | Lang::Tsx => {
+                let f = node.child_by_field_name("function")?;
+                (f.kind() == "member_expression")
+                    .then(|| f.child_by_field_name("object").map(text))
+                    .flatten()
+            }
+            Lang::Python => {
+                let f = node.child_by_field_name("function")?;
+                (f.kind() == "attribute")
+                    .then(|| f.child_by_field_name("object").map(text))
+                    .flatten()
+            }
+            Lang::Go => {
+                let f = node.child_by_field_name("function")?;
+                (f.kind() == "selector_expression")
+                    .then(|| f.child_by_field_name("operand").map(text))
+                    .flatten()
+            }
+            Lang::Java => node.child_by_field_name("object").map(text),
+            Lang::Ruby => node.child_by_field_name("receiver").map(text),
+            Lang::CSharp => {
+                let f = node.child_by_field_name("function")?;
+                (f.kind() == "member_access_expression")
+                    .then(|| f.child_by_field_name("expression").map(text))
+                    .flatten()
+            }
+            Lang::Cpp => {
+                let f = node.child_by_field_name("function")?;
+                match f.kind() {
+                    "field_expression" => f.child_by_field_name("argument").map(text),
+                    "qualified_identifier" => f.child_by_field_name("scope").map(text),
+                    _ => None,
+                }
+            }
+            Lang::Kotlin => {
+                let callee = node.named_child(0)?;
+                (callee.kind() == "navigation_expression")
+                    .then(|| callee.named_child(0).map(text))
+                    .flatten()
+            }
+            Lang::Swift => {
+                let callee = node.named_child(0)?;
+                (callee.kind() == "navigation_expression")
+                    .then(|| callee.named_child(0).map(text))
+                    .flatten()
+            }
+            Lang::Php => match node.kind() {
+                "member_call_expression" => node.child_by_field_name("object").map(text),
+                "scoped_call_expression" => node.child_by_field_name("scope").map(text),
+                _ => None,
+            },
+            // C has no methods; SQL's "calls" are table references.
+            Lang::C | Lang::Sql => None,
+        }
+    }
+
+    /// Names this node binds to a named type — typed parameters, locals with
+    /// a type or constructor initializer, and struct/class fields. Static
+    /// hints, not a type checker: anything unclear is simply not reported.
+    pub fn bindings(&self, _node: Node, _src: &str, _out: &mut Vec<(String, String)>) {}
+
     /// Collect imports declared by this node.
     pub fn imports(&self, node: Node, src: &str, out: &mut Vec<ImportRef>) {
         let text = |n: Node| src[n.byte_range()].to_string();

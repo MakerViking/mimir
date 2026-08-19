@@ -4,6 +4,43 @@ All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
+### Added
+- **`mimir audit` — who changed a memory, when, and why.** Nothing recorded
+  writes before this: `deleted_at` and `superseded_by` were set in place, so a
+  correction was structural but anonymous. New `mutation` table (op, actor,
+  reason, before/after hash), `mimir audit [<ref>]`, and the history inline on
+  `get`. Hashes only, never values — an audit that quotes what it audits is a
+  second copy of a deleted fact in a table recall never reads but `export`
+  does; the same plaintext sweep that guards the refusal ledger guards this
+  one. Memories only, because a reindex soft-deletes thousands of chunk rows
+  and a log nobody can read is not an audit. The actor is a required argument
+  rather than ambient state: an `Actor::default()` was tried and deleted,
+  since an audit whose actor can be silently wrong is worse than none.
+
+- **Bi-temporal: `--valid-from`/`--valid-to` on capture, `recall --as-of`.**
+  Two axes that were previously one. `meta.valid_from`/`valid_to` say when the
+  fact was true *in the world* (author-declared, absent means unknown, and a
+  closed interval is labelled rather than hidden — "vegetarian until 2024" is
+  still worth surfacing, which is what `--expires-in` is for when it isn't).
+  `recall --as-of <date>` answers as the store *stood* then: memories deleted
+  or superseded since come back, ones written later are absent.
+
+  As-of is only correct because the mutation ledger dates supersessions —
+  `superseded_by` is a bare column whose `updated_at` bump the next edit
+  overwrites — which is why the two landed together. Stated limit rather than
+  a hidden one: the vector leg's cache covers live nodes only, so an as-of
+  recall is complete but ranked more lexically than a present-tense one, and
+  the command says so in its output.
+
+- **`mimir history <ref>` — every wording a memory has had.** `edit`
+  overwrote body and title in place, so the previous text was simply gone and
+  an as-of query would have handed back today's wording under a past date. New
+  `node_revision` table, written before each edit lands. **A deliberate forget
+  purges it**, because prior versions left behind mean the deleted value
+  survives where recall never looks but `export` and every backup do; decay
+  archival deliberately does not purge, since nobody decided that.
+
+## [Unreleased]
 ### Fixed
 - **The tombstone guard no longer depends on how much you wrote.** The reword
   pass that stops a deliberately forgotten fact from being re-extracted used a

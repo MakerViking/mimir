@@ -27,6 +27,24 @@ pub struct CallSite {
     pub caller: String,
     /// Bare callee name as written (rightmost path segment).
     pub callee: String,
+    /// Receiver expression as written, for `recv.callee(..)` forms —
+    /// `self`, `this`, `self.db`, a variable, or a type name. `None` for a
+    /// bare `callee(..)`. Resolution turns this into a type downstream.
+    pub receiver: Option<String>,
+}
+
+/// A name observed to hold a value of a named type: a typed parameter, a
+/// local `let x: T` / `x := T{}` / `x = T()`, or a struct/class field.
+/// Static extraction, so it is a hint, not a type checker's verdict.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Binding {
+    /// Enclosing scope as qualified name ("" = file top level). A field's
+    /// scope is its type; a local's scope is its function.
+    pub scope: String,
+    /// The bound name (`db`, `self` never appears here).
+    pub name: String,
+    /// Base type name, wrappers unwrapped (`Arc<Db>` → `Db`).
+    pub type_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -42,6 +60,7 @@ pub struct FileExtract {
     pub symbols: Vec<SymbolDef>,
     pub calls: Vec<CallSite>,
     pub imports: Vec<ImportRef>,
+    pub bindings: Vec<Binding>,
 }
 
 pub fn extract(lang: Lang, source: &str) -> FileExtract {
@@ -93,9 +112,24 @@ fn walk(lang: Lang, node: Node, src: &str, scope: &mut Vec<String>, out: &mut Fi
         out.calls.push(CallSite {
             caller: scope.join(&lang.separator()),
             callee,
+            receiver: lang.call_receiver(node, src),
         });
     }
     lang.imports(node, src, &mut out.imports);
+    {
+        // The Lang layer answers "what does this node bind?"; the scope it
+        // was seen in is ours to attach.
+        let mut bound: Vec<(String, String)> = Vec::new();
+        lang.bindings(node, src, &mut bound);
+        let here = scope.join(&lang.separator());
+        for (name, type_name) in bound {
+            out.bindings.push(Binding {
+                scope: here.clone(),
+                name,
+                type_name,
+            });
+        }
+    }
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {

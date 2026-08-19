@@ -225,6 +225,7 @@ fn evaluate_all(
             type_prior_alpha: scoring.type_prior_alpha,
             code_damp: scoring.code_damp,
             include_superseded: false,
+            as_of: None,
         };
         let hits = search::search_hybrid(conn, &query, Some((model, &qvec)), &mut cache)?;
         let retrieved: Vec<i64> = hits.iter().map(|h| h.node.id).collect();
@@ -321,6 +322,7 @@ fn evaluate_inject_all(
             type_prior_alpha: scoring.type_prior_alpha,
             code_damp: scoring.code_damp,
             include_superseded: false,
+            as_of: None,
         };
         let (hits, legs) =
             search::search_hybrid_with_legs(conn, &query, Some((model, &qvec)), &mut cache)?;
@@ -753,6 +755,7 @@ mod tests {
                 type_prior_alpha: scoring.type_prior_alpha,
                 code_damp: scoring.code_damp,
                 include_superseded: false,
+                as_of: None,
             };
             let hits = search::search_hybrid(conn, &query, Some((model, &qvec)), &mut cache)?;
             let relevant = fixtures::relevant_ids(ids, q);

@@ -43,6 +43,42 @@ pub fn collapse_ws(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// (year, month, day) → days-since-epoch. Howard Hinnant's days_from_civil,
+/// the inverse of [`civil_from_days`].
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64;
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// `YYYY-MM-DD` → unix seconds at midnight UTC.
+///
+/// Date-only, deliberately. The queries this serves (`recall --as-of`,
+/// `--valid-from`) are about days, and accepting a time would invite a
+/// timezone question this store has no answer to — everything else here is
+/// UTC. Returns `None` rather than guessing: a misparsed date would silently
+/// answer about the wrong day, which is the failure mode hardest to notice.
+pub fn parse_date(s: &str) -> Option<i64> {
+    let mut parts = s.trim().split('-');
+    let y: i64 = parts.next()?.parse().ok()?;
+    let m: u32 = parts.next()?.parse().ok()?;
+    let d: u32 = parts.next()?.parse().ok()?;
+    if parts.next().is_some() || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let days = days_from_civil(y, m, d);
+    // Round-trip check: catches 2026-02-31 and friends, which the arithmetic
+    // above would happily normalize into March.
+    if civil_from_days(days) != (y, m, d) {
+        return None;
+    }
+    Some(days * 86_400)
+}
+
 /// Lowercase hex. Used for content hashes on the wire (`replicate`) and in
 /// the mutation ledger's rendering, where the hash stands in for a value the
 /// store deliberately does not keep.
@@ -252,6 +288,17 @@ pub fn agent_line_for_query(
         Some(crate::model::MemoryConfidence::Unsure) => " unsure",
         _ => "",
     };
+    // Only a *closed* validity interval reaches this line, on the same
+    // reasoning as `doubt`: "no longer current" changes what an agent should
+    // do with the fact, while an open interval says only what every
+    // undeclared memory already implies. `get` shows both ends in full.
+    let validity = if node.validity_closed(crate::model::now_unix()) {
+        node.valid_to()
+            .map(|to| format!(" until {}", full_date(to)))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     // Same reasoning as `doubt`, and the reason this is worth a parameter
     // rather than a lookup: recall is where an agent decides what to act
     // on, and until now a falsified grounding was only visible to whoever
@@ -259,7 +306,7 @@ pub fn agent_line_for_query(
     // is nobody. Costs a word on the hits that have it and nothing on the
     // rest.
     let stale = if stale_grounding { " stale-link" } else { "" };
-    let mut line = format!("{id} [{tag}{scope} {date}{uses}{doubt}{stale}] {title}");
+    let mut line = format!("{id} [{tag}{scope} {date}{uses}{doubt}{validity}{stale}] {title}");
     if let Some(body) = node.body.as_deref() {
         let flat = collapse_ws(body);
         let stems = query.map(query_stems).unwrap_or_default();
@@ -355,6 +402,23 @@ pub fn full_record(
                 "\nconfidence: {c} (author-declared; not a ranking signal)"
             ));
         }
+        if node.valid_from().is_some() || node.valid_to().is_some() {
+            let from = node
+                .valid_from()
+                .map(full_date)
+                .unwrap_or_else(|| "unknown".into());
+            let to = node.valid_to().map(full_date);
+            out.push_str(&format!(
+                "\nvalid: {from} .. {} (author-declared; when the fact was true, \
+                 not when it was recorded{})",
+                to.clone().unwrap_or_else(|| "open".into()),
+                if node.validity_closed(crate::model::now_unix()) {
+                    " — no longer current"
+                } else {
+                    ""
+                }
+            ));
+        }
         if let crate::grounding::Grounding::Stale { kind, label } =
             crate::grounding::grounding(conn, node.id)?
         {
@@ -397,6 +461,30 @@ mod tests {
         assert_eq!(full_date(0), "1970-01-01");
         assert_eq!(full_date(1_780_000_000), "2026-05-28");
         assert_eq!(month_day(1_780_000_000), "05-28");
+    }
+
+    #[test]
+    fn parse_date_round_trips_and_rejects_rather_than_guessing() {
+        for s in ["1970-01-01", "2026-05-28", "2024-02-29", "1999-12-31"] {
+            let unix = parse_date(s).unwrap_or_else(|| panic!("{s} must parse"));
+            assert_eq!(full_date(unix), s, "round trip through parse/format");
+        }
+        // Normalizing 2026-02-31 into March would answer about the wrong day
+        // with nothing to show for it.
+        for s in [
+            "2026-02-31",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-05",
+            "2026-05-28-01",
+            "not a date",
+            "",
+        ] {
+            assert!(
+                parse_date(s).is_none(),
+                "'{s}' must be refused, not guessed"
+            );
+        }
     }
 
     #[test]

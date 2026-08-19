@@ -60,6 +60,12 @@ pub struct RecallArgs {
     /// true = include superseded memories (hidden by default).
     #[serde(default)]
     pub include_superseded: bool,
+    /// Answer as the store stood on this date (YYYY-MM-DD): memories deleted
+    /// or superseded since come back, ones written later are absent. This is
+    /// what you *knew* then, not what was *true* then — a memory's own
+    /// validity interval is a separate thing, shown by `get`.
+    #[serde(default)]
+    pub as_of: Option<String>,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -251,6 +257,14 @@ impl MimirServer {
             } else {
                 project_id.map(Scope::Project).unwrap_or(Scope::All)
             };
+            let as_of = match args.as_of.as_deref() {
+                Some(s) => Some(mimir_core::format::parse_date(s).ok_or_else(|| {
+                    engine_err(mimir_core::error::Error::Invalid(format!(
+                        "bad as_of '{s}': expected a date like 2026-03-01"
+                    )))
+                })?),
+                None => None,
+            };
             let query = SearchQuery {
                 text: args.query,
                 scope,
@@ -262,6 +276,7 @@ impl MimirServer {
                 type_prior_alpha: m.config.scoring.type_prior_alpha,
                 code_damp: m.config.scoring.code_damp,
                 include_superseded: args.include_superseded,
+                as_of,
             };
             let hits = m.search_with(&query, args.rerank).map_err(engine_err)?;
             if hits.is_empty() {
@@ -1865,6 +1880,7 @@ mod tests {
                 all_projects: true,
                 rerank: false,
                 include_superseded: false,
+                as_of: None,
             }))
             .await;
         assert!(hits.contains("SCRAM"), "recall: {hits}");

@@ -257,6 +257,7 @@ fn find_near_duplicate(conn: &Connection, text: &str) -> Result<Option<Node>> {
         type_prior_alpha: 0.0,
         code_damp: 1.0,
         include_superseded: false,
+        as_of: None,
     };
     for hit in search::search(conn, &query)? {
         // Title-only memories (some imports) have no body — compare against
@@ -391,6 +392,9 @@ pub fn edit(
     let node = store::get_node(conn, id)?;
     let before = node.content_hash.clone();
     let kind = node.kind;
+    // Keep what it said before the update lands — `recall --as-of` reads
+    // this, and after the UPDATE there is nothing left to read.
+    crate::revision::snapshot(conn, &node);
     let body = edit.text.or(node.body);
     let title = match edit.title {
         Some(t) => Some(t),

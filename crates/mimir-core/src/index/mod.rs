@@ -538,6 +538,7 @@ mod tests {
                 type_prior_alpha: 0.0,
                 code_damp: 1.0,
                 include_superseded: false,
+                as_of: None,
             },
         )
         .unwrap();
@@ -578,6 +579,7 @@ mod tests {
                 type_prior_alpha: 0.0,
                 code_damp: 1.0,
                 include_superseded: false,
+                as_of: None,
             },
         )
         .unwrap();
@@ -596,6 +598,7 @@ mod tests {
                 type_prior_alpha: 0.0,
                 code_damp: 1.0,
                 include_superseded: false,
+                as_of: None,
             },
         )
         .unwrap();
@@ -793,6 +796,7 @@ mod tests {
                 type_prior_alpha: 0.0,
                 code_damp: 1.0,
                 include_superseded: false,
+                as_of: None,
             },
         )
         .unwrap();

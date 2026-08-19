@@ -79,7 +79,8 @@ fn ranked_ids(conn: &Connection, query: &SearchQuery, expr: &str, cap: usize) ->
     }
     let mut sql = format!(
         "SELECT n.id FROM node_fts JOIN node n ON n.id = node_fts.rowid
-         WHERE node_fts MATCH ?1 AND n.deleted_at IS NULL AND {}",
+         WHERE node_fts MATCH ?1 AND {} AND {}",
+        crate::search::liveness_sql(query.as_of),
         scope_sql(query.scope)
     );
     if !query.kinds.is_empty() {

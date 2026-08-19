@@ -176,6 +176,7 @@ pub fn compute_with_session(
         type_prior_alpha: mimir.config.scoring.type_prior_alpha,
         code_damp: mimir.config.scoring.code_damp,
         include_superseded: false,
+        as_of: None,
     };
     let (hits, legs) = if bm25_only {
         mimir.search_with_legs_bm25_only(&query)?

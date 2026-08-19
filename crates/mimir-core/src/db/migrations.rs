@@ -256,6 +256,34 @@ CREATE TABLE mutation (
 CREATE INDEX mutation_node ON mutation(node_id, at);
 CREATE INDEX mutation_at   ON mutation(at);
 "#,
+    // Content history: what a memory used to say.
+    //
+    // `memory::edit` overwrites body and title in place, so before this the
+    // previous wording was simply gone. `recall --as-of` needs it: without a
+    // prior body, an as-of query can only tell you a row *existed* then, and
+    // would hand back today's text under a past date — a confident wrong
+    // answer, which is worse than refusing.
+    //
+    // One row per superseded version, written before the update lands. This
+    // is the same "supersede, never delete" invariant the store already holds
+    // for whole memories, applied to the text inside one.
+    //
+    // CRITICAL: a deliberate `forget` purges this table for that node. A
+    // tombstone that leaves prior versions behind means the deleted value
+    // survives somewhere recall never reads but `export` and every backup
+    // do — which is exactly the leak a deletion is supposed to prevent, and
+    // the reason the mutation ledger above stores hashes rather than text.
+    r#"
+CREATE TABLE node_revision (
+    id      INTEGER PRIMARY KEY,
+    node_id INTEGER NOT NULL,
+    at      INTEGER NOT NULL,
+    title   TEXT,
+    body    TEXT,
+    meta    TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX node_revision_node ON node_revision(node_id, at);
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

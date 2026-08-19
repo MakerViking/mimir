@@ -47,6 +47,38 @@ pub struct SearchQuery {
     /// they share one archaeology flag. Note `resolves_when` does NOT retire a
     /// node — an unevaluatable condition can't gate.
     pub include_superseded: bool,
+    /// Answer as the store stood at this instant (unix seconds) instead of
+    /// now — *transaction*-time travel, the axis `created_at`/`deleted_at`
+    /// and the mutation ledger record.
+    ///
+    /// A node qualifies when it existed then (`created_at <= as_of`) and had
+    /// not yet been deleted (`deleted_at` absent or later), and it counts as
+    /// current unless it was already superseded or expired *by then* — which
+    /// is why this needs [`crate::audit::superseded_at`]: `superseded_by` is
+    /// a column with no date of its own.
+    ///
+    /// Deliberately separate from valid time (`meta.valid_from`/`valid_to`,
+    /// see [`crate::model::Node::valid_from`]). "What did I believe in March"
+    /// and "what was true in March" are different questions, and a store that
+    /// answers only one of them while sounding like it answers both is worse
+    /// than one that answers neither.
+    ///
+    /// **Known limit, stated rather than hidden:** the vector leg's matrix
+    /// cache is built once per model over live nodes only, so a memory
+    /// deleted since `as_of` can be proposed by the lexical leg but not the
+    /// semantic one. As-of recall is therefore complete but ranked more
+    /// lexically than a present-tense recall of the same words. Relaxing the
+    /// cache would mean carrying every tombstone in a hot in-memory matrix
+    /// forever to serve a rare query; `mimir recall --as-of` says so in its
+    /// output instead.
+    pub as_of: Option<i64>,
+}
+
+impl SearchQuery {
+    /// The instant this query is asked about: `as_of`, or now.
+    pub fn at(&self) -> i64 {
+        self.as_of.unwrap_or_else(crate::model::now_unix)
+    }
 }
 
 #[derive(Debug)]
@@ -63,6 +95,55 @@ pub(crate) fn scope_sql(scope: Scope) -> String {
         Scope::All => "1=1".into(),
         Scope::Global => "n.project_id IS NULL".into(),
         Scope::Project(id) => format!("(n.project_id = {id} OR n.project_id IS NULL)"),
+    }
+}
+
+/// Whether `node` was present in the store at the query's instant.
+///
+/// Without `as_of` this is the old rule verbatim: a tombstone never surfaces.
+/// With it, a node counts as present when it had been created and had not yet
+/// been deleted — the ordinary meaning of "was it there in March".
+fn existed_at(_conn: &Connection, node: &Node, as_of: Option<i64>) -> bool {
+    match as_of {
+        None => node.deleted_at.is_none(),
+        Some(at) => node.created_at <= at && node.deleted_at.is_none_or(|deleted| deleted > at),
+    }
+}
+
+/// Whether `node` counted as retired — superseded or expired — at the
+/// query's instant.
+///
+/// The supersession date is read from the mutation ledger rather than the
+/// node, because `superseded_by` is a bare column: `set_superseded` bumps
+/// `updated_at`, which the next edit overwrites. A supersession with no
+/// recorded date is treated as always-having-been (the pre-ledger behaviour),
+/// which keeps stores written before the ledger existed answering the way
+/// they always did rather than quietly resurrecting retired memories.
+fn retired_at(conn: &Connection, node: &Node, now: i64, as_of: Option<i64>) -> bool {
+    if node.is_expired(now) {
+        return true;
+    }
+    if node.superseded_by.is_none() {
+        return false;
+    }
+    match as_of {
+        None => true,
+        Some(at) => crate::audit::superseded_at(conn, node.id)
+            .ok()
+            .flatten()
+            .is_none_or(|when| when <= at),
+    }
+}
+
+/// SQL predicate (aliased table `n`) for "present in the store", at now or at
+/// an as-of instant. The Rust-side twin is [`existed_at`]; both must agree, so
+/// they are written next to each other deliberately.
+pub(crate) fn liveness_sql(as_of: Option<i64>) -> String {
+    match as_of {
+        None => "n.deleted_at IS NULL".into(),
+        Some(at) => {
+            format!("(n.created_at <= {at} AND (n.deleted_at IS NULL OR n.deleted_at > {at}))")
+        }
     }
 }
 
@@ -161,7 +242,7 @@ pub fn search_hybrid_with_legs_scored(
         }
     }
 
-    let now = crate::model::now_unix();
+    let now = query.at();
     let fused_count = rrf.len();
     let t_getnode = std::time::Instant::now();
     let ids: Vec<i64> = rrf.keys().copied().collect();
@@ -181,10 +262,16 @@ pub fn search_hybrid_with_legs_scored(
             // A stale vector cache may still hold soft-deleted nodes; they (and,
             // unless explicitly asked for, retired memories — superseded or
             // past their declared expiry) must never surface.
-            if node.deleted_at.is_some()
-                || ((node.superseded_by.is_some() || node.is_expired(now))
-                    && !query.include_superseded)
-            {
+            //
+            // Under `--as-of`, "deleted" and "superseded" are judged at that
+            // instant rather than now: a memory deleted last week was still
+            // there in March, and one superseded in June was still current in
+            // March. The supersession date comes from the mutation ledger,
+            // since `superseded_by` carries none.
+            if !existed_at(conn, &node, query.as_of) {
+                return None;
+            }
+            if !query.include_superseded && retired_at(conn, &node, now, query.as_of) {
                 return None;
             }
             // Decayed strength is a tiebreaker multiplier, never a burier.
@@ -293,7 +380,124 @@ mod tests {
             type_prior_alpha: 0.0,
             code_damp: 1.0,
             include_superseded: false,
+            as_of: None,
         }
+    }
+
+    /// The point of transaction-time travel: a memory deleted since is back,
+    /// judged by when the deletion happened rather than whether it happened.
+    #[test]
+    fn as_of_brings_back_what_was_live_then() {
+        let conn = db::open_in_memory().unwrap();
+        let id = add(
+            &conn,
+            Kind::Memory,
+            None,
+            "kafka retention",
+            "kafka retention is seven days",
+        )
+        .id;
+        // Created in the past, deleted more recently.
+        conn.execute("UPDATE node SET created_at = 1000 WHERE id = ?1", [id])
+            .unwrap();
+        conn.execute("UPDATE node SET deleted_at = 5000 WHERE id = ?1", [id])
+            .unwrap();
+
+        assert!(
+            search(&conn, &q("kafka retention")).unwrap().is_empty(),
+            "a deleted memory must stay gone in the present tense"
+        );
+
+        let mut then = q("kafka retention");
+        then.as_of = Some(3000);
+        let hits = search(&conn, &then).unwrap();
+        assert_eq!(hits.len(), 1, "it was live at 3000: {hits:?}");
+        assert_eq!(hits[0].node.id, id);
+
+        let mut before = q("kafka retention");
+        before.as_of = Some(500);
+        assert!(
+            search(&conn, &before).unwrap().is_empty(),
+            "it did not exist yet at 500"
+        );
+
+        let mut after = q("kafka retention");
+        after.as_of = Some(9000);
+        assert!(
+            search(&conn, &after).unwrap().is_empty(),
+            "it was already deleted by 9000"
+        );
+    }
+
+    /// A supersession has a date only because the mutation ledger records
+    /// one; `superseded_by` is a bare column. Without that row this query
+    /// could not be answered, which is why the two features landed together.
+    #[test]
+    fn as_of_judges_supersession_by_when_it_happened() {
+        let conn = db::open_in_memory().unwrap();
+        let old = add(
+            &conn,
+            Kind::Memory,
+            None,
+            "deploy region",
+            "deploys go to eu-west-1",
+        )
+        .id;
+        let new = add(
+            &conn,
+            Kind::Memory,
+            None,
+            "deploy region",
+            "deploys go to eu-north-1",
+        )
+        .id;
+        conn.execute("UPDATE node SET created_at = 1000 WHERE id = ?1", [old])
+            .unwrap();
+        conn.execute("UPDATE node SET created_at = 4000 WHERE id = ?1", [new])
+            .unwrap();
+        store::set_superseded(&conn, old, new, crate::model::Actor::Human, None).unwrap();
+        // Date the supersession in the ledger the way a real one would be.
+        conn.execute(
+            "UPDATE mutation SET at = 4000 WHERE node_id = ?1 AND op = 'supersede'",
+            [old],
+        )
+        .unwrap();
+
+        // Present tense: the replacement only.
+        let now_hits = search(&conn, &q("deploy region")).unwrap();
+        assert_eq!(now_hits.len(), 1);
+        assert_eq!(now_hits[0].node.id, new);
+
+        // Before the supersession, the old one was still current — and the
+        // replacement had not been written yet.
+        let mut then = q("deploy region");
+        then.as_of = Some(2000);
+        let hits = search(&conn, &then).unwrap();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected only the pre-supersession fact: {hits:?}"
+        );
+        assert_eq!(hits[0].node.id, old);
+    }
+
+    /// Valid time and transaction time are different axes. Declaring that a
+    /// fact stopped being true must not hide it — that is what `expires_at`
+    /// is for, and conflating them would make the label unusable.
+    #[test]
+    fn a_closed_validity_interval_does_not_hide_the_memory() {
+        let conn = db::open_in_memory().unwrap();
+        let id = add(&conn, Kind::Memory, None, "diet", "vegetarian since 2019").id;
+        store::set_valid_interval(&conn, id, Some(1_550_000_000), Some(1_720_000_000)).unwrap();
+
+        let hits = search(&conn, &q("diet vegetarian")).unwrap();
+        assert_eq!(hits.len(), 1, "a no-longer-current fact still surfaces");
+        assert!(
+            hits[0].node.validity_closed(crate::model::now_unix()),
+            "and is marked closed so the reader can see it"
+        );
+        assert_eq!(hits[0].node.valid_at(1_600_000_000), Some(true));
+        assert_eq!(hits[0].node.valid_at(1_800_000_000), Some(false));
     }
 
     #[test]
@@ -707,6 +911,7 @@ mod perf_tests {
             type_prior_alpha: 0.0,
             code_damp: 1.0,
             include_superseded: false,
+            as_of: None,
         };
         let mut cache = None;
         // Cold: builds the 100k×384 matrix.
@@ -785,6 +990,7 @@ mod perf_tests {
                 type_prior_alpha: 0.0,
                 code_damp: 1.0,
                 include_superseded: false,
+                as_of: None,
             };
             let mut cache = None;
             let t = std::time::Instant::now();

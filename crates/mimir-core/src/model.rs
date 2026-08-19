@@ -220,9 +220,56 @@ impl Node {
         self.meta.get("confidence")?.as_str()?.parse().ok()
     }
 
-    /// True once a declared `expires_at` has passed.
+    /// When the fact this memory states began being true in the world, and
+    /// when it stopped — its *valid time*, as distinct from the transaction
+    /// time already on the row (`created_at`, `updated_at`, `deleted_at`,
+    /// plus the dated ops in [`crate::audit`]).
     ///
-    /// This is a *gate*, unlike strength decay — see `learn::effective_strength`,
+    /// The two axes answer different questions and conflating them loses
+    /// both. "I was a vegetarian from 2019 until 2024" and "I recorded that
+    /// on Tuesday" are independent, and only the pair can answer "what was
+    /// true in 2022?" separately from "what did I believe in 2022?".
+    ///
+    /// Author-declared and open-ended at both ends, on the same argument
+    /// `expires_at` and `confidence` rest on: the writer is the only one who
+    /// knows, they know it at write time, and nobody backfills. Absent is a
+    /// real state — an undeclared interval is *unknown*, not `-∞..∞`, so
+    /// nothing here filters recall. `expires_at` remains the separate,
+    /// deliberate gate; a memory can be valid-until-2024 and still worth
+    /// surfacing, which is exactly why "no longer current" is rendered rather
+    /// than hidden.
+    pub fn valid_from(&self) -> Option<i64> {
+        self.meta.get("valid_from")?.as_i64()
+    }
+
+    /// See [`Node::valid_from`].
+    pub fn valid_to(&self) -> Option<i64> {
+        self.meta.get("valid_to")?.as_i64()
+    }
+
+    /// True when a declared validity interval has closed — the fact was true
+    /// once and, by the author's own account, no longer is.
+    ///
+    /// This is the case worth a reader's attention, and the only one that
+    /// earns a token on the compact recall line: an open interval says
+    /// "still true as far as anyone said", which is what every undeclared
+    /// memory already implies.
+    pub fn validity_closed(&self, now: i64) -> bool {
+        self.valid_to().is_some_and(|to| to <= now)
+    }
+
+    /// Whether the fact was true at `at`, as far as the author declared.
+    /// `None` when nothing was declared — unknown, not false.
+    pub fn valid_at(&self, at: i64) -> Option<bool> {
+        let (from, to) = (self.valid_from(), self.valid_to());
+        if from.is_none() && to.is_none() {
+            return None;
+        }
+        Some(from.is_none_or(|f| at >= f) && to.is_none_or(|t| at < t))
+    }
+
+    /// True once a declared `expires_at` has passed.
+    ///    /// This is a *gate*, unlike strength decay — see `learn::effective_strength`,
     /// where decay is explicitly "a tiebreaker multiplier, never a burier". Decay
     /// models "gradually less relevant"; it cannot model "became false on a
     /// specific date", so an expired memory would otherwise keep winning its

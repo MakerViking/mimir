@@ -1020,6 +1020,8 @@ pub fn remember(
     expires_in: Option<String>,
     resolves_when: Option<String>,
     confidence: Option<String>,
+    valid_from: Option<String>,
+    valid_to: Option<String>,
 ) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let mtype: MemoryType = mtype.parse()?;
@@ -1046,6 +1048,23 @@ pub fn remember(
                 })
         })
         .transpose()?;
+    // Same rule again for the validity interval.
+    let parse_day = |label: &str, v: &Option<String>| -> Result<Option<i64>> {
+        v.as_deref()
+            .map(|s| {
+                mimir_core::format::parse_date(s).ok_or_else(|| {
+                    anyhow!("invalid --{label} {s:?}: expected a date like 2024-06-30")
+                })
+            })
+            .transpose()
+    };
+    let valid_from = parse_day("valid-from", &valid_from)?;
+    let valid_to = parse_day("valid-to", &valid_to)?;
+    if let (Some(f), Some(t)) = (valid_from, valid_to) {
+        if t <= f {
+            bail!("--valid-to must be after --valid-from");
+        }
+    }
     let project = if global {
         None
     } else {
@@ -1114,6 +1133,18 @@ pub fn remember(
                 store::set_confidence(&mimir.conn, node.id, c)?;
                 println!("confidence: {c}");
             }
+            if valid_from.is_some() || valid_to.is_some() {
+                store::set_valid_interval(&mimir.conn, node.id, valid_from, valid_to)?;
+                println!(
+                    "valid {} → {}",
+                    valid_from
+                        .map(mimir_core::format::full_date)
+                        .unwrap_or_else(|| "?".into()),
+                    valid_to
+                        .map(mimir_core::format::full_date)
+                        .unwrap_or_else(|| "now".into())
+                );
+            }
             // Keep semantic recall fresh; harmless no-op without a model.
             if let Err(err) = mimir.embed_pending() {
                 tracing::warn!(%err, "embedding new memory failed");
@@ -1146,6 +1177,7 @@ pub fn recall(
     linked: bool,
     min_score: Option<f64>,
     include_superseded: bool,
+    as_of: Option<i64>,
 ) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let query = SearchQuery {
@@ -1158,6 +1190,7 @@ pub fn recall(
         type_prior_alpha: mimir.config.scoring.type_prior_alpha,
         code_damp: mimir.config.scoring.code_damp,
         include_superseded,
+        as_of,
         text,
     };
     let mut hits = mimir.search_with(&query, rerank)?;
@@ -1186,6 +1219,16 @@ pub fn recall(
     }
 
     let projects = store::project_titles(&mimir.conn)?;
+    if let Some(at) = as_of {
+        if !json {
+            println!(
+                "as of {} — what the store held then, not what was true then. \
+                 Ranking is more lexical than usual: the semantic index only \
+                 covers memories that are still live.",
+                mimir_core::format::full_date(at)
+            );
+        }
+    }
     if hits.is_empty() && !json {
         println!("no results");
         return Ok(());
@@ -1545,6 +1588,59 @@ pub fn audit(reference: Option<&str>, limit: usize, json: bool) -> Result<()> {
         "\nthe `value` column is a hash prefix, not the text — a record of a \
          deletion that quotes what was deleted is a second copy of it."
     );
+    Ok(())
+}
+
+/// A memory's life: every recorded change, and every wording it has had.
+///
+/// The atlas's criterion D — "correction is not amnesia", so
+/// "where did I *use* to live?" has to keep working after a correction.
+pub fn history(reference: &str) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let node = store::resolve_ref_including_deleted(&mimir.conn, reference)?;
+    let changes = mimir_core::audit::history(&mimir.conn, node.id)?;
+    let versions = mimir_core::revision::history(&mimir.conn, node.id)?;
+
+    println!(
+        "{} {}",
+        short_uid(node.kind, &node.uid),
+        node.title.as_deref().unwrap_or("")
+    );
+    println!(
+        "  {} created",
+        mimir_core::format::full_date(node.created_at)
+    );
+    for v in &versions {
+        println!(
+            "  {} said: {}",
+            mimir_core::format::full_date(v.at),
+            mimir_core::format::truncate_chars(
+                &mimir_core::format::collapse_ws(v.body.as_deref().unwrap_or("")),
+                100
+            )
+        );
+    }
+    for m in &changes {
+        println!(
+            "  {} {} by {}{}",
+            mimir_core::format::full_date(m.at),
+            m.op.as_str(),
+            m.actor.as_str(),
+            m.reason
+                .as_deref()
+                .map(|r| format!(" — {r}"))
+                .unwrap_or_default()
+        );
+    }
+    if versions.is_empty() && changes.is_empty() {
+        println!("  (nothing has happened to it since)");
+    }
+    // Say what this does NOT cover, rather than letting an empty list read as
+    // "nothing happened": a deliberate forget purges prior wordings on
+    // purpose, so their absence here is the deletion working.
+    if node.deleted_at.is_some() {
+        println!("\nforgotten — prior wordings were purged with it, by design.");
+    }
     Ok(())
 }
 
