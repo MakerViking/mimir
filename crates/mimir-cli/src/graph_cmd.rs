@@ -41,6 +41,42 @@ pub(crate) fn ensure_graph(mimir: &mut Mimir, proj: &Node) -> Result<()> {
     Ok(())
 }
 
+/// Every project that actually has a graph. The rest cost a query and can
+/// match nothing.
+fn graphed_projects(mimir: &Mimir) -> Result<Vec<Node>> {
+    let mut stmt = mimir.conn.prepare(&format!(
+        "SELECT {} FROM node p WHERE p.kind='project' AND p.deleted_at IS NULL
+           AND EXISTS (SELECT 1 FROM node s WHERE s.kind='symbol'
+                       AND s.project_id=p.id AND s.deleted_at IS NULL)
+         ORDER BY p.title",
+        store::NODE_COLS
+    ))?;
+    let rows = stmt.query_map([], mimir_core::store::row_to_node)?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The projects a query should run against: just this one, or every graphed
+/// project. `--all-projects` exists because a symbol you are asking about
+/// often lives in a repo you are not standing in — and call edges never
+/// cross a project boundary, so each graph is searched on its own and the
+/// results are labelled, never merged.
+fn targets(mimir: &mut Mimir, all_projects: bool) -> Result<Vec<Node>> {
+    if !all_projects {
+        let proj = project(mimir)?;
+        ensure_graph(mimir, &proj)?;
+        return Ok(vec![proj]);
+    }
+    let all = graphed_projects(mimir)?;
+    if all.is_empty() {
+        bail!("no project has a code graph yet — run `mimir graph build` in one first");
+    }
+    Ok(all)
+}
+
+fn project_header(proj: &Node) -> String {
+    format!("── {} ──", proj.title.as_deref().unwrap_or("(unnamed)"))
+}
+
 pub fn build() -> Result<()> {
     let mut mimir = Mimir::open()?;
     let proj = project(&mimir)?;
@@ -48,7 +84,7 @@ pub fn build() -> Result<()> {
     let started = std::time::Instant::now();
     let stats = mimir_graph::update(&mut mimir.conn, &proj, &root)?;
     println!(
-        "{}: {} files seen, {} indexed, {} unchanged, {} removed — {} symbols, {} calls resolved (+{} heuristic), {} import edges [{:.1?}]",
+        "{}: {} files seen, {} indexed, {} unchanged, {} removed — {} symbols, {} calls resolved ({} by receiver type, +{} heuristic), {} import edges [{:.1?}]",
         proj.title.as_deref().unwrap_or("project"),
         stats.files_seen,
         stats.files_indexed,
@@ -56,6 +92,7 @@ pub fn build() -> Result<()> {
         stats.removed,
         stats.symbols,
         stats.calls_resolved,
+        stats.calls_typed,
         stats.calls_heuristic,
         stats.imports,
         started.elapsed(),
@@ -67,69 +104,158 @@ pub fn build() -> Result<()> {
     Ok(())
 }
 
-pub fn callers(reference: &str, depth: usize) -> Result<()> {
-    walk_relation(reference, depth, true)
-}
-
-pub fn calls(reference: &str, depth: usize) -> Result<()> {
-    walk_relation(reference, depth, false)
-}
-
-fn walk_relation(reference: &str, depth: usize, reverse: bool) -> Result<()> {
-    let mut mimir = Mimir::open()?;
+/// Report whether the graph still matches the working tree, and say so with
+/// an exit code so a hook or CI job can act on it. Never writes: a check
+/// that quietly rebuilt would pass every time and prove nothing.
+pub fn check(json: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
     let proj = project(&mimir)?;
-    ensure_graph(&mut mimir, &proj)?;
-    let sym = resolve_symbol(&mimir.conn, proj.id, reference)?;
-    let graph = CodeGraph::load(&mimir.conn, proj.id)?;
-    let reached = if reverse {
-        graph.callers(sym.id, depth)
+    let root = std::path::PathBuf::from(proj.path.as_deref().context("project has no root")?);
+    let drift = mimir_graph::check(&mimir.conn, &proj, &root)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "project": proj.title,
+                "stale": drift.is_stale(),
+                "added": drift.added,
+                "changed": drift.changed,
+                "removed": drift.removed,
+                "unchanged": drift.unchanged,
+            })
+        );
+    } else if !drift.is_stale() {
+        println!(
+            "{}: graph is current ({} files)",
+            proj.title.as_deref().unwrap_or("project"),
+            drift.unchanged
+        );
     } else {
-        graph.calls(sym.id, depth)
-    };
-    println!("{}", symbol_line(&sym));
-    if reached.is_empty() {
-        println!("no {} found", if reverse { "callers" } else { "callees" });
-        return Ok(());
+        // Enough to act on without burying a big refactor's output.
+        const SHOWN: usize = 10;
+        for (label, paths) in [
+            ("new", &drift.added),
+            ("changed", &drift.changed),
+            ("gone", &drift.removed),
+        ] {
+            for p in paths.iter().take(SHOWN) {
+                println!("{label:>7}  {p}");
+            }
+            if paths.len() > SHOWN {
+                println!("{:>7}  … and {} more", "", paths.len() - SHOWN);
+            }
+        }
     }
-    for r in reached {
-        let node = store::get_node(&mimir.conn, r.id)?;
-        println!("{}{}", "  ".repeat(r.distance), symbol_line(&node));
+    if drift.is_stale() {
+        bail!(
+            "graph is {} file(s) behind the working tree — run `mimir graph build`",
+            drift.stale_count()
+        );
+    }
+    Ok(())
+}
+
+pub fn callers(reference: &str, depth: usize, all_projects: bool) -> Result<()> {
+    walk_relation(reference, depth, true, all_projects)
+}
+
+pub fn calls(reference: &str, depth: usize, all_projects: bool) -> Result<()> {
+    walk_relation(reference, depth, false, all_projects)
+}
+
+fn walk_relation(reference: &str, depth: usize, reverse: bool, all_projects: bool) -> Result<()> {
+    let mut mimir = Mimir::open()?;
+    let projects = targets(&mut mimir, all_projects)?;
+    let multi = projects.len() > 1;
+    let mut found = 0usize;
+
+    for proj in &projects {
+        // Across projects a name may be missing or ambiguous in most of
+        // them; that is not an error, it is just the wrong repo.
+        let sym = match resolve_symbol(&mimir.conn, proj.id, reference) {
+            Ok(s) => s,
+            Err(e) if multi => {
+                if matches!(e, mimir_core::error::Error::AmbiguousRef(..)) {
+                    eprintln!("{}: {e}", proj.title.as_deref().unwrap_or("(unnamed)"));
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
+        found += 1;
+        let graph = CodeGraph::load(&mimir.conn, proj.id)?;
+        let reached = if reverse {
+            graph.callers(sym.id, depth)
+        } else {
+            graph.calls(sym.id, depth)
+        };
+        if multi {
+            println!("{}", project_header(proj));
+        }
+        println!("{}", symbol_line(&sym));
+        if reached.is_empty() {
+            println!("no {} found", if reverse { "callers" } else { "callees" });
+            continue;
+        }
+        for r in reached {
+            let node = store::get_node(&mimir.conn, r.id)?;
+            println!("{}{}", "  ".repeat(r.distance), symbol_line(&node));
+        }
+    }
+    if found == 0 {
+        bail!("no project has a symbol named `{reference}`");
     }
     Ok(())
 }
 
 /// Blast radius of changing the given files (e.g. `$(git diff --name-only)`).
-pub fn impact(files: Vec<String>, depth: usize) -> Result<()> {
+pub fn impact(files: Vec<String>, depth: usize, all_projects: bool) -> Result<()> {
     let mut mimir = Mimir::open()?;
-    let proj = project(&mimir)?;
-    ensure_graph(&mut mimir, &proj)?;
-    let graph = CodeGraph::load(&mimir.conn, proj.id)?;
+    let projects = targets(&mut mimir, all_projects)?;
+    let multi = projects.len() > 1;
+    let mut hit_any = false;
 
-    let mut seeds: Vec<i64> = Vec::new();
-    for f in &files {
-        let matches = store::files_by_path_suffix(&mimir.conn, f.trim_start_matches("./"))?;
-        for file in matches {
-            seeds.push(file.id);
-            if let Some(symbols) = graph.file_symbols.get(&file.id) {
-                seeds.extend(symbols);
+    for proj in &projects {
+        let graph = CodeGraph::load(&mimir.conn, proj.id)?;
+        let mut seeds: Vec<i64> = Vec::new();
+        for f in &files {
+            let matches = store::files_by_path_suffix(&mimir.conn, f.trim_start_matches("./"))?;
+            for file in matches {
+                // A suffix like `src/lib.rs` matches in half the repos on
+                // the machine; only this project's files seed its graph.
+                if file.project_id != Some(proj.id) {
+                    continue;
+                }
+                seeds.push(file.id);
+                if let Some(symbols) = graph.file_symbols.get(&file.id) {
+                    seeds.extend(symbols);
+                }
             }
         }
+        if seeds.is_empty() {
+            continue;
+        }
+        hit_any = true;
+        let reached = graph.impact(&seeds, depth);
+        if multi {
+            println!("{}", project_header(proj));
+        }
+        if reached.is_empty() {
+            println!("no impact outside the changed files");
+            continue;
+        }
+        for r in &reached {
+            let node = store::get_node(&mimir.conn, r.id)?;
+            if node.kind == Kind::Symbol {
+                println!("{}{}", "  ".repeat(r.distance - 1), symbol_line(&node));
+            }
+        }
+        println!("({} affected symbols within {depth} hops)", reached.len());
     }
-    if seeds.is_empty() {
+    if !hit_any {
         bail!("none of those paths are in the code graph (run `mimir graph build`?)");
     }
-    let reached = graph.impact(&seeds, depth);
-    if reached.is_empty() {
-        println!("no impact outside the changed files");
-        return Ok(());
-    }
-    for r in &reached {
-        let node = store::get_node(&mimir.conn, r.id)?;
-        if node.kind == Kind::Symbol {
-            println!("{}{}", "  ".repeat(r.distance - 1), symbol_line(&node));
-        }
-    }
-    println!("({} affected symbols within {depth} hops)", reached.len());
     Ok(())
 }
 
@@ -166,25 +292,45 @@ pub fn node_info(reference: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn path(a: &str, b: &str) -> Result<()> {
+pub fn path(a: &str, b: &str, all_projects: bool) -> Result<()> {
     let mut mimir = Mimir::open()?;
-    let proj = project(&mimir)?;
-    ensure_graph(&mut mimir, &proj)?;
-    let sa = resolve_symbol(&mimir.conn, proj.id, a)?;
-    let sb = resolve_symbol(&mimir.conn, proj.id, b)?;
-    let graph = CodeGraph::load(&mimir.conn, proj.id)?;
-    match graph.path(sa.id, sb.id) {
-        Some(ids) => {
-            for (i, id) in ids.iter().enumerate() {
-                let node = store::get_node(&mimir.conn, *id)?;
-                println!("{}{}", "  ".repeat(i), symbol_line(&node));
-            }
+    let projects = targets(&mut mimir, all_projects)?;
+    let multi = projects.len() > 1;
+    let mut found = 0usize;
+
+    for proj in &projects {
+        // A call path needs both ends in one graph — edges never cross a
+        // project — so a project missing either symbol simply isn't it.
+        // Standing in one project, though, "not found" is the useful answer.
+        let (sa, sb) = match (
+            resolve_symbol(&mimir.conn, proj.id, a),
+            resolve_symbol(&mimir.conn, proj.id, b),
+        ) {
+            (Ok(sa), Ok(sb)) => (sa, sb),
+            (Err(e), _) | (_, Err(e)) if !multi => return Err(e.into()),
+            _ => continue,
+        };
+        found += 1;
+        let graph = CodeGraph::load(&mimir.conn, proj.id)?;
+        if multi {
+            println!("{}", project_header(proj));
         }
-        None => println!(
-            "no call path {} → {}",
-            sa.title.as_deref().unwrap_or(a),
-            sb.title.as_deref().unwrap_or(b)
-        ),
+        match graph.path(sa.id, sb.id) {
+            Some(ids) => {
+                for (i, id) in ids.iter().enumerate() {
+                    let node = store::get_node(&mimir.conn, *id)?;
+                    println!("{}{}", "  ".repeat(i), symbol_line(&node));
+                }
+            }
+            None => println!(
+                "no call path {} → {}",
+                sa.title.as_deref().unwrap_or(a),
+                sb.title.as_deref().unwrap_or(b)
+            ),
+        }
+    }
+    if found == 0 {
+        bail!("no project has both `{a}` and `{b}`");
     }
     Ok(())
 }

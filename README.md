@@ -68,7 +68,14 @@ they're a side effect; the point is the links.
   Python, Go, Java, Ruby, C, C++, C#, Kotlin, Swift, PHP, SQL) with
   call/import edges: `graph callers`, `impact` (blast radius of a diff),
   `path`, `hubs` — and code symbols participate in semantic recall. Link
-  memories to functions and they surface together.
+  memories to functions and they surface together. Method calls resolve
+  through the **receiver's type** where one is legible statically (typed
+  parameters and fields, constructor initializers, `self`/`this`), so
+  `db.save()` and `cache.save()` land on different edges instead of a guess
+  at every `save` in the repo. `graph check` reports drift as an exit code
+  — content-hashed, never writing — for a pre-commit hook or CI. Any query
+  takes `--all-projects` to search every repo that has a graph, labelled per
+  project (edges never cross a project, so results are never merged).
 - **Code content search.** `mimir code add <dir>` indexes source files
   chunked on tree-sitter symbol boundaries, so recall matches function/method
   *bodies* — inline comments, string literals, implementation details — not
@@ -201,7 +208,9 @@ mimir recall tricky semantic question --rerank  # cross-encoder rescoring (~1 s 
 # code graph (the MCP server runs build + docs indexing automatically
 # on session start — these are for manual/CLI use)
 mimir graph build                 # tree-sitter extraction, incremental
+mimir graph check                 # exit 1 if the graph lags the tree (CI/hooks)
 mimir graph callers resolve_ref   # who calls this?
+mimir graph callers resolve_ref --all-projects   # …in every repo with a graph
 mimir graph impact $(git diff --name-only)   # blast radius of a change
 mimir graph viz --open            # interactive graph map (self-contained HTML)
 mimir link m:ABC123 my_function --rel about  # decisions ↔ code

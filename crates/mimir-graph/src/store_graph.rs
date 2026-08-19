@@ -24,6 +24,9 @@ pub struct GraphStats {
     pub removed: usize,
     pub symbols: usize,
     pub calls_resolved: usize,
+    /// Subset of `calls_resolved` pinned to one method by its receiver's
+    /// type rather than by name alone.
+    pub calls_typed: usize,
     pub calls_heuristic: usize,
     pub imports: usize,
 }
@@ -158,8 +161,107 @@ pub fn update(conn: &mut Connection, project: &Node, root: &Path) -> Result<Grap
     Ok(stats)
 }
 
-fn code_file(conn: &Connection, project_id: i64, rel: &str) -> Result<Option<Node>> {
-    Ok(conn
+/// What the graph would learn if it were rebuilt right now. Drift is
+/// defined by content, not timestamps: a touched file whose bytes are
+/// unchanged is not drift, because a rebuild would find nothing to do.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Drift {
+    pub added: Vec<String>,
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
+    pub unchanged: usize,
+}
+
+impl Drift {
+    pub fn is_stale(&self) -> bool {
+        !self.added.is_empty() || !self.changed.is_empty() || !self.removed.is_empty()
+    }
+
+    pub fn stale_count(&self) -> usize {
+        self.added.len() + self.changed.len() + self.removed.len()
+    }
+}
+
+/// Compare the stored graph against the working tree without touching
+/// either. Deliberately never writes — not even the mtime refresh `update`
+/// does — so it is safe in a pre-commit hook or a CI job running against a
+/// read-only checkout.
+pub fn check(conn: &Connection, project: &Node, root: &Path) -> Result<Drift> {
+    let mut drift = Drift::default();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    // Same traversal as `update`, or the two would disagree about which
+    // files are even in scope.
+    for entry in ignore::WalkBuilder::new(root).build() {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(%err, "skipping unreadable entry");
+                continue;
+            }
+        };
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let path = entry.path();
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if Lang::from_path(&rel).is_none() {
+            continue;
+        }
+        seen.insert(rel.clone());
+
+        let existing = code_file(conn, project.id, &rel)?;
+        let Some(f) = existing.filter(|f| f.deleted_at.is_none()) else {
+            drift.added.push(rel);
+            continue;
+        };
+        let meta = entry
+            .metadata()
+            .map_err(|e| Error::Invalid(format!("stat {rel}: {e}")))?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(-1);
+        if mtime >= 0
+            && f.meta.get("mtime").and_then(|v| v.as_i64()) == Some(mtime)
+            && f.meta.get("size").and_then(|v| v.as_i64()) == Some(meta.len() as i64)
+        {
+            drift.unchanged += 1;
+            continue;
+        }
+        let raw = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+        let hash = blake3::hash(String::from_utf8_lossy(&raw).as_bytes());
+        if f.content_hash.as_deref() == Some(hash.as_bytes()) {
+            drift.unchanged += 1;
+        } else {
+            drift.changed.push(rel);
+        }
+    }
+
+    let mut stmt = conn.prepare(
+        "SELECT path FROM node
+         WHERE kind = 'file' AND project_id = ?1 AND collection_id IS NULL
+           AND deleted_at IS NULL",
+    )?;
+    let live: Vec<String> = stmt
+        .query_map([project.id], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+    drift.removed = live.into_iter().filter(|p| !seen.contains(p)).collect();
+
+    drift.added.sort();
+    drift.changed.sort();
+    drift.removed.sort();
+    Ok(drift)
+}
+
+fn code_file(conn: &Connection, project_id: i64, rel: &str) -> Result<Option<Node>> {    Ok(conn
         .query_row(
             &format!(
                 "SELECT {NODE_COLS} FROM node
@@ -373,6 +475,19 @@ fn resolve_calls(
     };
 
     for (file_id, rel, fx) in changed {
+        // Bindings are per-file by construction: a receiver is a name in
+        // scope at the call site, so the file that holds the call also
+        // holds whatever declared it.
+        let mut binds: HashMap<(&str, &str), &str> = HashMap::new();
+        for b in &fx.bindings {
+            // First declaration wins — parameters and fields are seen
+            // before any later shadowing, and determinism matters more
+            // than chasing reassignment.
+            binds
+                .entry((b.scope.as_str(), b.name.as_str()))
+                .or_insert(b.type_name.as_str());
+        }
+
         // Wipe edges originating from this file's symbols + its imports.
         conn.execute(
             "DELETE FROM edge WHERE rel = 'calls' AND src IN
@@ -409,6 +524,15 @@ fn resolve_calls(
             let Some(candidates) = candidates else {
                 continue;
             };
+            // Tier 0: the receiver's type names exactly one method. This is
+            // the only tier that can tell two same-named methods apart, so
+            // it runs before the same-file shortcut.
+            if let Some(dst) = receiver_target(call, &binds, &fx.bindings, candidates, src, rel) {
+                link_call(conn, src, dst, 1.0, true)?;
+                stats.calls_resolved += 1;
+                stats.calls_typed += 1;
+                continue;
+            }
             // Tier 1: same file.
             if let Some(c) = candidates.iter().find(|c| c.path == *rel && c.id != src) {
                 link_call(conn, src, c.id, 1.0, true)?;
@@ -442,6 +566,122 @@ fn resolve_calls(
         }
     }
     Ok(())
+}
+
+/// Receivers that mean "the type I am defined on" rather than a name in
+/// scope. `Self` is Rust's type-position spelling; the rest are values.
+const SELF_RECEIVERS: &[&str] = &["self", "this", "Self", "$this"];
+
+/// Tier 0: turn `recv.callee(..)` into the one method it can mean, using the
+/// receiver's type. Returns the target symbol id, or None when the receiver
+/// is absent, its type is unknown, or the type owns no such method — every
+/// one of which falls through to the name-based tiers unchanged.
+fn receiver_target(
+    call: &extract::CallSite,
+    binds: &HashMap<(&str, &str), &str>,
+    bindings: &[extract::Binding],
+    candidates: &[&SymRef],
+    src: i64,
+    rel: &str,
+) -> Option<i64> {
+    let receiver = call.receiver.as_deref()?;
+    let ty = receiver_type(receiver, &call.caller, binds, bindings)?;
+
+    // The type may be written bare (`Greeter`) while the symbol is nested
+    // (`App::Greeter::format`), so accept an exact match or a suffix.
+    let exact = format!("{ty}::{}", call.callee);
+    let suffix = format!("::{exact}");
+    let owned: Vec<&&SymRef> = candidates
+        .iter()
+        .filter(|c| c.id != src && (c.qualified == exact || c.qualified.ends_with(&suffix)))
+        .collect();
+    match owned.len() {
+        0 => None,
+        1 => Some(owned[0].id),
+        // The same type path in two files: no better than a guess unless
+        // exactly one of them is right here. Otherwise fall through to the
+        // name-based tiers, which are honest about the weight.
+        _ => {
+            let same_file: Vec<&&&SymRef> = owned.iter().filter(|c| c.path == rel).collect();
+            (same_file.len() == 1).then(|| same_file[0].id)
+        }
+    }
+}
+
+/// Walk a receiver expression to a type name: `self` → the enclosing type,
+/// `self.db` → that type's field type, `store` → a local/parameter's type,
+/// `Formatter` → itself. Field chains are followed one segment at a time.
+fn receiver_type(
+    receiver: &str,
+    caller: &str,
+    binds: &HashMap<(&str, &str), &str>,
+    bindings: &[extract::Binding],
+) -> Option<String> {
+    let segments: Vec<&str> = receiver
+        .split(['.', ':', '>', '-'])
+        .filter(|s| !s.is_empty())
+        .map(|s| s.trim_start_matches('$'))
+        .collect();
+    let (first, rest) = segments.split_first()?;
+
+    let mut ty = if SELF_RECEIVERS.contains(first) {
+        // The enclosing type is the caller's qualified name minus the
+        // method itself: "App::Greeter::greet" → "App::Greeter".
+        caller.rsplit_once("::")?.0.to_string()
+    } else {
+        lookup_binding(binds, caller, first)
+            .map(str::to_string)
+            // Not a name in scope: the receiver is a type already
+            // (`Formatter::upper`, `Type.Method()`).
+            .unwrap_or_else(|| (*first).to_string())
+    };
+    for field in rest {
+        ty = field_type(bindings, &ty, field)?.to_string();
+    }
+    (!ty.is_empty()).then_some(ty)
+}
+
+/// A local or parameter, looked up from the calling scope outward — an
+/// inner function sees names declared around it.
+fn lookup_binding<'a>(
+    binds: &HashMap<(&str, &'a str), &'a str>,
+    caller: &str,
+    name: &str,
+) -> Option<&'a str> {
+    let mut scope = caller;
+    loop {
+        if let Some(ty) = binds.get(&(scope, name)) {
+            return Some(ty);
+        }
+        match scope.rsplit_once("::") {
+            Some((outer, _)) => scope = outer,
+            None => return binds.get(&("", name)).copied(),
+        }
+    }
+}
+
+/// A field's type, searched across every scope belonging to the owning type
+/// — a Python field is declared inside `__init__`, not on the class. Source
+/// order decides ties, so the graph is the same on every rebuild.
+fn field_type<'a>(bindings: &'a [extract::Binding], ty: &str, field: &str) -> Option<&'a str> {
+    let owned = || {
+        bindings
+            .iter()
+            .filter(|b| b.name == field && scope_owned_by(&b.scope, ty))
+    };
+    owned()
+        .find(|b| b.scope == ty)
+        .or_else(|| owned().next())
+        .map(|b| b.type_name.as_str())
+}
+
+/// Is `scope` the type `ty` itself, or something nested inside it? Matches
+/// on the bare name too, since a receiver rarely spells the full path.
+fn scope_owned_by(scope: &str, ty: &str) -> bool {
+    scope == ty
+        || scope.starts_with(&format!("{ty}::"))
+        || scope.ends_with(&format!("::{ty}"))
+        || scope.contains(&format!("::{ty}::"))
 }
 
 fn link_call(conn: &Connection, src: i64, dst: i64, weight: f64, resolved: bool) -> Result<()> {
@@ -503,10 +743,13 @@ fn resolve_import(importer: &str, source: &str, files: &HashSet<&str>) -> Option
             return None;
         }
         // The import target is usually an item; its module file is the
-        // second-to-last segment (or last for module imports).
+        // second-to-last segment (or last for module imports). `files` is a
+        // set, so pick the smallest match rather than whichever the hash
+        // order happens to yield — a graph that differs between rebuilds
+        // makes `graph check` cry wolf.
         for take in (1..=segs.len().min(3)).rev() {
             let suffix = format!("{}.rs", segs[..take].join("/"));
-            if let Some(hit) = files.iter().find(|f| f.ends_with(&suffix)) {
+            if let Some(hit) = files.iter().filter(|f| f.ends_with(&suffix)).min() {
                 return Some(hit.to_string());
             }
         }
@@ -523,7 +766,8 @@ fn resolve_import(importer: &str, source: &str, files: &HashSet<&str>) -> Option
         .or_else(|| {
             files
                 .iter()
-                .find(|f| f.ends_with(&format!("{joined}.py")))
+                .filter(|f| f.ends_with(&format!("{joined}.py")))
+                .min()
                 .map(|f| f.to_string())
         });
     }
@@ -533,7 +777,7 @@ fn resolve_import(importer: &str, source: &str, files: &HashSet<&str>) -> Option
     let last = source.rsplit('/').next().unwrap_or(source);
     files
         .iter()
-        .find(|f| {
+        .filter(|f| {
             Path::new(f)
                 .parent()
                 .and_then(|p| p.file_name())
@@ -541,6 +785,7 @@ fn resolve_import(importer: &str, source: &str, files: &HashSet<&str>) -> Option
                 .unwrap_or(false)
                 || **f == format!("{last}.py")
         })
+        .min()
         .map(|f| f.to_string())
 }
 

@@ -7,4 +7,3 @@
 
 pub mod extract;
 pub mod languages;
-pub mod probe;

@@ -21,7 +21,7 @@ use mimir_core::store::{self, row_to_node, NODE_COLS};
 use rusqlite::Connection;
 
 pub use queries::CodeGraph;
-pub use store_graph::{update, GraphStats};
+pub use store_graph::{check, update, Drift, GraphStats};
 
 /// Resolve a symbol by short id, exact qualified name, or bare name.
 /// Bare-name matches must be unique; ambiguity lists the candidates.
@@ -325,5 +325,163 @@ mod tests {
             "active_orders",
             "orders",
         );
+    }
+
+    /// Two types, one method name, two files: the case name-based
+    /// resolution cannot get right. Before receiver typing this produced a
+    /// half-weight edge to *both* `save`s, which is exactly the noise that
+    /// makes `impact` untrustworthy.
+    #[test]
+    fn receiver_type_picks_one_of_two_same_named_methods() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/db.rs",
+            "pub struct Database;\nimpl Database { pub fn save(&self) -> u8 { 1 } }\n",
+        );
+        write(
+            dir.path(),
+            "src/cache.rs",
+            "pub struct Cache;\nimpl Cache { pub fn save(&self) -> u8 { 2 } }\n",
+        );
+        write(
+            dir.path(),
+            "src/app.rs",
+            "fn persist() {\n    let db = Database::new();\n    db.save();\n}\n",
+        );
+        let mimir = Mimir::open_in_memory().unwrap();
+        let proj = project(&mimir.conn, dir.path());
+        let mut conn = mimir.conn;
+        let stats = update(&mut conn, &proj, dir.path()).unwrap();
+        assert!(stats.calls_typed >= 1, "{stats:?}");
+
+        let graph = CodeGraph::load(&conn, proj.id).unwrap();
+        let persist = resolve_symbol(&conn, proj.id, "persist").unwrap();
+        let db_save = resolve_symbol(&conn, proj.id, "Database::save").unwrap();
+        let cache_save = resolve_symbol(&conn, proj.id, "Cache::save").unwrap();
+
+        let hits = graph.callers(db_save.id, 2);
+        assert!(
+            hits.iter().any(|r| r.id == persist.id),
+            "persist calls Database::save"
+        );
+        assert!(
+            !graph
+                .callers(cache_save.id, 2)
+                .iter()
+                .any(|r| r.id == persist.id),
+            "Cache::save must not be dragged in by name"
+        );
+    }
+
+    /// `self.field.method()` — the receiver is a chain, and the field's type
+    /// is declared on the struct, not at the call site.
+    #[test]
+    fn receiver_type_follows_a_field_through_self() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/db.rs",
+            "pub struct Database;\nimpl Database { pub fn flush(&self) -> u8 { 1 } }\n",
+        );
+        write(
+            dir.path(),
+            "src/cache.rs",
+            "pub struct Cache;\nimpl Cache { pub fn flush(&self) -> u8 { 2 } }\n",
+        );
+        write(
+            dir.path(),
+            "src/repo.rs",
+            "pub struct Repo { db: Database }\nimpl Repo { pub fn commit(&self) { self.db.flush(); } }\n",
+        );
+        let mimir = Mimir::open_in_memory().unwrap();
+        let proj = project(&mimir.conn, dir.path());
+        let mut conn = mimir.conn;
+        update(&mut conn, &proj, dir.path()).unwrap();
+
+        let graph = CodeGraph::load(&conn, proj.id).unwrap();
+        let commit = resolve_symbol(&conn, proj.id, "Repo::commit").unwrap();
+        let db_flush = resolve_symbol(&conn, proj.id, "Database::flush").unwrap();
+        let cache_flush = resolve_symbol(&conn, proj.id, "Cache::flush").unwrap();
+        assert!(graph
+            .callers(db_flush.id, 2)
+            .iter()
+            .any(|r| r.id == commit.id));
+        assert!(!graph
+            .callers(cache_flush.id, 2)
+            .iter()
+            .any(|r| r.id == commit.id));
+    }
+
+    /// An unresolvable receiver must change nothing: the name-based tiers
+    /// still run, so this is additive precision, never lost recall.
+    #[test]
+    fn an_unresolvable_receiver_falls_through_to_the_name_tiers() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/util.rs",
+            "pub fn only_one(x: u8) -> u8 { x }\n",
+        );
+        write(
+            dir.path(),
+            "src/app.rs",
+            "fn go(mystery: Whatever) { mystery.only_one(1); }\n",
+        );
+        let mimir = Mimir::open_in_memory().unwrap();
+        let proj = project(&mimir.conn, dir.path());
+        let mut conn = mimir.conn;
+        let stats = update(&mut conn, &proj, dir.path()).unwrap();
+        assert_eq!(stats.calls_typed, 0, "no type for `Whatever`: {stats:?}");
+
+        let graph = CodeGraph::load(&conn, proj.id).unwrap();
+        let go = resolve_symbol(&conn, proj.id, "go").unwrap();
+        let target = resolve_symbol(&conn, proj.id, "only_one").unwrap();
+        assert!(
+            graph.callers(target.id, 2).iter().any(|r| r.id == go.id),
+            "the global-by-name tier still links it"
+        );
+    }
+
+    #[test]
+    fn check_reports_drift_without_writing() {
+        let (dir, mut mimir, proj) = setup();
+        update(&mut mimir.conn, &proj, dir.path()).unwrap();
+
+        let fresh = check(&mimir.conn, &proj, dir.path()).unwrap();
+        assert!(!fresh.is_stale(), "{fresh:?}");
+        assert_eq!(fresh.unchanged, 2);
+
+        write(dir.path(), "src/util.rs", "pub fn slugify() {}\npub fn n() {}\n");
+        write(dir.path(), "src/new.rs", "pub fn added() {}\n");
+        std::fs::remove_file(dir.path().join("src/main.rs")).unwrap();
+
+        let drift = check(&mimir.conn, &proj, dir.path()).unwrap();
+        assert_eq!(drift.changed, vec!["src/util.rs"]);
+        assert_eq!(drift.added, vec!["src/new.rs"]);
+        assert_eq!(drift.removed, vec!["src/main.rs"]);
+        assert_eq!(drift.stale_count(), 3);
+
+        // Reporting drift must not resolve it — that is `update`'s job, and
+        // a check that silently fixed things would always pass.
+        let again = check(&mimir.conn, &proj, dir.path()).unwrap();
+        assert_eq!(again, drift);
+    }
+
+    /// A file touched but not edited is not drift: rebuilding would find
+    /// nothing to do, so failing CI over it would be noise.
+    #[test]
+    fn check_ignores_a_touched_but_unedited_file() {
+        let (dir, mut mimir, proj) = setup();
+        update(&mut mimir.conn, &proj, dir.path()).unwrap();
+
+        let path = dir.path().join("src/util.rs");
+        let content = std::fs::read_to_string(&path).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        std::fs::write(&path, content).unwrap();
+
+        let drift = check(&mimir.conn, &proj, dir.path()).unwrap();
+        assert!(!drift.is_stale(), "{drift:?}");
+        assert_eq!(drift.unchanged, 2);
     }
 }

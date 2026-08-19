@@ -605,7 +605,253 @@ impl Lang {
     /// Names this node binds to a named type — typed parameters, locals with
     /// a type or constructor initializer, and struct/class fields. Static
     /// hints, not a type checker: anything unclear is simply not reported.
-    pub fn bindings(&self, _node: Node, _src: &str, _out: &mut Vec<(String, String)>) {}
+    /// `self`/`this` are deliberately absent; the resolver derives those from
+    /// the enclosing scope instead.
+    pub fn bindings(&self, node: Node, src: &str, out: &mut Vec<(String, String)>) {
+        let text = |n: Node| src[n.byte_range()].to_string();
+        // A declaration reads "<type> <name>" in some languages and
+        // "<name>: <type>" in others; both end here.
+        let mut bind = |name: Option<String>, ty: Option<String>| {
+            if let (Some(n), Some(t)) = (name, ty) {
+                if !n.is_empty() && !t.is_empty() {
+                    out.push((n, t));
+                }
+            }
+        };
+        match self {
+            Lang::Rust => match node.kind() {
+                "let_declaration" => {
+                    let name = node
+                        .child_by_field_name("pattern")
+                        .filter(|p| p.kind() == "identifier")
+                        .map(text);
+                    let ty = node
+                        .child_by_field_name("type")
+                        .map(|t| type_name_of(t, src))
+                        .or_else(|| node.child_by_field_name("value").and_then(|v| ctor_type(v, src)));
+                    bind(name, ty);
+                }
+                "parameter" => bind(
+                    node.child_by_field_name("pattern")
+                        .filter(|p| p.kind() == "identifier")
+                        .map(text),
+                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                ),
+                "field_declaration" => bind(
+                    node.child_by_field_name("name").map(text),
+                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                ),
+                _ => {}
+            },
+            Lang::TypeScript | Lang::Tsx => match node.kind() {
+                "variable_declarator" => {
+                    let ty = node
+                        .child_by_field_name("type")
+                        .and_then(|a| a.named_child(0))
+                        .map(|t| type_name_of(t, src))
+                        .or_else(|| node.child_by_field_name("value").and_then(|v| ctor_type(v, src)));
+                    bind(node.child_by_field_name("name").map(text), ty);
+                }
+                "required_parameter" | "optional_parameter" => bind(
+                    node.child_by_field_name("pattern")
+                        .filter(|p| p.kind() == "identifier")
+                        .map(text),
+                    node.child_by_field_name("type")
+                        .and_then(|a| a.named_child(0))
+                        .map(|t| type_name_of(t, src)),
+                ),
+                "public_field_definition" => bind(
+                    node.child_by_field_name("name").map(text),
+                    node.child_by_field_name("type")
+                        .and_then(|a| a.named_child(0))
+                        .map(|t| type_name_of(t, src)),
+                ),
+                _ => {}
+            },
+            Lang::Python => match node.kind() {
+                // `x = Database()` / `self.db = Database()` — a call whose
+                // callee looks like a class is the only usable signal an
+                // untyped language gives us.
+                "assignment" => {
+                    let name = node.child_by_field_name("left").and_then(|l| match l.kind() {
+                        "identifier" => Some(text(l)),
+                        "attribute" => l.child_by_field_name("attribute").map(text),
+                        _ => None,
+                    });
+                    let ty = node
+                        .child_by_field_name("type")
+                        .map(|t| type_name_of(t, src))
+                        .or_else(|| node.child_by_field_name("right").and_then(|v| ctor_type(v, src)));
+                    bind(name, ty);
+                }
+                "typed_parameter" => bind(
+                    node.named_child(0).filter(|c| c.kind() == "identifier").map(text),
+                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                ),
+                _ => {}
+            },
+            Lang::Go => match node.kind() {
+                "short_var_declaration" => {
+                    let (Some(left), Some(right)) = (
+                        node.child_by_field_name("left"),
+                        node.child_by_field_name("right"),
+                    ) else {
+                        return;
+                    };
+                    for i in 0..left.named_child_count() as u32 {
+                        let (Some(n), Some(v)) = (
+                            left.named_child(i).filter(|n| n.kind() == "identifier"),
+                            right.named_child(i),
+                        ) else {
+                            continue;
+                        };
+                        bind(Some(text(n)), ctor_type(v, src));
+                    }
+                }
+                // Parameters, method receivers, struct fields and `var x T`
+                // all carry plain name/type fields.
+                "parameter_declaration" | "field_declaration" | "var_spec" => {
+                    let Some(ty) = node.child_by_field_name("type") else {
+                        return;
+                    };
+                    let ty = type_name_of(ty, src);
+                    let mut cursor = node.walk();
+                    for n in node.children_by_field_name("name", &mut cursor) {
+                        bind(Some(text(n)), Some(ty.clone()));
+                    }
+                }
+                _ => {}
+            },
+            Lang::Java => match node.kind() {
+                "field_declaration" | "local_variable_declaration" => {
+                    let Some(ty) = node.child_by_field_name("type") else {
+                        return;
+                    };
+                    let ty = type_name_of(ty, src);
+                    let mut cursor = node.walk();
+                    for d in node.children_by_field_name("declarator", &mut cursor) {
+                        bind(d.child_by_field_name("name").map(text), Some(ty.clone()));
+                    }
+                }
+                "formal_parameter" => bind(
+                    node.child_by_field_name("name").map(text),
+                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                ),
+                _ => {}
+            },
+            // C#'s `variable_declaration` is shared by fields and locals.
+            Lang::CSharp => match node.kind() {
+                "variable_declaration" => {
+                    let Some(ty) = node.child_by_field_name("type") else {
+                        return;
+                    };
+                    let ty = type_name_of(ty, src);
+                    let mut cursor = node.walk();
+                    for d in node.named_children(&mut cursor) {
+                        if d.kind() == "variable_declarator" {
+                            bind(d.child_by_field_name("name").map(text), Some(ty.clone()));
+                        }
+                    }
+                }
+                "parameter" => bind(
+                    node.child_by_field_name("name").map(text),
+                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                ),
+                _ => {}
+            },
+            Lang::Cpp | Lang::C => match node.kind() {
+                "declaration" | "field_declaration" | "parameter_declaration" => {
+                    let Some(ty) = node.child_by_field_name("type") else {
+                        return;
+                    };
+                    let ty = type_name_of(ty, src);
+                    let mut cursor = node.walk();
+                    for d in node.children_by_field_name("declarator", &mut cursor) {
+                        bind(c_declarator_name(d, src), Some(ty.clone()));
+                    }
+                }
+                _ => {}
+            },
+            // kotlin-ng is fieldless here: a declaration is
+            // (identifier)(user_type?), an initialized property is
+            // (variable_declaration)(call_expression).
+            Lang::Kotlin => match node.kind() {
+                "class_parameter" | "parameter" => bind(
+                    node.named_child(0).filter(|c| c.kind() == "identifier").map(text),
+                    node.named_child(1)
+                        .filter(|c| c.kind() == "user_type")
+                        .map(|t| type_name_of(t, src)),
+                ),
+                "property_declaration" => {
+                    let Some(decl) = node.named_child(0).filter(|c| c.kind() == "variable_declaration")
+                    else {
+                        return;
+                    };
+                    let name = decl.named_child(0).filter(|c| c.kind() == "identifier").map(text);
+                    let ty = decl
+                        .named_child(1)
+                        .filter(|c| c.kind() == "user_type")
+                        .map(|t| type_name_of(t, src))
+                        .or_else(|| node.named_child(1).and_then(|v| ctor_type(v, src)));
+                    bind(name, ty);
+                }
+                _ => {}
+            },
+            // tree-sitter-swift labels a parameter's name *and* its type
+            // with the same `name` field; position disambiguates.
+            Lang::Swift => match node.kind() {
+                "parameter" => {
+                    let mut cursor = node.walk();
+                    let fields: Vec<Node> = node.children_by_field_name("name", &mut cursor).collect();
+                    bind(
+                        fields.first().filter(|c| c.kind() == "simple_identifier").map(|n| text(*n)),
+                        fields.get(1).filter(|c| c.kind() == "user_type").map(|t| type_name_of(*t, src)),
+                    );
+                }
+                "property_declaration" => {
+                    let name = node
+                        .child_by_field_name("name")
+                        .and_then(|p| p.child_by_field_name("bound_identifier"))
+                        .map(text);
+                    let ty = node
+                        .named_children(&mut node.walk())
+                        .find(|c| c.kind() == "type_annotation")
+                        .and_then(|a| a.named_child(0))
+                        .map(|t| type_name_of(t, src))
+                        .or_else(|| node.child_by_field_name("value").and_then(|v| ctor_type(v, src)));
+                    bind(name, ty);
+                }
+                _ => {}
+            },
+            Lang::Php => match node.kind() {
+                "property_declaration" => {
+                    let ty = node.child_by_field_name("type").map(|t| type_name_of(t, src));
+                    let mut cursor = node.walk();
+                    for e in node.named_children(&mut cursor) {
+                        if e.kind() == "property_element" {
+                            bind(
+                                e.child_by_field_name("name").map(|n| php_var(n, src)),
+                                ty.clone(),
+                            );
+                        }
+                    }
+                }
+                "simple_parameter" => bind(
+                    node.child_by_field_name("name").map(|n| php_var(n, src)),
+                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                ),
+                "assignment_expression" => bind(
+                    node.child_by_field_name("left")
+                        .filter(|l| l.kind() == "variable_name")
+                        .map(|n| php_var(n, src)),
+                    node.child_by_field_name("right").and_then(|v| ctor_type(v, src)),
+                ),
+                _ => {}
+            },
+            // Ruby is untyped and SQL has no variables.
+            Lang::Ruby | Lang::Sql => {}
+        }
+    }
 
     /// Collect imports declared by this node.
     pub fn imports(&self, node: Node, src: &str, out: &mut Vec<ImportRef>) {
@@ -1013,6 +1259,99 @@ fn sql_def_name(node: Node, src: &str) -> Option<String> {
 }
 
 /// `impl Foo`, `impl Foo<T>`, `impl Trait for Foo<T>` → "Foo".
+/// Wrappers whose type argument is the thing you actually called a method
+/// on: `Arc<Db>.get()` is `Db::get`, never `Arc::get`.
+const TYPE_WRAPPERS: &[&str] = &[
+    "Arc", "Rc", "Box", "Option", "Vec", "Mutex", "RwLock", "RefCell", "Cell", "Result", "Promise",
+    "Array", "List", "Optional",
+];
+
+/// Reduce a type expression to the bare name a symbol would be declared
+/// under: `&Arc<db::Database>` → `Database`, `*Server` → `Server`.
+fn type_name_of(ty: Node, src: &str) -> String {
+    match ty.kind() {
+        "pointer_type" | "reference_type" | "type_annotation" | "named_type" | "user_type"
+        | "optional_type" | "nullable_type" | "type" => ty
+            .child_by_field_name("type")
+            .or_else(|| ty.named_child(0))
+            .map(|inner| type_name_of(inner, src))
+            .unwrap_or_else(|| bare_type_name(&src[ty.byte_range()])),
+        "generic_type" | "generic_instantiation" => {
+            let base = ty
+                .child_by_field_name("type")
+                .map(|t| bare_type_name(&src[t.byte_range()]))
+                .unwrap_or_default();
+            let unwrapped = TYPE_WRAPPERS
+                .contains(&base.as_str())
+                .then(|| {
+                    ty.child_by_field_name("type_arguments")
+                        .and_then(|a| a.named_child(0))
+                        .map(|inner| type_name_of(inner, src))
+                })
+                .flatten();
+            unwrapped.unwrap_or(base)
+        }
+        _ => bare_type_name(&src[ty.byte_range()]),
+    }
+}
+
+/// Strip decoration a type name may carry in source: pointers, generics,
+/// and any module path in front of it.
+fn bare_type_name(text: &str) -> String {
+    let t = text.trim().trim_start_matches(['&', '*', ' ']);
+    let t = t.split(['<', '(', '[', '?', ' ']).next().unwrap_or(t);
+    // Module paths differ per language; strip all three separators.
+    let t = t.rsplit("::").next().unwrap_or(t);
+    let t = t.rsplit('.').next().unwrap_or(t);
+    t.rsplit('\\').next().unwrap_or(t).to_string()
+}
+
+/// The type an initializer constructs, when that is legible statically:
+/// `new Foo()`, `Foo{}`, `Foo::new()`, `Foo()`.
+fn ctor_type(value: Node, src: &str) -> Option<String> {
+    let text = |n: Node| src[n.byte_range()].to_string();
+    match value.kind() {
+        // TS `new Foo()`, Java/C#/PHP `new Foo()`.
+        "new_expression" | "object_creation_expression" => value
+            .child_by_field_name("constructor")
+            .or_else(|| value.child_by_field_name("type"))
+            .or_else(|| value.named_child(0))
+            .map(|t| bare_type_name(&text(t))),
+        // Go `Foo{}` and `&Foo{}`.
+        "composite_literal" => value
+            .child_by_field_name("type")
+            .map(|t| type_name_of(t, src)),
+        "unary_expression" => value
+            .child_by_field_name("operand")
+            .and_then(|o| ctor_type(o, src)),
+        // Rust `Foo { .. }`.
+        "struct_expression" => value
+            .child_by_field_name("name")
+            .map(|n| bare_type_name(&text(n))),
+        // Rust `Foo::new()`, Python/Kotlin/Swift `Foo()`.
+        "call_expression" | "call" => {
+            let callee = value
+                .child_by_field_name("function")
+                .or_else(|| value.named_child(0))?;
+            let name = match callee.kind() {
+                "scoped_identifier" => callee.child_by_field_name("path").map(&text),
+                "identifier" | "simple_identifier" => Some(text(callee)),
+                _ => None,
+            }?;
+            let name = bare_type_name(&name);
+            // A lowercase callee is a function, not a constructor. Without
+            // this every `let x = helper()` would bind x to "helper".
+            name.chars().next().is_some_and(char::is_uppercase).then_some(name)
+        }
+        _ => None,
+    }
+}
+
+/// PHP variable name without its sigil: `$db` → `db`.
+fn php_var(node: Node, src: &str) -> String {
+    src[node.byte_range()].trim_start_matches('$').to_string()
+}
+
 fn base_type_name(ty: Node, src: &str) -> String {
     match ty.kind() {
         "generic_type" => ty

@@ -5,6 +5,55 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **Call edges resolved through the receiver's type.** `db.save()` and
+  `cache.save()` used to be the same question to the resolver — a bare name
+  — so it answered with a half-weight guess at every `save` in the project,
+  or gave up when there were more than three. A new tier ahead of the
+  name-based ones reads the receiver (`self`, `self.db`, a local, a type)
+  and turns it into a type using typed parameters, fields, and constructor
+  initializers extracted per file, then asks for that type's method
+  specifically. Static hints, never a type checker: an unresolvable receiver
+  falls straight through to the old tiers, so this only ever adds precision.
+  Measured on this repo (1,340 symbols, 3,124 call edges): 384 edges
+  resolved by receiver type, of which 140 the old tiers had abandoned as too
+  ambiguous, 24 replace a spray of 2–3 half-weight guesses with one edge, 2
+  were pointed at the wrong function outright, and 218 confirm what
+  name-matching already had right. Covers Rust, TypeScript/JS, Python, Go,
+  Java, C#, C++, Kotlin, Swift and PHP; Ruby is untyped and SQL has no
+  receivers, so both are deliberately untouched. `graph build` now reports
+  the typed count so the share is visible per project.
+
+- **`mimir graph check` — drift as an exit code.** Answers "would a rebuild
+  change anything?" without writing: exit 0 when the graph matches the
+  working tree, exit 1 with the added/changed/removed paths when it doesn't,
+  `--json` for CI. Drift is defined by content hash, not mtime, so a touched
+  but unedited file is not drift — a gate that fired on `touch` would be
+  trained away within a week. It deliberately never refreshes anything,
+  because a check that quietly fixed what it found would pass every time and
+  prove nothing.
+
+- **`--all-projects` on `graph callers|calls|impact|path`.** A symbol you are
+  asking about often lives in a repo you are not standing in. Each project's
+  graph is searched on its own and the results are labelled by project,
+  never merged — call edges do not cross a project boundary, and pretending
+  otherwise would invent paths that don't exist. Ranking is untouched: this
+  is traversal, not retrieval, so nothing here goes near recall's fusion.
+  A name that is missing or ambiguous in one project is simply not that
+  project's answer; standing in a single project, "not found" is still the
+  error you get. CLI only for now — the MCP `graph` tool stays single-project
+  rather than paying a schema-size cost in every session.
+
+### Fixed
+- **The code graph rebuilt identically twice.** `resolve_import` picked its
+  match by iterating a `HashSet`, so a Rust module path with more than one
+  suffix match resolved to whichever file the hash order surfaced — import
+  edge counts drifted between rebuilds of an unchanged tree (246 vs 247 on
+  this repo). Both lookups now take the lexicographically smallest match.
+  Found while building `graph check`, which is worth little if the thing it
+  checks is unstable.
+
+## [Unreleased]
+### Added
 - **`mimir audit` — who changed a memory, when, and why.** Nothing recorded
   writes before this: `deleted_at` and `superseded_by` were set in place, so a
   correction was structural but anonymous. New `mutation` table (op, actor,

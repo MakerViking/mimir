@@ -13,6 +13,7 @@ mod project_cmd;
 mod proxy_cmd;
 mod report;
 mod rewrite_cmd;
+mod review_cmd;
 mod rules_cmd;
 mod run_cmd;
 mod savings_cmd;
@@ -393,6 +394,29 @@ enum Command {
         /// The memory (id or `m:ABCDEF`).
         reference: String,
     },
+    /// Findings the store noticed and deliberately will not decide for you:
+    /// contradicting memories, falsified grounding links, expired facts whose
+    /// end-condition nobody confirmed, and deleted facts that keep coming
+    /// back. Nothing here resolves on its own — that is the point.
+    Review {
+        /// Decide this finding (from `mimir review`). Omit to list.
+        id: Option<i64>,
+        /// Both are right, or it isn't a problem. Changes nothing.
+        #[arg(long, group = "disposition")]
+        keep: bool,
+        /// Retire the older memory in favour of the newer.
+        #[arg(long, group = "disposition")]
+        supersede: bool,
+        /// Not worth acting on, and not worth showing again.
+        #[arg(long, group = "disposition")]
+        dismiss: bool,
+        /// Why. This is what carries your own words into `mimir audit`.
+        #[arg(long)]
+        reason: Option<String>,
+        /// How many findings to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// Import memories from the tools Mimir replaces.
     Import {
         #[command(subcommand)]
@@ -599,17 +623,29 @@ enum GraphCmd {
     Build,
     /// Alias of build (always incremental).
     Update,
+    /// Is the graph still current? Exits 1 on drift; never writes.
+    Check {
+        /// Machine-readable report for CI.
+        #[arg(long)]
+        json: bool,
+    },
     /// Who calls this symbol (transitively).
     Callers {
         symbol: String,
         #[arg(long, default_value_t = 3)]
         depth: usize,
+        /// Search every project that has a graph, not just this one.
+        #[arg(long)]
+        all_projects: bool,
     },
     /// What this symbol calls (transitively).
     Calls {
         symbol: String,
         #[arg(long, default_value_t = 3)]
         depth: usize,
+        /// Search every project that has a graph, not just this one.
+        #[arg(long)]
+        all_projects: bool,
     },
     /// Blast radius of changing these files (try `$(git diff --name-only)`).
     Impact {
@@ -617,11 +653,20 @@ enum GraphCmd {
         files: Vec<String>,
         #[arg(long, default_value_t = 3)]
         depth: usize,
+        /// Search every project that has a graph, not just this one.
+        #[arg(long)]
+        all_projects: bool,
     },
     /// Full record for a symbol: signature, doc, edges, linked memories.
     Node { symbol: String },
     /// Shortest call path between two symbols.
-    Path { from: String, to: String },
+    Path {
+        from: String,
+        to: String,
+        /// Search every project that has a graph, not just this one.
+        #[arg(long)]
+        all_projects: bool,
+    },
     /// Most-called symbols.
     Hubs {
         #[arg(short = 'n', long, default_value_t = 10)]
@@ -931,6 +976,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             commands::audit(reference.as_deref(), limit, cli.json)
         }
         Command::History { reference } => commands::history(&reference),
+        Command::Review {
+            id,
+            keep,
+            supersede,
+            dismiss,
+            reason,
+            limit,
+        } => match id {
+            Some(id) => review_cmd::decide(id, keep, supersede, dismiss, reason),
+            None => review_cmd::list(cli.json, limit),
+        },
         Command::Grounding { stale, limit } => commands::grounding(stale, limit),
         Command::Import { cmd } => match cmd {
             ImportCmd::Openbrain { file } => commands::import_openbrain(&file),
@@ -983,11 +1039,28 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Serve { bind } => sync::serve(bind),
         Command::Graph { cmd } => match cmd {
             GraphCmd::Build | GraphCmd::Update => graph_cmd::build(),
-            GraphCmd::Callers { symbol, depth } => graph_cmd::callers(&symbol, depth),
-            GraphCmd::Calls { symbol, depth } => graph_cmd::calls(&symbol, depth),
-            GraphCmd::Impact { files, depth } => graph_cmd::impact(files, depth),
+            GraphCmd::Check { json } => graph_cmd::check(json),
+            GraphCmd::Callers {
+                symbol,
+                depth,
+                all_projects,
+            } => graph_cmd::callers(&symbol, depth, all_projects),
+            GraphCmd::Calls {
+                symbol,
+                depth,
+                all_projects,
+            } => graph_cmd::calls(&symbol, depth, all_projects),
+            GraphCmd::Impact {
+                files,
+                depth,
+                all_projects,
+            } => graph_cmd::impact(files, depth, all_projects),
             GraphCmd::Node { symbol } => graph_cmd::node_info(&symbol),
-            GraphCmd::Path { from, to } => graph_cmd::path(&from, &to),
+            GraphCmd::Path {
+                from,
+                to,
+                all_projects,
+            } => graph_cmd::path(&from, &to, all_projects),
             GraphCmd::Hubs { limit } => graph_cmd::hubs(limit),
             GraphCmd::Communities { persist, min_size } => {
                 graph_cmd::communities(persist, min_size)

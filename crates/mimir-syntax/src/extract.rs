@@ -180,6 +180,26 @@ mod tests {
             .collect()
     }
 
+    /// (scope, name, type) triples — what the resolver gets to work with.
+    fn binds(fx: &FileExtract) -> Vec<(&str, &str, &str)> {
+        fx.bindings
+            .iter()
+            .map(|b| (b.scope.as_str(), b.name.as_str(), b.type_name.as_str()))
+            .collect()
+    }
+
+    /// (caller, receiver, callee) for calls that named a receiver.
+    fn recvs(fx: &FileExtract) -> Vec<(&str, &str, &str)> {
+        fx.calls
+            .iter()
+            .filter_map(|c| {
+                c.receiver
+                    .as_deref()
+                    .map(|r| (c.caller.as_str(), r, c.callee.as_str()))
+            })
+            .collect()
+    }
+
     #[test]
     fn rust_extraction() {
         let src = r#"
@@ -810,5 +830,314 @@ namespace App {
         assert!(fx.symbols.is_empty(), "{:?}", fx.symbols);
         assert!(fx.calls.is_empty(), "{:?}", fx.calls);
         assert!(fx.imports.is_empty(), "{:?}", fx.imports);
+    }
+
+    // ---- receiver + binding extraction -------------------------------
+    //
+    // Each case is the same shape in a different language: a type with a
+    // typed field, a method taking a typed parameter, a local built from a
+    // constructor, and three calls — on the local, on the field via
+    // self/this, and on a type directly. What the resolver needs from each
+    // is the receiver text and enough bindings to turn it into a type.
+
+    #[test]
+    fn rust_receivers_and_bindings() {
+        let src = r#"
+struct Repo { db: Arc<Database> }
+impl Repo {
+    fn save(&self, item: Item) {
+        let store = Database::new();
+        store.put(item);
+        self.db.put(item);
+        Formatter::upper(item);
+    }
+}
+"#;
+        let fx = extract(Lang::Rust, src);
+        let b = binds(&fx);
+        assert!(b.contains(&("Repo", "db", "Database")), "field: {b:?}");
+        assert!(
+            b.contains(&("Repo::save", "item", "Item")),
+            "parameter: {b:?}"
+        );
+        assert!(
+            b.contains(&("Repo::save", "store", "Database")),
+            "local: {b:?}"
+        );
+
+        let r = recvs(&fx);
+        assert!(r.contains(&("Repo::save", "store", "put")), "{r:?}");
+        assert!(r.contains(&("Repo::save", "self.db", "put")), "{r:?}");
+        assert!(r.contains(&("Repo::save", "Formatter", "upper")), "{r:?}");
+    }
+
+    #[test]
+    fn typescript_receivers_and_bindings() {
+        let src = r#"
+class Repo {
+  private db: Database;
+  save(item: Item) {
+    const store = new Database();
+    store.put(item);
+    this.db.put(item);
+    Formatter.upper(item);
+  }
+}
+"#;
+        let fx = extract(Lang::TypeScript, src);
+        let b = binds(&fx);
+        assert!(b.contains(&("Repo", "db", "Database")), "field: {b:?}");
+        assert!(
+            b.contains(&("Repo::save", "item", "Item")),
+            "parameter: {b:?}"
+        );
+        assert!(
+            b.contains(&("Repo::save", "store", "Database")),
+            "local: {b:?}"
+        );
+
+        let r = recvs(&fx);
+        assert!(r.contains(&("Repo::save", "store", "put")), "{r:?}");
+        assert!(r.contains(&("Repo::save", "this.db", "put")), "{r:?}");
+    }
+
+    #[test]
+    fn python_receivers_and_bindings() {
+        let src = r#"
+class Repo:
+    def __init__(self):
+        self.db = Database()
+
+    def save(self, item: Item):
+        store = Database()
+        store.put(item)
+        self.db.put(item)
+        Formatter.upper(item)
+"#;
+        let fx = extract(Lang::Python, src);
+        let b = binds(&fx);
+        // An untyped `self.db = Database()` binds under the method that
+        // assigned it; the resolver searches the whole type's scope.
+        assert!(
+            b.contains(&("Repo::__init__", "db", "Database")),
+            "field: {b:?}"
+        );
+        assert!(
+            b.contains(&("Repo::save", "item", "Item")),
+            "parameter: {b:?}"
+        );
+        assert!(
+            b.contains(&("Repo::save", "store", "Database")),
+            "local: {b:?}"
+        );
+
+        let r = recvs(&fx);
+        assert!(r.contains(&("Repo::save", "store", "put")), "{r:?}");
+        assert!(r.contains(&("Repo::save", "self.db", "put")), "{r:?}");
+    }
+
+    #[test]
+    fn go_receivers_and_bindings() {
+        let src = r#"
+type Server struct { db *Database }
+
+func (s *Server) Start(item Item) error {
+    store := Database{}
+    store.Put(item)
+    s.db.Put(item)
+    return nil
+}
+"#;
+        let fx = extract(Lang::Go, src);
+        let b = binds(&fx);
+        assert!(b.contains(&("Server", "db", "Database")), "field: {b:?}");
+        // The method receiver `s` is what makes `s.db` resolvable at all.
+        assert!(
+            b.contains(&("Server::Start", "s", "Server")),
+            "receiver: {b:?}"
+        );
+        assert!(
+            b.contains(&("Server::Start", "item", "Item")),
+            "parameter: {b:?}"
+        );
+        assert!(
+            b.contains(&("Server::Start", "store", "Database")),
+            "local: {b:?}"
+        );
+
+        let r = recvs(&fx);
+        assert!(r.contains(&("Server::Start", "store", "Put")), "{r:?}");
+        assert!(r.contains(&("Server::Start", "s.db", "Put")), "{r:?}");
+    }
+
+    #[test]
+    fn java_csharp_cpp_receivers_and_bindings() {
+        let java = extract(
+            Lang::Java,
+            r#"
+class Repo {
+  private Database db;
+  void save(Item item) {
+    Database store = new Database();
+    store.put(item);
+    this.db.put(item);
+  }
+}
+"#,
+        );
+        let b = binds(&java);
+        assert!(b.contains(&("Repo", "db", "Database")), "java field: {b:?}");
+        assert!(
+            b.contains(&("Repo::save", "item", "Item")),
+            "java param: {b:?}"
+        );
+        assert!(
+            b.contains(&("Repo::save", "store", "Database")),
+            "java local: {b:?}"
+        );
+        let r = recvs(&java);
+        assert!(r.contains(&("Repo::save", "this.db", "put")), "java: {r:?}");
+
+        let cs = extract(
+            Lang::CSharp,
+            r#"
+class Repo {
+  private Database db;
+  void Save(Item item) {
+    Database store = new Database();
+    store.Put(item);
+  }
+}
+"#,
+        );
+        let b = binds(&cs);
+        assert!(b.contains(&("Repo", "db", "Database")), "c# field: {b:?}");
+        assert!(
+            b.contains(&("Repo::Save", "store", "Database")),
+            "c# local: {b:?}"
+        );
+        assert!(
+            recvs(&cs).contains(&("Repo::Save", "store", "Put")),
+            "c#: {:?}",
+            recvs(&cs)
+        );
+
+        let cpp = extract(
+            Lang::Cpp,
+            r#"
+class Repo {
+  Database* db;
+  void save(Item item) {
+    Database store;
+    store.put(item);
+    this->db->put(item);
+  }
+};
+"#,
+        );
+        let b = binds(&cpp);
+        assert!(b.contains(&("Repo", "db", "Database")), "cpp field: {b:?}");
+        assert!(
+            b.contains(&("Repo::save", "store", "Database")),
+            "cpp local: {b:?}"
+        );
+        let r = recvs(&cpp);
+        assert!(r.contains(&("Repo::save", "this->db", "put")), "cpp: {r:?}");
+    }
+
+    #[test]
+    fn kotlin_swift_php_receivers_and_bindings() {
+        let kt = extract(
+            Lang::Kotlin,
+            r#"
+class Repo(val db: Database) {
+    fun save(item: Item) {
+        val store = Database()
+        store.put(item)
+        db.put(item)
+    }
+}
+"#,
+        );
+        let b = binds(&kt);
+        assert!(
+            b.contains(&("Repo", "db", "Database")),
+            "kotlin ctor param: {b:?}"
+        );
+        assert!(
+            b.contains(&("Repo::save", "store", "Database")),
+            "kotlin local: {b:?}"
+        );
+        assert!(
+            recvs(&kt).contains(&("Repo::save", "store", "put")),
+            "kotlin: {:?}",
+            recvs(&kt)
+        );
+
+        let sw = extract(
+            Lang::Swift,
+            r#"
+class Repo {
+    let db: Database
+    func save(item: Item) {
+        let store = Database()
+        store.put(item)
+        self.db.put(item)
+    }
+}
+"#,
+        );
+        let b = binds(&sw);
+        assert!(b.contains(&("Repo", "db", "Database")), "swift field: {b:?}");
+        assert!(
+            b.contains(&("Repo::save", "store", "Database")),
+            "swift local: {b:?}"
+        );
+        let r = recvs(&sw);
+        assert!(r.contains(&("Repo::save", "self.db", "put")), "swift: {r:?}");
+
+        let php = extract(
+            Lang::Php,
+            r#"<?php
+class Repo {
+    private Database $db;
+    public function save(Item $item) {
+        $store = new Database();
+        $store->put($item);
+        $this->db->put($item);
+    }
+}
+"#,
+        );
+        let b = binds(&php);
+        assert!(b.contains(&("Repo", "db", "Database")), "php field: {b:?}");
+        assert!(
+            b.contains(&("Repo::save", "item", "Item")),
+            "php param: {b:?}"
+        );
+        assert!(
+            b.contains(&("Repo::save", "store", "Database")),
+            "php local: {b:?}"
+        );
+        let r = recvs(&php);
+        assert!(r.contains(&("Repo::save", "$store", "put")), "php: {r:?}");
+        assert!(
+            r.contains(&("Repo::save", "$this->db", "put")),
+            "php: {r:?}"
+        );
+    }
+
+    #[test]
+    fn a_plain_call_has_no_receiver() {
+        let fx = extract(Lang::Rust, "fn a() { helper(1); }");
+        assert_eq!(fx.calls.len(), 1);
+        assert_eq!(fx.calls[0].receiver, None);
+    }
+
+    #[test]
+    fn a_lowercase_initializer_is_not_a_type() {
+        // `let x = helper()` must not bind x to the *function* helper.
+        let fx = extract(Lang::Rust, "fn a() { let x = helper(); }");
+        assert!(binds(&fx).is_empty(), "{:?}", binds(&fx));
     }
 }
