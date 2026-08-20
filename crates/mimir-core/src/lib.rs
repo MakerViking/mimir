@@ -24,6 +24,7 @@ pub mod learn;
 pub mod memory;
 pub mod model;
 pub mod replicate;
+pub mod review;
 pub mod revision;
 pub mod savings;
 pub mod scope;

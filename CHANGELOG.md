@@ -54,6 +54,49 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
 ## [Unreleased]
 ### Added
+- **`mimir review` — the findings the store will not decide for you.**
+  `consolidate` already found contradicting memories and printed them into a
+  report that scrolled past; `grounding` already knew which links had gone
+  stale; an expired memory could sit with its `resolves_when` unexamined
+  forever. Detecting something and then doing nothing about it is the same as
+  not detecting it. Four feeders now queue findings — contradictions, stale
+  grounding, unresolved expiry, and facts that keep coming back after being
+  forgotten — and `mimir review <id> --keep|--supersede|--dismiss --reason`
+  records what a person decided.
+
+  Nothing auto-resolves, deliberately: which of two contradicting memories is
+  right depends on facts the store does not have. The disposition is what
+  carries a human's own words into the mutation ledger, which is the
+  difference between "superseded on the 14th" and "superseded on the 14th
+  because the cron moved after the incident". Idempotent per finding, a
+  dismissal is never re-raised, `doctor` says how many are waiting, and MCP
+  gets read access only — the point of a review queue is that a person looked.
+
+- **Deletion evals that gate CI (`eval/forget.rs`).** ForgetEval's ten
+  adversarial categories (substring traps, prefix collisions, paraphrase
+  supersession, negation, temporal qualifiers, shared attributes, compound
+  facts, identifier obfuscation, cross-lingual, recursive supersession) plus
+  the Agent Memory Atlas's thirteen-step deletion-durability sequence, both
+  deterministic and both running under plain `cargo test` — no judge model, no
+  dataset, no network.
+
+  Every attack is paired with a near-miss control that must be *accepted*, and
+  every durability step with a never-forgotten twin that must stay
+  retrievable, so no negative assertion can pass vacuously. The scorecard
+  reports obligations and negative invariants **separately and never pooled**,
+  because a store that keeps nothing passes every negative invariant — an
+  empty-store control arm asserts exactly that. Reported as a pass/fail
+  matrix, never a percentage.
+
+  Both arms pass clean today (soft delete 8/8 and 7/7; hard delete 7/7 and
+  5/5), including the steps almost nothing implements: re-feeding the source
+  by a different write path, running every background job, and probing FTS,
+  embeddings, prior revisions, the audit ledger and a synced second scope.
+  The suite records one stated limit rather than hiding it — `--hard` removes
+  the tombstone, so it trades away the re-feed guard that `forget` keeps.
+
+## [Unreleased]
+### Added
 - **`mimir audit` — who changed a memory, when, and why.** Nothing recorded
   writes before this: `deleted_at` and `superseded_by` were set in place, so a
   correction was structural but anonymous. New `mutation` table (op, actor,
@@ -105,12 +148,15 @@ the `mimir-mem` crate, and the on-disk schema move together.
 
   The tombstone pass now asks three questions instead of one: equality under a
   comparison view that strips leading/trailing `.`/`-`/`_` (so "utc." and "utc"
-  agree while `file.rs` still differs from `file`), containment within two
-  tokens (the same fact with a qualifier added or dropped), and then the ratio,
-  which still earns its keep on diffuse rewording of long text. Containment is
-  a *subset* test rather than a token distance on purpose: an unconditional
-  "differs by ≤2 tokens" would also swallow substitutions, and "redis port 6379
-  tcp" against "redis port 5432 tcp" is two tokens apart and a different fact.
+  agree while `file.rs` still differs from `file`), containment scaled to the
+  fact's own length (the same claim with detail added or dropped), and then the
+  ratio, which still earns its keep on diffuse rewording of long text.
+  Containment is a *subset* test rather than a token distance on purpose: an
+  unconditional "differs by ≤N tokens" would also swallow substitutions, and
+  "redis port 6379 tcp" against "redis port 5432 tcp" is two tokens apart and a
+  different fact. Two guards keep it from over-reaching — a contained set below
+  four tokens is a fragment, not a fact, and a polarity flip is never a reword,
+  so `consolidate::negation_mismatch` draws that line here too.
 
   Only the tombstone path changed. The live near-duplicate pass keeps the plain
   ratio, because the costs are not symmetric — a false duplicate refusal is an

@@ -17,6 +17,12 @@ const NEAR_DUP_JACCARD: f64 = 0.85;
 /// reworded — see [`is_reword`].
 const REWORD_SUBSET_SLACK: usize = 2;
 
+/// Smallest contained token set that may be treated as a whole fact by the
+/// containment rule. Below this a "subset" is a fragment ("redis port"), and
+/// treating every text containing it as the same fact would refuse most of
+/// the store.
+const MIN_CONTAINED_TOKENS: usize = 4;
+
 /// How many deliberate tombstones the reword pass compares against. A bound
 /// so `remember` can never turn into a table scan on a store where someone
 /// has forgotten a great deal; newest-first, because a recent deletion is
@@ -63,6 +69,17 @@ pub fn remember(conn: &Connection, args: Remember) -> Result<RememberOutcome> {
             return Ok(RememberOutcome::Duplicate(dup));
         }
         if let Some(gone) = find_forgotten(conn, &args.text, &hash)? {
+            // Something deliberately deleted that keeps coming back is a
+            // finding in its own right: either the source that produces it
+            // needs fixing, or the deletion was wrong. The guard refuses it
+            // every time and would otherwise never say so out loud.
+            let _ = crate::review::enqueue(
+                conn,
+                crate::review::Finding::Resurfacing,
+                gone.id,
+                None,
+                Some("offered again after being forgotten"),
+            );
             return Ok(RememberOutcome::Forgotten(gone));
         }
         if let Some(dup) = find_near_duplicate(conn, &args.text)? {
@@ -328,16 +345,28 @@ fn comparison_tokens(text: &str) -> HashSet<String> {
 ///
 /// 1. Equal under [`comparison_tokens`] — a pure formatting reword (case,
 ///    whitespace, trailing punctuation). Length-independent by construction.
-/// 2. One token set contains the other, differing by at most
-///    [`REWORD_SUBSET_SLACK`] — the same fact with a qualifier added or
-///    dropped ("redis port 6379" → "redis default port 6379").
+/// 2. One token set contains the other, every word of the shorter surviving
+///    in the longer, with the addition no larger than the fact it qualifies —
+///    the same claim with detail added or dropped ("the deploy token rotates
+///    on Sundays" → "… on Sundays at 03:00"). The slack scales with the
+///    fact's own length rather than being a flat count, because "one added
+///    qualifier" costs three tokens when it is a clock time and one when it
+///    is a word.
 /// 3. The ratio, which still earns its keep on diffuse rewording of long text.
 ///
 /// Rule 2 is a *subset* test rather than a token-distance one on purpose. An
-/// unconditional "differs by ≤2 tokens" would also swallow substitutions —
+/// unconditional "differs by ≤N tokens" would also swallow substitutions —
 /// "redis port 6379 tcp" against "redis port 5432 tcp" is two tokens apart and
 /// a completely different fact. Requiring containment keeps insertions and
 /// deletions in scope while leaving substitutions out.
+///
+/// Two guards keep rule 2 from over-reaching. A contained set below
+/// [`MIN_CONTAINED_TOKENS`] is a fragment rather than a fact, so it does not
+/// qualify — otherwise "redis port" would make half the store one memory. And
+/// a polarity flip is never a reword however much text the two share:
+/// "autoscaling is enabled" is contained in "autoscaling is not enabled", and
+/// they are opposite claims. `consolidate::negation_mismatch` already draws
+/// that line for contradiction flagging, so the same detector draws it here.
 fn is_reword(text: &str, existing: &str) -> bool {
     let a = comparison_tokens(text);
     let b = comparison_tokens(existing);
@@ -347,12 +376,19 @@ fn is_reword(text: &str, existing: &str) -> bool {
     if a == b {
         return true;
     }
+    if crate::consolidate::negation_mismatch(text, existing) {
+        return false;
+    }
     let (small, large) = if a.len() <= b.len() {
         (&a, &b)
     } else {
         (&b, &a)
     };
-    if small.is_subset(large) && large.len() - small.len() <= REWORD_SUBSET_SLACK {
+    let added = large.len() - small.len();
+    if small.len() >= MIN_CONTAINED_TOKENS
+        && small.is_subset(large)
+        && added <= small.len().max(REWORD_SUBSET_SLACK)
+    {
         return true;
     }
     jaccard(text, existing) >= NEAR_DUP_JACCARD
@@ -580,6 +616,34 @@ mod tests {
         };
         assert_ne!(revived.id, first.id);
         assert!(revived.deleted_at.is_none());
+    }
+
+    /// The tombstone guard refuses a re-add every time and, until the review
+    /// queue existed, never said so anywhere a person would see. Something
+    /// that keeps coming back means either the source producing it needs
+    /// fixing or the deletion was wrong — both are findings.
+    #[test]
+    fn a_fact_that_keeps_coming_back_becomes_a_finding() {
+        let conn = db::open_in_memory().unwrap();
+        let text = "the ops cron runs at 03:00 UTC";
+        let first = match remember_text(&conn, text) {
+            RememberOutcome::Created(n) => n,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        store::soft_delete(&conn, first.id, crate::model::Actor::Human, None).unwrap();
+        assert_eq!(crate::review::open_count(&conn).unwrap(), 0);
+
+        for _ in 0..3 {
+            assert!(matches!(
+                remember_text(&conn, text),
+                RememberOutcome::Forgotten(_)
+            ));
+        }
+
+        let items = crate::review::open(&conn, 10).unwrap();
+        assert_eq!(items.len(), 1, "three offers, one finding: {items:?}");
+        assert_eq!(items[0].finding, crate::review::Finding::Resurfacing);
+        assert_eq!(items[0].node_id, first.id);
     }
 
     /// The hash pass alone would miss this: `tokens` keeps trailing

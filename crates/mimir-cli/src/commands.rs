@@ -935,6 +935,14 @@ pub fn doctor(check_only: bool) -> Result<()> {
             if let Some(detail) = link_scan_hint(&conn) {
                 check("link scan", true, detail, &mut failures);
             }
+            // Same argument for the review queue: findings nobody is told
+            // about are findings nobody acts on, which is the state
+            // `consolidate`'s contradiction report was already in.
+            if let Ok(m) = Mimir::open() {
+                if let Some(detail) = crate::review_cmd::summary(&m) {
+                    check("review", true, detail, &mut failures);
+                }
+            }
         }
         Err(e) => check("db", false, e.to_string(), &mut failures),
     }

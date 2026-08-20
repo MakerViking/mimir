@@ -284,6 +284,39 @@ CREATE TABLE node_revision (
 );
 CREATE INDEX node_revision_node ON node_revision(node_id, at);
 "#,
+    // Review queue: what the store noticed and deliberately will not decide.
+    //
+    // `consolidate` already found contradictions and threw them into a report
+    // that scrolled past; grounding already knew which links had gone stale.
+    // Both are judgement calls — which of two contradicting memories is right
+    // depends on facts the store does not have — so auto-resolving would be
+    // guessing with a confident face. Queueing them is the honest version:
+    // the machine says what it noticed, a person says what it means.
+    //
+    // This is also where the mutation ledger gets its `reason`. A disposition
+    // carries the human's own words into `mutation.reason`, which is the
+    // difference between "superseded on the 14th" and "superseded on the 14th
+    // because the cron moved after the incident".
+    //
+    // `disposition` NULL = still open. One row per (kind, node_id, other_id)
+    // so re-running a detector refreshes rather than duplicates — a queue that
+    // grows a new copy of the same finding every night is one people stop
+    // opening.
+    r#"
+CREATE TABLE review (
+    id             INTEGER PRIMARY KEY,
+    at             INTEGER NOT NULL,
+    kind           TEXT NOT NULL,
+    node_id        INTEGER NOT NULL,
+    other_id       INTEGER,
+    detail         TEXT,
+    disposition    TEXT,
+    decided_at     INTEGER,
+    decided_reason TEXT
+);
+CREATE UNIQUE INDEX review_finding ON review(kind, node_id, COALESCE(other_id, -1));
+CREATE INDEX review_open ON review(at) WHERE disposition IS NULL;
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;

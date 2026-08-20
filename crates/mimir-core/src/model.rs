@@ -123,6 +123,7 @@ str_enum!(MutationOp {
     Pin => "pin",
     Unpin => "unpin",
     Restore => "restore",
+    Review => "review",
 });
 
 str_enum!(Rel {

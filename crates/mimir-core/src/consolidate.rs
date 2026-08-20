@@ -125,6 +125,19 @@ fn consolidate_inner(conn: &Connection, model: &str, dry_run: bool) -> Result<Re
                         format!("m:{} {}", tail(&ma.uid), ma.title),
                         format!("m:{} {}", tail(&mb.uid), mb.title),
                     ));
+                    // The report scrolls past; the queue does not. Which of
+                    // two contradicting memories is right depends on things
+                    // this pass cannot know, so it stays a finding for a
+                    // person rather than becoming an automatic supersession.
+                    if !dry_run {
+                        let _ = crate::review::enqueue(
+                            conn,
+                            crate::review::Finding::Contradiction,
+                            ma.id,
+                            Some(mb.id),
+                            Some(&format!("{} / {}", ma.title, mb.title)),
+                        );
+                    }
                 }
             }
         }
@@ -306,7 +319,7 @@ const NEGATIONS: &[&str] = &[
     "refuted",
 ];
 
-fn negation_mismatch(a: &str, b: &str) -> bool {
+pub(crate) fn negation_mismatch(a: &str, b: &str) -> bool {
     let has = |s: &str| {
         let lower = s.to_lowercase();
         NEGATIONS.iter().any(|n| lower.contains(n))
