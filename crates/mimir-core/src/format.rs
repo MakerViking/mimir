@@ -25,6 +25,13 @@ pub fn full_date(unix: i64) -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
+/// `YYYY` of a unix timestamp (UTC). The compact recall line's valid-time
+/// marker — see `agent_line_for_query` for why the year alone.
+pub fn year_of(unix: i64) -> String {
+    let (y, _, _) = civil_from_days(unix.div_euclid(86_400));
+    format!("{y:04}")
+}
+
 /// Days-since-epoch → (year, month, day). Howard Hinnant's civil_from_days.
 fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
@@ -291,10 +298,25 @@ pub fn agent_line_for_query(
     // Only a *closed* validity interval reaches this line, on the same
     // reasoning as `doubt`: "no longer current" changes what an agent should
     // do with the fact, while an open interval says only what every
-    // undeclared memory already implies. `get` shows both ends in full.
+    // undeclared memory already implies.
+    //
+    // The **year**, not the full date, and that is a measured call rather
+    // than a guess. Against the bundled tokenizer, " until 2024-06-30" costs
+    // 8 tokens — 26% of a 31-token line, against the 1 token `unsure` pays —
+    // while " until 2024" costs 4. The month and day earn nothing here: they
+    // are precision for a reader who has already decided to look, and `get`
+    // has them.
+    //
+    // A bare word ("ended", 1 token) was cheaper still and rejected. The date
+    // field on this line is *transaction* time (`08-18` above), so on a
+    // memory written today about a fact that stopped in 2024 that field
+    // actively misleads — a valid-time year is the least that keeps the line
+    // self-consistent. Same reason `month_day` drops the year for
+    // `created_at` and this keeps it: they are opposite axes, and the one
+    // being flagged is the one the rest of the line does not already imply.
     let validity = if node.validity_closed(crate::model::now_unix()) {
         node.valid_to()
-            .map(|to| format!(" until {}", full_date(to)))
+            .map(|to| format!(" until {}", year_of(to)))
             .unwrap_or_default()
     } else {
         String::new()
@@ -529,6 +551,46 @@ mod tests {
         assert!(!make(Some(crate::model::MemoryConfidence::Likely)).contains("likely"));
         let bare = make(None);
         assert!(!bare.contains("unsure") && !bare.contains("certain"));
+    }
+
+    /// The compact line is what an agent acts from, so what rides it is a
+    /// token-budget decision, not a formatting one. Measured against the
+    /// bundled tokenizer: " until 2024-06-30" is 8 tokens (26% of a 31-token
+    /// line) and " until 2024" is 4, against the 1 token `unsure` pays.
+    ///
+    /// Pinned here because the cheap regression is someone "improving" this
+    /// back to a full date for symmetry with `get`, which would quadruple a
+    /// per-hit cost for precision nobody reads at recall time.
+    #[test]
+    fn a_closed_interval_costs_the_compact_line_a_year_not_a_date() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let make = |from: Option<i64>, to: Option<i64>| {
+            let mut new = NewNode::new(Kind::Memory);
+            new.subkind = Some("note".into());
+            new.title = Some("i was vegetarian".into());
+            new.body = Some("i was vegetarian".into());
+            let node = store::insert_node(&conn, new).unwrap();
+            store::set_valid_interval(&conn, node.id, from, to).unwrap();
+            let node = store::get_node(&conn, node.id).unwrap();
+            agent_line(&node, None, 120)
+        };
+
+        // Closed: flagged, and with the year only.
+        let closed = make(Some(1_550_000_000), Some(1_720_000_000)); // ..2024-07
+        assert!(closed.contains("until 2024"), "{closed}");
+        assert!(
+            !closed.contains("2024-07"),
+            "the month and day belong to `get`, not to every recall hit: {closed}"
+        );
+
+        // Open at the far end: nothing, because "still true as far as anyone
+        // said" is what every undeclared memory already implies.
+        let open = make(Some(1_550_000_000), None);
+        assert!(!open.contains("until"), "{open}");
+
+        // Undeclared: nothing at all.
+        let bare = make(None, None);
+        assert!(!bare.contains("until"), "{bare}");
     }
 
     /// Confidence must be readable in full, and must be legibly the
