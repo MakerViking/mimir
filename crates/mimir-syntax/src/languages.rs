@@ -628,18 +628,23 @@ impl Lang {
                     let ty = node
                         .child_by_field_name("type")
                         .map(|t| type_name_of(t, src))
-                        .or_else(|| node.child_by_field_name("value").and_then(|v| ctor_type(v, src)));
+                        .or_else(|| {
+                            node.child_by_field_name("value")
+                                .and_then(|v| ctor_type(v, src))
+                        });
                     bind(name, ty);
                 }
                 "parameter" => bind(
                     node.child_by_field_name("pattern")
                         .filter(|p| p.kind() == "identifier")
                         .map(text),
-                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                    node.child_by_field_name("type")
+                        .map(|t| type_name_of(t, src)),
                 ),
                 "field_declaration" => bind(
                     node.child_by_field_name("name").map(text),
-                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                    node.child_by_field_name("type")
+                        .map(|t| type_name_of(t, src)),
                 ),
                 _ => {}
             },
@@ -649,7 +654,10 @@ impl Lang {
                         .child_by_field_name("type")
                         .and_then(|a| a.named_child(0))
                         .map(|t| type_name_of(t, src))
-                        .or_else(|| node.child_by_field_name("value").and_then(|v| ctor_type(v, src)));
+                        .or_else(|| {
+                            node.child_by_field_name("value")
+                                .and_then(|v| ctor_type(v, src))
+                        });
                     bind(node.child_by_field_name("name").map(text), ty);
                 }
                 "required_parameter" | "optional_parameter" => bind(
@@ -673,20 +681,28 @@ impl Lang {
                 // callee looks like a class is the only usable signal an
                 // untyped language gives us.
                 "assignment" => {
-                    let name = node.child_by_field_name("left").and_then(|l| match l.kind() {
-                        "identifier" => Some(text(l)),
-                        "attribute" => l.child_by_field_name("attribute").map(text),
-                        _ => None,
-                    });
+                    let name = node
+                        .child_by_field_name("left")
+                        .and_then(|l| match l.kind() {
+                            "identifier" => Some(text(l)),
+                            "attribute" => l.child_by_field_name("attribute").map(text),
+                            _ => None,
+                        });
                     let ty = node
                         .child_by_field_name("type")
                         .map(|t| type_name_of(t, src))
-                        .or_else(|| node.child_by_field_name("right").and_then(|v| ctor_type(v, src)));
+                        .or_else(|| {
+                            node.child_by_field_name("right")
+                                .and_then(|v| ctor_type(v, src))
+                        });
                     bind(name, ty);
                 }
                 "typed_parameter" => bind(
-                    node.named_child(0).filter(|c| c.kind() == "identifier").map(text),
-                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                    node.named_child(0)
+                        .filter(|c| c.kind() == "identifier")
+                        .map(text),
+                    node.child_by_field_name("type")
+                        .map(|t| type_name_of(t, src)),
                 ),
                 _ => {}
             },
@@ -735,7 +751,8 @@ impl Lang {
                 }
                 "formal_parameter" => bind(
                     node.child_by_field_name("name").map(text),
-                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                    node.child_by_field_name("type")
+                        .map(|t| type_name_of(t, src)),
                 ),
                 _ => {}
             },
@@ -755,7 +772,8 @@ impl Lang {
                 }
                 "parameter" => bind(
                     node.child_by_field_name("name").map(text),
-                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                    node.child_by_field_name("type")
+                        .map(|t| type_name_of(t, src)),
                 ),
                 _ => {}
             },
@@ -777,17 +795,24 @@ impl Lang {
             // (variable_declaration)(call_expression).
             Lang::Kotlin => match node.kind() {
                 "class_parameter" | "parameter" => bind(
-                    node.named_child(0).filter(|c| c.kind() == "identifier").map(text),
+                    node.named_child(0)
+                        .filter(|c| c.kind() == "identifier")
+                        .map(text),
                     node.named_child(1)
                         .filter(|c| c.kind() == "user_type")
                         .map(|t| type_name_of(t, src)),
                 ),
                 "property_declaration" => {
-                    let Some(decl) = node.named_child(0).filter(|c| c.kind() == "variable_declaration")
+                    let Some(decl) = node
+                        .named_child(0)
+                        .filter(|c| c.kind() == "variable_declaration")
                     else {
                         return;
                     };
-                    let name = decl.named_child(0).filter(|c| c.kind() == "identifier").map(text);
+                    let name = decl
+                        .named_child(0)
+                        .filter(|c| c.kind() == "identifier")
+                        .map(text);
                     let ty = decl
                         .named_child(1)
                         .filter(|c| c.kind() == "user_type")
@@ -802,10 +827,17 @@ impl Lang {
             Lang::Swift => match node.kind() {
                 "parameter" => {
                     let mut cursor = node.walk();
-                    let fields: Vec<Node> = node.children_by_field_name("name", &mut cursor).collect();
+                    let fields: Vec<Node> =
+                        node.children_by_field_name("name", &mut cursor).collect();
                     bind(
-                        fields.first().filter(|c| c.kind() == "simple_identifier").map(|n| text(*n)),
-                        fields.get(1).filter(|c| c.kind() == "user_type").map(|t| type_name_of(*t, src)),
+                        fields
+                            .first()
+                            .filter(|c| c.kind() == "simple_identifier")
+                            .map(|n| text(*n)),
+                        fields
+                            .get(1)
+                            .filter(|c| c.kind() == "user_type")
+                            .map(|t| type_name_of(*t, src)),
                     );
                 }
                 "property_declaration" => {
@@ -818,14 +850,19 @@ impl Lang {
                         .find(|c| c.kind() == "type_annotation")
                         .and_then(|a| a.named_child(0))
                         .map(|t| type_name_of(t, src))
-                        .or_else(|| node.child_by_field_name("value").and_then(|v| ctor_type(v, src)));
+                        .or_else(|| {
+                            node.child_by_field_name("value")
+                                .and_then(|v| ctor_type(v, src))
+                        });
                     bind(name, ty);
                 }
                 _ => {}
             },
             Lang::Php => match node.kind() {
                 "property_declaration" => {
-                    let ty = node.child_by_field_name("type").map(|t| type_name_of(t, src));
+                    let ty = node
+                        .child_by_field_name("type")
+                        .map(|t| type_name_of(t, src));
                     let mut cursor = node.walk();
                     for e in node.named_children(&mut cursor) {
                         if e.kind() == "property_element" {
@@ -838,13 +875,15 @@ impl Lang {
                 }
                 "simple_parameter" => bind(
                     node.child_by_field_name("name").map(|n| php_var(n, src)),
-                    node.child_by_field_name("type").map(|t| type_name_of(t, src)),
+                    node.child_by_field_name("type")
+                        .map(|t| type_name_of(t, src)),
                 ),
                 "assignment_expression" => bind(
                     node.child_by_field_name("left")
                         .filter(|l| l.kind() == "variable_name")
                         .map(|n| php_var(n, src)),
-                    node.child_by_field_name("right").and_then(|v| ctor_type(v, src)),
+                    node.child_by_field_name("right")
+                        .and_then(|v| ctor_type(v, src)),
                 ),
                 _ => {}
             },
@@ -1341,7 +1380,10 @@ fn ctor_type(value: Node, src: &str) -> Option<String> {
             let name = bare_type_name(&name);
             // A lowercase callee is a function, not a constructor. Without
             // this every `let x = helper()` would bind x to "helper".
-            name.chars().next().is_some_and(char::is_uppercase).then_some(name)
+            name.chars()
+                .next()
+                .is_some_and(char::is_uppercase)
+                .then_some(name)
         }
         _ => None,
     }

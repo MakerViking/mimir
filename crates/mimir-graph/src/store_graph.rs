@@ -261,7 +261,8 @@ pub fn check(conn: &Connection, project: &Node, root: &Path) -> Result<Drift> {
     Ok(drift)
 }
 
-fn code_file(conn: &Connection, project_id: i64, rel: &str) -> Result<Option<Node>> {    Ok(conn
+fn code_file(conn: &Connection, project_id: i64, rel: &str) -> Result<Option<Node>> {
+    Ok(conn
         .query_row(
             &format!(
                 "SELECT {NODE_COLS} FROM node

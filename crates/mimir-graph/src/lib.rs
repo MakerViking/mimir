@@ -452,7 +452,11 @@ mod tests {
         assert!(!fresh.is_stale(), "{fresh:?}");
         assert_eq!(fresh.unchanged, 2);
 
-        write(dir.path(), "src/util.rs", "pub fn slugify() {}\npub fn n() {}\n");
+        write(
+            dir.path(),
+            "src/util.rs",
+            "pub fn slugify() {}\npub fn n() {}\n",
+        );
         write(dir.path(), "src/new.rs", "pub fn added() {}\n");
         std::fs::remove_file(dir.path().join("src/main.rs")).unwrap();
 

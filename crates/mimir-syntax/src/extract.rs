@@ -1088,13 +1088,19 @@ class Repo {
 "#,
         );
         let b = binds(&sw);
-        assert!(b.contains(&("Repo", "db", "Database")), "swift field: {b:?}");
+        assert!(
+            b.contains(&("Repo", "db", "Database")),
+            "swift field: {b:?}"
+        );
         assert!(
             b.contains(&("Repo::save", "store", "Database")),
             "swift local: {b:?}"
         );
         let r = recvs(&sw);
-        assert!(r.contains(&("Repo::save", "self.db", "put")), "swift: {r:?}");
+        assert!(
+            r.contains(&("Repo::save", "self.db", "put")),
+            "swift: {r:?}"
+        );
 
         let php = extract(
             Lang::Php,
