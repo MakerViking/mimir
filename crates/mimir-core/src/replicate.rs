@@ -18,7 +18,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
-use crate::model::Rel;
+use crate::model::{MemoryType, Rel};
 use crate::store;
 
 /// One memory node on the wire. `type` is the memory subkind; `content_hash`
@@ -198,6 +198,13 @@ pub fn apply_changes(conn: &Connection, batch: &SyncBatch) -> Result<ApplyStats>
             None => None,
             Some(key) => Some(store::resolve_or_shadow_project(&tx, key)?),
         };
+        // Wire `type` must be a subkind this build knows. Unknown values
+        // coerce to None (reads back as "note") rather than being stored
+        // verbatim: dashboards and filters group on subkind, so a hostile
+        // peer must not dictate arbitrary display strings into this store.
+        // A NEWER peer's new types degrade to note here instead of dropping
+        // the memory — convergence beats typing fidelity across versions.
+        let mtype: Option<String> = n.mtype.clone().filter(|s| s.parse::<MemoryType>().is_ok());
         // Upsert; on uid conflict, overwrite only the synced fields and only when
         // the incoming record is strictly newer. Local signals (strength,
         // access_count, …) are never touched.
@@ -218,7 +225,7 @@ pub fn apply_changes(conn: &Connection, batch: &SyncBatch) -> Result<ApplyStats>
                     AND excluded.deleted_at IS NOT NULL AND node.deleted_at IS NULL)",
             params![
                 n.uid,
-                n.mtype,
+                mtype,
                 project_id,
                 n.title,
                 n.body,
@@ -629,5 +636,25 @@ mod tests {
             })
             .unwrap();
         assert!(after > before, "soft_delete bumped updated_at");
+    }
+
+    #[test]
+    fn unknown_wire_type_coerces_to_note() {
+        let a = db::open_in_memory().unwrap();
+        let n = mem(&a, "typed elsewhere");
+        let mut batch = snapshot(&a).unwrap();
+        batch.nodes[0].mtype = Some("<img src=x onerror=alert(1)>".into());
+
+        let b = db::open_in_memory().unwrap();
+        apply_changes(&b, &batch).unwrap();
+        let subkind: Option<String> = b
+            .query_row("SELECT subkind FROM node WHERE uid=?1", [&n.uid], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert!(
+            subkind.is_none(),
+            "hostile wire type must not land verbatim (got {subkind:?})"
+        );
     }
 }

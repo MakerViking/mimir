@@ -259,7 +259,7 @@ fn render(mimir: &Mimir) -> Result<String> {
         .map(|(name, n)| {
             format!(
                 r#"<div class="hrow"><span class="hlabel">{}</span><span class="hbar"><i class="grow-x" style="width:{:.1}%"></i></span><span class="hval">{}</span></div>"#,
-                name,
+                esc(name),
                 100.0 * *n as f64 / max_t as f64,
                 fmt_n(*n)
             )
@@ -288,7 +288,11 @@ fn render(mimir: &Mimir) -> Result<String> {
     } else {
         top.iter()
             .map(|(uid, title, n)| {
-                let tail = &uid[uid.len().saturating_sub(6)..];
+                // chars() not byte-slicing: a sync-supplied uid can end in a
+                // multibyte char, where `&uid[len-6..]` would panic. Escaped
+                // like every other DB-derived string here.
+                let skip = uid.chars().count().saturating_sub(6);
+                let tail = esc(&uid.chars().skip(skip).collect::<String>());
                 format!(
                     r#"<div class="trow"><span class="tid">{}</span><span class="ttitle">{}</span><span class="tcount">↑{}</span></div>"#,
                     tail,
