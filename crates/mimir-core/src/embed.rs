@@ -389,9 +389,19 @@ pub fn to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 pub fn from_blob(blob: &[u8]) -> Vec<f32> {
-    blob.chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect()
+    // `as_chunks::<4>` rather than `chunks_exact(4)`: the const generic hands
+    // back `[u8; 4]` directly, so `from_le_bytes` takes it without the manual
+    // re-indexing that could silently transpose a byte. A trailing partial
+    // chunk is discarded either way — a blob whose length is not a multiple of
+    // 4 is not a vector this wrote.
+    //
+    // Also what `clippy::chunks_exact_to_as_chunks` asks for. That lint is
+    // newer than some toolchains in use here, so this is written to satisfy it
+    // rather than `#[allow]`ed: an allow of a lint an older clippy has never
+    // heard of trips `unknown_lints`, which fails the same `-D warnings` gate
+    // from the other side.
+    let (chunks, _) = blob.as_chunks::<4>();
+    chunks.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 /// Embed every node whose content is new or changed for this model.
@@ -545,6 +555,23 @@ mod tests {
     fn blob_round_trip() {
         let v = vec![0.25f32, -1.5, 3.0e-7, 42.0];
         assert_eq!(from_blob(&to_blob(&v)), v);
+    }
+
+    /// `from_blob` decodes every stored embedding, so its edge behaviour is
+    /// worth pinning rather than assuming: a trailing partial chunk is
+    /// dropped, not padded into a bogus float. A blob whose length is not a
+    /// multiple of 4 was not written by `to_blob`, and inventing a final
+    /// value from 1-3 stray bytes would put a garbage dimension into a
+    /// vector that then scores against every query.
+    #[test]
+    fn from_blob_drops_a_trailing_partial_float() {
+        let v = vec![1.0f32, -2.0];
+        let mut truncated = to_blob(&v);
+        truncated.extend_from_slice(&[0xAB, 0xCD, 0xEF]); // 3 stray bytes
+        assert_eq!(from_blob(&truncated), v);
+
+        assert!(from_blob(&[]).is_empty());
+        assert!(from_blob(&[1, 2, 3]).is_empty(), "no complete float at all");
     }
 
     #[test]
