@@ -33,17 +33,23 @@ if [ "$os" = "macos" ] && [ "$arch" = "x86_64" ]; then
 fi
 
 if [ "$VERSION" = "latest" ]; then
-  url="https://github.com/$REPO/releases/latest/download/mimir-$os-$arch.tar.gz"
+  base="https://github.com/$REPO/releases/latest/download"
 else
-  url="https://github.com/$REPO/releases/download/$VERSION/mimir-$os-$arch.tar.gz"
+  base="https://github.com/$REPO/releases/download/$VERSION"
 fi
+url="$base/mimir-$os-$arch.tar.gz"
 
 echo "Installing mimir ($os-$arch) to $BIN_DIR ..."
 mkdir -p "$BIN_DIR"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
-curl -fsSL "$url" -o "$tmp/mimir.tar.gz"
-tar -xzf "$tmp/mimir.tar.gz" -C "$tmp"
+curl -fsSL "$url" -o "$tmp/mimir-$os-$arch.tar.gz"
+# Verify against the release's SHA256SUMS (fail-closed: releases published
+# before checksums existed must be installed from source instead).
+curl -fsSL "$base/SHA256SUMS" | grep "mimir-$os-$arch.tar.gz" \
+  | (cd "$tmp" && sha256sum -c -)
+tar -xzf "$tmp/mimir-$os-$arch.tar.gz" -C "$tmp"
+install -m 755 "$tmp/mimir" "$BIN_DIR/mimir"
 install -m 755 "$tmp/mimir" "$BIN_DIR/mimir"
 
 case ":$PATH:" in

@@ -109,7 +109,15 @@ jobs:
       - uses: actions/download-artifact@v5
         with:
           merge-multiple: true
+      # Installers verify against this file; keep it sorted for stable diffs.
+      - name: Generate SHA256SUMS
+        run: |
+          find . -maxdepth 1 -type f -name 'mimir-*' \
+            | sort | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
-          files: mimir-*
+          files: |
+            mimir-*
+            SHA256SUMS
           generate_release_notes: true
