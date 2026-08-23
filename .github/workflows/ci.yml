@@ -32,3 +32,76 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  # `install.sh` is the only upgrade path most users have, and it was untested:
+  # a checksum step that assumed GNU coreutils shipped and would have aborted
+  # on every Mac, and a fail-closed check against releases that carry no
+  # SHA256SUMS. Both are shell-level bugs no Rust test can see.
+  #
+  # Runs against a local fixture rather than a real GitHub release, so it tests
+  # the script instead of the network, works before a release exists, and can
+  # assert the case that actually matters: a TAMPERED archive is refused.
+  installer:
+    name: install.sh (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build a fake release
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -s)" in Linux) os=linux ;; Darwin) os=macos ;; esac
+          case "$(uname -m)" in x86_64|amd64) arch=x86_64 ;; aarch64|arm64) arch=aarch64 ;; esac
+          echo "asset=mimir-$os-$arch.tar.gz" >> "$GITHUB_ENV"
+
+          mkdir -p fixture/latest/download
+          # A stand-in binary: the installer only execs it for --version.
+          mkdir -p stage
+          printf '#!/bin/sh\necho "mimir 0.0.0-test"\n' > stage/mimir
+          chmod +x stage/mimir
+          tar -czf "fixture/latest/download/mimir-$os-$arch.tar.gz" -C stage mimir
+          ( cd fixture/latest/download && \
+            if command -v sha256sum >/dev/null; then sha256sum ./mimir-*.tar.gz > SHA256SUMS;
+            else shasum -a 256 ./mimir-*.tar.gz > SHA256SUMS; fi )
+          cat fixture/latest/download/SHA256SUMS
+
+      - name: Serve it
+        shell: bash
+        run: |
+          python3 -m http.server 8765 --directory fixture &>/dev/null &
+          for _ in $(seq 1 40); do
+            curl -fsS "http://127.0.0.1:8765/latest/download/SHA256SUMS" -o /dev/null && break
+            sleep 0.25
+          done
+
+      - name: Installs and verifies
+        shell: bash
+        run: |
+          set -euo pipefail
+          MIMIR_BASE_URL=http://127.0.0.1:8765 MIMIR_BIN_DIR="$PWD/out" sh install.sh
+          "$PWD/out/mimir" --version | grep -q '0.0.0-test'
+
+      - name: Refuses a tampered archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'tampered' >> "fixture/latest/download/$asset"
+          if MIMIR_BASE_URL=http://127.0.0.1:8765 MIMIR_BIN_DIR="$PWD/out2" sh install.sh; then
+            echo "::error::installer accepted a tampered archive" && exit 1
+          fi
+          test ! -e "$PWD/out2/mimir"
+
+      - name: Refuses a release with no SHA256SUMS
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f fixture/latest/download/SHA256SUMS
+          if MIMIR_BASE_URL=http://127.0.0.1:8765 MIMIR_BIN_DIR="$PWD/out3" sh install.sh; then
+            echo "::error::installer accepted an unverifiable release" && exit 1
+          fi
+          test ! -e "$PWD/out3/mimir"
+
