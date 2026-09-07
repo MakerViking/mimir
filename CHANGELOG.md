@@ -3,8 +3,10 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
-## [Unreleased]
+## [0.17.0] - 2026-08-26
+
 ### Added
+
 - **Call edges resolved through the receiver's type.** `db.save()` and
   `cache.save()` used to be the same question to the resolver — a bare name
   — so it answered with a half-weight guess at every `save` in the project,
@@ -43,17 +45,6 @@ the `mimir-mem` crate, and the on-disk schema move together.
   error you get. CLI only for now — the MCP `graph` tool stays single-project
   rather than paying a schema-size cost in every session.
 
-### Fixed
-- **The code graph rebuilt identically twice.** `resolve_import` picked its
-  match by iterating a `HashSet`, so a Rust module path with more than one
-  suffix match resolved to whichever file the hash order surfaced — import
-  edge counts drifted between rebuilds of an unchanged tree (246 vs 247 on
-  this repo). Both lookups now take the lexicographically smallest match.
-  Found while building `graph check`, which is worth little if the thing it
-  checks is unstable.
-
-## [Unreleased]
-### Added
 - **`mimir review` — the findings the store will not decide for you.**
   `consolidate` already found contradicting memories and printed them into a
   report that scrolled past; `grounding` already knew which links had gone
@@ -95,8 +86,6 @@ the `mimir-mem` crate, and the on-disk schema move together.
   The suite records one stated limit rather than hiding it — `--hard` removes
   the tombstone, so it trades away the re-feed guard that `forget` keeps.
 
-## [Unreleased]
-### Added
 - **`mimir audit` — who changed a memory, when, and why.** Nothing recorded
   writes before this: `deleted_at` and `superseded_by` were set in place, so a
   correction was structural but anonymous. New `mutation` table (op, actor,
@@ -132,58 +121,6 @@ the `mimir-mem` crate, and the on-disk schema move together.
   survives where recall never looks but `export` and every backup do; decay
   archival deliberately does not purge, since nobody decided that.
 
-## [Unreleased]
-### Fixed
-- **The tombstone guard no longer depends on how much you wrote.** The reword
-  pass that stops a deliberately forgotten fact from being re-extracted used a
-  fixed similarity ratio, and a ratio is a function of length: at one differing
-  token, `jaccard >= 0.85` needs 13 unique tokens to clear. The same trailing
-  period that was caught on a 14-token memory walked straight through a
-  9-token one — measured at the boundary, `n=12` accepted and `n=13` refused.
-  Forget "SCRAM auth rejects non-ASCII passwords at 03:00 UTC", offer it back
-  lowercased with a full stop, and it returned with no warning. The failure
-  landed on terse one-line gotchas, which is the common shape of a
-  hand-written memory, and the committed test passed only because its fixture
-  was long enough.
-
-  The tombstone pass now asks three questions instead of one: equality under a
-  comparison view that strips leading/trailing `.`/`-`/`_` (so "utc." and "utc"
-  agree while `file.rs` still differs from `file`), containment scaled to the
-  fact's own length (the same claim with detail added or dropped), and then the
-  ratio, which still earns its keep on diffuse rewording of long text.
-  Containment is a *subset* test rather than a token distance on purpose: an
-  unconditional "differs by ≤N tokens" would also swallow substitutions, and
-  "redis port 6379 tcp" against "redis port 5432 tcp" is two tokens apart and a
-  different fact. Two guards keep it from over-reaching — a contained set below
-  four tokens is a fragment, not a fact, and a polarity flip is never a reword,
-  so `consolidate::negation_mismatch` draws that line here too.
-
-  Only the tombstone path changed. The live near-duplicate pass keeps the plain
-  ratio, because the costs are not symmetric — a false duplicate refusal is an
-  annoyance with `--force` one keystroke away, a missed tombstone silently
-  undoes a deletion someone meant. Re-fixtured the reword test to a 9-token
-  memory so it can no longer pass by length, and pinned the property itself
-  across five lengths from 5 to 20 tokens.
-
-## [Unreleased]
-### Fixed
-- **`mimir mcp` no longer outlives the client that spawned it.** Fourteen
-  orphaned stdio servers had accumulated on one machine, the oldest fourteen
-  days old, ~2.9 GB resident between them, every one holding the SQLite
-  database open. The EOF handling was never at fault — rmcp returns `None` on
-  a zero-length read and the process exits in 0.3 s when stdin closes. The
-  EOF simply never arrived: MCP stdio is an `AF_UNIX` **socketpair**, not a
-  pipe, and a socketpair delivers EOF only once *every* descriptor for the
-  peer end is closed, so any unrelated process that inherited it pins the
-  server open forever. The trigger therefore cannot be a descriptor:
-  `PR_SET_PDEATHSIG` (Linux) plus a `getppid()` poll (macOS, and to close the
-  arming race) now end the process when its parent does, and SIGTERM/SIGHUP
-  route through the same path — cancel the service, drain in flight, drop the
-  engine and its database handle. `--http` is untouched: `mimir daemon` has
-  its own lifetime and arms none of this.
-
-## [Unreleased]
-### Added
 - **`mimir link --scan --all-projects`, and a `doctor` nudge to run it.**
   Grounding only exists if something creates the links, and on a real
   728-memory store 1.4% of memories had any. The cause was a scope
@@ -237,76 +174,6 @@ the `mimir-mem` crate, and the on-disk schema move together.
   table for the plaintext: a record of a leak must never become a second
   copy of it.
 
-### Fixed
-- **A stale grounding is now visible on the recall line.** It rendered only
-  in `full_record`, i.e. `get` — so an agent that recalls, reads the ranked
-  lines and acts on the top hits never saw it, which is every agent. The
-  compact line now carries `stale-link` in the bracket, the same one-word
-  treatment `unsure` gets, on affected hits only. Resolved for the whole
-  page in one query (`grounding::stale_ids`) rather than per hit, since
-  recall is a hot path and the marker is usually absent; a test asserts the
-  batch lookup and the per-node one can never disagree.
-- **`mimir remember --link <symbol>` now resolves symbol names.** Both the
-  CLI and MCP advertise "a code symbol or node", but the CLI only ever
-  called `resolve_ref`, which resolves ids — so linking a memory to
-  `retry_with_backoff` failed with "no node matching" and the only links
-  anyone could make by hand were between things they already had ids for.
-  MCP had the fallback already; the CLI is now at parity. Found while
-  building grounding, which this is the main path into: shipping it broken
-  would have repeated the anchors-at-zero-adoption failure exactly.
-- **The retrieval eval is now a gate, not just a report.** The hermetic
-  corpus was committed and deterministic but nothing failed when the
-  numbers moved: the only assertions were well-formedness checks with an
-  `MRR > 0.2` floor, and every actual baseline was `#[ignore]`d. Two tests
-  now run on plain `cargo test` — a committed per-set baseline that must
-  reproduce **exactly** (in both directions, so an improvement also has to
-  be written down), and an ablation asserting each scoring knob still beats
-  its own absence. Verified by zeroing `type_prior_alpha`: previously
-  green, now two failures naming the metric and the delta.
-  - Fell out of writing it: **`scoring.code_damp` changes nothing on the
-    corpus** — same numbers in every category, including the
-    `code-vs-memory` scenario that exists to guard it, whose single
-    question ranks the memory first either way. Pinned by a test rather
-    than papered over, so authoring a fixture that finally exercises the
-    knob will fail loudly and move it into the ablation where it belongs.
-
-- **`mimir anchor <ref> --pattern ...`** sets guard anchors on an
-  *existing* memory. `remember --anchor` only covered capture time, which
-  is why anchor adoption sits at zero in practice: by the time you know
-  which file a memory guards, the memory already exists. Patterns replace
-  the existing set.
-
-### Fixed
-- **A forgotten memory can no longer come back on its own.** `forget` set a
-  tombstone, but duplicate detection only ever looked at live nodes — so
-  offering the same text again created a fresh node with no warning, and
-  the deletion left nothing behind that could catch it. An importer re-run,
-  an extractor re-reading an unchanged source, or an agent that saw the
-  fact twice would each quietly undo the delete. `remember` now refuses
-  with the date it was forgotten on, and takes `--force` to override; the
-  MCP tool has no `force` parameter at all, so an agent cannot resurrect
-  something a human deleted. Matching is by exact normalized hash *and* by
-  token overlap, because a reword is the common shape of re-extraction.
-  Decay-archived nodes (`meta.archived`) are deliberately excluded — nobody
-  decided those, and refusing them would train everyone to pass `--force`
-  by reflex.
-- **The CLI no longer overflows the stack on Windows.** Windows gives the
-  main thread a 1 MiB stack where Linux and macOS give 8, and clap's
-  derived builder for Mimir's ~50 subcommands outgrew it in debug builds:
-  `mimir --version` aborted with `thread 'main' has overflowed its stack`
-  before parsing a single argument, taking the whole Windows e2e suite
-  down with it. The CLI now runs on a worker thread with a 16 MiB stack
-  it sets itself, instead of on whatever the OS happened to hand it.
-- **The auto-recall hook now passes `session_id`,** so per-session dedup
-  actually engages. Claude Code supplies it on every hook payload, but the
-  script never read it — leaving the ledger key empty, `injection_log`
-  permanently empty, and the same memory eligible for re-injection on
-  every prompt of a long session. That is precisely the "flooded by stale
-  crap" failure the relevance floor exists to prevent. With it wired,
-  a repeat prompt in the same session rotates to the next unseen memory
-  instead of repeating the first. Hook script version 3 → 4; re-run
-  `mimir init --hooks --auto-recall` to pick it up.
-### Added
 - **Memories can declare when they stop being true.** `mimir remember
   --expires-in 90d` (units `h`/`d`/`w`; months and years are refused
   because they have no fixed length — use `365d`) sets a machine-checkable
@@ -320,43 +187,6 @@ the `mimir-mem` crate, and the on-disk schema move together.
   a memory stored without the deadline its author asked for is worse than
   an error, because nothing later reveals the omission.
 
-### Fixed
-- **`link` no longer accepts `rel = "supersedes"`.** The `supersedes`
-  *edge* and the `superseded_by` *column* are independent, and only the
-  column suppresses recall — so a `supersedes` link read exactly like a
-  retirement while retiring nothing. One such edge sat in a real store for
-  six weeks while the "retired" memory kept ranking first on the queries
-  it was supposed to have been replaced for. Both the CLI and the MCP tool
-  now refuse the rel and point at `supersede`, which sets both.
-### Fixed
-- **The daemon no longer delegates inference to itself.** A process
-  serving `mimir mcp --http` (i.e. `mimir daemon`) installed a
-  `DaemonClient` pointed at its own endpoint on its background engines.
-  Because the auto-sync thread starts before the HTTP listener binds,
-  every daemon start with pending embed work logged
-  `WARN daemon embed failed; falling back to local embedder ...
-  Connection refused` — a spurious fault in the journal, plus a doomed
-  round-trip per background tick. Delegation is now skipped when this
-  process *is* the daemon.
-- **Each MCP session now records which inference path it took.** The
-  delegate-vs-local decision is made once at session start and is sticky
-  for the session's entire life, but nothing logged it — so a session
-  that fell back and eager-loaded a ~150MB reranker was indistinguishable
-  at runtime from one that delegated, and the only symptom was
-  unattributable resident memory days later. Falling back now logs at
-  WARN (visible at the default log level, which is `warn`); delegating
-  logs at INFO.
-
-### Changed
-- **`contrib/mimir-daemon.service`: `RestartSec` 5 → 1.** The daily
-  `RuntimeMaxSec` recycle (which guards a real WebGPU/Dawn VRAM leak and
-  stays) opens a window where a *starting* MCP session cannot reach the
-  daemon and therefore eager-loads its own reranker for its whole life.
-  Narrowing the gap makes that trap five times less likely. Also
-  documented in the unit that systemd reporting `Failed with result
-  'timeout'` on each recycle is expected, not a fault — there is no exit
-  status that marks a `RuntimeMaxSec` stop successful.
-### Added
 - **Runaway circuit breaker on the proxy (`--max-request-tokens`, `[proxy]
   max_request_tokens`).** Off by default. Above the cap, `mimir proxy`
   rejects a `/v1/messages` request with an Anthropic-shaped
@@ -424,6 +254,15 @@ the `mimir-mem` crate, and the on-disk schema move together.
   0.14.0 CLI-only limitation is lifted.
 
 ### Changed
+
+- **`contrib/mimir-daemon.service`: `RestartSec` 5 → 1.** The daily
+  `RuntimeMaxSec` recycle (which guards a real WebGPU/Dawn VRAM leak and
+  stays) opens a window where a *starting* MCP session cannot reach the
+  daemon and therefore eager-loads its own reranker for its whole life.
+  Narrowing the gap makes that trap five times less likely. Also
+  documented in the unit that systemd reporting `Failed with result
+  'timeout'` on each recycle is expected, not a fault — there is no exit
+  status that marks a `RuntimeMaxSec` stop successful.
 - **The session brief is now ON by default** (`[brief] enabled = true`).
   The 0.16.0 design gated this flip on an eval, and the gate has been
   passed with citable numbers (scoped to hook-running clients): selection
@@ -459,6 +298,189 @@ the `mimir-mem` crate, and the on-disk schema move together.
 - **Session brief: a pinned global bypasses the relevance gate** — the
   gate silences automatic noise; an explicit pin is the user saying
   "never miss this" and a lexical heuristic must not overrule it.
+
+### Fixed
+
+- **`install.sh` could not install anything, on any platform.** The one-liner
+  in the README fetches this script from `main`, so this was live for every
+  user. Three defects: it hard-required a `SHA256SUMS` asset that **no
+  published release carries** (fail-closed under `set -eu`, so every install
+  aborted on an HTTP 404); it verified with `sha256sum`, which is GNU
+  coreutils and **absent from a stock macOS**, aborting every Mac install
+  before it could verify anything; and it ran `install -m 755` twice.
+
+  Verification stays fail-closed — an attacker who can strip one response can
+  strip the checksum response, so continuing anyway would be an integrity
+  check that isn't one — but a missing `SHA256SUMS` now explains itself and
+  points at `cargo install mimir-mem` instead of leaving a bare `curl: (22)`.
+  The digest is computed with whichever of `sha256sum`, `shasum` or `openssl`
+  exists; all three were checked to return byte-identical output.
+
+  **This release is the first to publish `SHA256SUMS`**, so it is also the
+  first the installer can verify. `MIMIR_BASE_URL` joins the existing
+  overrides so the script can be pointed at a fixture and tested.
+
+- **CI never executed `install.sh`.** A new job runs it on ubuntu *and* macos
+  against a local fixture — no network, works before a release exists — and
+  asserts the cases that matter: a tampered archive is refused and an
+  unverifiable release is refused, with no binary landing in either path.
+
+- **`cargo clippy` was green locally and red in CI.** The runner's stable
+  toolchain moved ahead of the local one and the new
+  `clippy::chunks_exact_to_as_chunks` fired on months-old code in
+  `embed::from_blob`. Rewritten as `as_chunks::<4>()` rather than silenced:
+  an `#[allow]` of a lint an *older* clippy has never heard of raises
+  `unknown_lints` and fails the same `-D warnings` gate from the other side.
+  The new form is also better — `f32::from_le_bytes` takes the `[u8; 4]`
+  whole, removing the hand-indexed `[b[0], b[1], b[2], b[3]]` where a byte
+  transposition could have hidden silently in the decoder for every stored
+  embedding.
+
+- **The code graph rebuilt identically twice.** `resolve_import` picked its
+  match by iterating a `HashSet`, so a Rust module path with more than one
+  suffix match resolved to whichever file the hash order surfaced — import
+  edge counts drifted between rebuilds of an unchanged tree (246 vs 247 on
+  this repo). Both lookups now take the lexicographically smallest match.
+  Found while building `graph check`, which is worth little if the thing it
+  checks is unstable.
+
+- **The tombstone guard no longer depends on how much you wrote.** The reword
+  pass that stops a deliberately forgotten fact from being re-extracted used a
+  fixed similarity ratio, and a ratio is a function of length: at one differing
+  token, `jaccard >= 0.85` needs 13 unique tokens to clear. The same trailing
+  period that was caught on a 14-token memory walked straight through a
+  9-token one — measured at the boundary, `n=12` accepted and `n=13` refused.
+  Forget "SCRAM auth rejects non-ASCII passwords at 03:00 UTC", offer it back
+  lowercased with a full stop, and it returned with no warning. The failure
+  landed on terse one-line gotchas, which is the common shape of a
+  hand-written memory, and the committed test passed only because its fixture
+  was long enough.
+
+  The tombstone pass now asks three questions instead of one: equality under a
+  comparison view that strips leading/trailing `.`/`-`/`_` (so "utc." and "utc"
+  agree while `file.rs` still differs from `file`), containment scaled to the
+  fact's own length (the same claim with detail added or dropped), and then the
+  ratio, which still earns its keep on diffuse rewording of long text.
+  Containment is a *subset* test rather than a token distance on purpose: an
+  unconditional "differs by ≤N tokens" would also swallow substitutions, and
+  "redis port 6379 tcp" against "redis port 5432 tcp" is two tokens apart and a
+  different fact. Two guards keep it from over-reaching — a contained set below
+  four tokens is a fragment, not a fact, and a polarity flip is never a reword,
+  so `consolidate::negation_mismatch` draws that line here too.
+
+  Only the tombstone path changed. The live near-duplicate pass keeps the plain
+  ratio, because the costs are not symmetric — a false duplicate refusal is an
+  annoyance with `--force` one keystroke away, a missed tombstone silently
+  undoes a deletion someone meant. Re-fixtured the reword test to a 9-token
+  memory so it can no longer pass by length, and pinned the property itself
+  across five lengths from 5 to 20 tokens.
+
+- **`mimir mcp` no longer outlives the client that spawned it.** Fourteen
+  orphaned stdio servers had accumulated on one machine, the oldest fourteen
+  days old, ~2.9 GB resident between them, every one holding the SQLite
+  database open. The EOF handling was never at fault — rmcp returns `None` on
+  a zero-length read and the process exits in 0.3 s when stdin closes. The
+  EOF simply never arrived: MCP stdio is an `AF_UNIX` **socketpair**, not a
+  pipe, and a socketpair delivers EOF only once *every* descriptor for the
+  peer end is closed, so any unrelated process that inherited it pins the
+  server open forever. The trigger therefore cannot be a descriptor:
+  `PR_SET_PDEATHSIG` (Linux) plus a `getppid()` poll (macOS, and to close the
+  arming race) now end the process when its parent does, and SIGTERM/SIGHUP
+  route through the same path — cancel the service, drain in flight, drop the
+  engine and its database handle. `--http` is untouched: `mimir daemon` has
+  its own lifetime and arms none of this.
+
+- **A stale grounding is now visible on the recall line.** It rendered only
+  in `full_record`, i.e. `get` — so an agent that recalls, reads the ranked
+  lines and acts on the top hits never saw it, which is every agent. The
+  compact line now carries `stale-link` in the bracket, the same one-word
+  treatment `unsure` gets, on affected hits only. Resolved for the whole
+  page in one query (`grounding::stale_ids`) rather than per hit, since
+  recall is a hot path and the marker is usually absent; a test asserts the
+  batch lookup and the per-node one can never disagree.
+- **`mimir remember --link <symbol>` now resolves symbol names.** Both the
+  CLI and MCP advertise "a code symbol or node", but the CLI only ever
+  called `resolve_ref`, which resolves ids — so linking a memory to
+  `retry_with_backoff` failed with "no node matching" and the only links
+  anyone could make by hand were between things they already had ids for.
+  MCP had the fallback already; the CLI is now at parity. Found while
+  building grounding, which this is the main path into: shipping it broken
+  would have repeated the anchors-at-zero-adoption failure exactly.
+- **The retrieval eval is now a gate, not just a report.** The hermetic
+  corpus was committed and deterministic but nothing failed when the
+  numbers moved: the only assertions were well-formedness checks with an
+  `MRR > 0.2` floor, and every actual baseline was `#[ignore]`d. Two tests
+  now run on plain `cargo test` — a committed per-set baseline that must
+  reproduce **exactly** (in both directions, so an improvement also has to
+  be written down), and an ablation asserting each scoring knob still beats
+  its own absence. Verified by zeroing `type_prior_alpha`: previously
+  green, now two failures naming the metric and the delta.
+  - Fell out of writing it: **`scoring.code_damp` changes nothing on the
+    corpus** — same numbers in every category, including the
+    `code-vs-memory` scenario that exists to guard it, whose single
+    question ranks the memory first either way. Pinned by a test rather
+    than papered over, so authoring a fixture that finally exercises the
+    knob will fail loudly and move it into the ablation where it belongs.
+
+- **`mimir anchor <ref> --pattern ...`** sets guard anchors on an
+  *existing* memory. `remember --anchor` only covered capture time, which
+  is why anchor adoption sits at zero in practice: by the time you know
+  which file a memory guards, the memory already exists. Patterns replace
+  the existing set.
+
+- **A forgotten memory can no longer come back on its own.** `forget` set a
+  tombstone, but duplicate detection only ever looked at live nodes — so
+  offering the same text again created a fresh node with no warning, and
+  the deletion left nothing behind that could catch it. An importer re-run,
+  an extractor re-reading an unchanged source, or an agent that saw the
+  fact twice would each quietly undo the delete. `remember` now refuses
+  with the date it was forgotten on, and takes `--force` to override; the
+  MCP tool has no `force` parameter at all, so an agent cannot resurrect
+  something a human deleted. Matching is by exact normalized hash *and* by
+  token overlap, because a reword is the common shape of re-extraction.
+  Decay-archived nodes (`meta.archived`) are deliberately excluded — nobody
+  decided those, and refusing them would train everyone to pass `--force`
+  by reflex.
+- **The CLI no longer overflows the stack on Windows.** Windows gives the
+  main thread a 1 MiB stack where Linux and macOS give 8, and clap's
+  derived builder for Mimir's ~50 subcommands outgrew it in debug builds:
+  `mimir --version` aborted with `thread 'main' has overflowed its stack`
+  before parsing a single argument, taking the whole Windows e2e suite
+  down with it. The CLI now runs on a worker thread with a 16 MiB stack
+  it sets itself, instead of on whatever the OS happened to hand it.
+- **The auto-recall hook now passes `session_id`,** so per-session dedup
+  actually engages. Claude Code supplies it on every hook payload, but the
+  script never read it — leaving the ledger key empty, `injection_log`
+  permanently empty, and the same memory eligible for re-injection on
+  every prompt of a long session. That is precisely the "flooded by stale
+  crap" failure the relevance floor exists to prevent. With it wired,
+  a repeat prompt in the same session rotates to the next unseen memory
+  instead of repeating the first. Hook script version 3 → 4; re-run
+  `mimir init --hooks --auto-recall` to pick it up.
+- **`link` no longer accepts `rel = "supersedes"`.** The `supersedes`
+  *edge* and the `superseded_by` *column* are independent, and only the
+  column suppresses recall — so a `supersedes` link read exactly like a
+  retirement while retiring nothing. One such edge sat in a real store for
+  six weeks while the "retired" memory kept ranking first on the queries
+  it was supposed to have been replaced for. Both the CLI and the MCP tool
+  now refuse the rel and point at `supersede`, which sets both.
+- **The daemon no longer delegates inference to itself.** A process
+  serving `mimir mcp --http` (i.e. `mimir daemon`) installed a
+  `DaemonClient` pointed at its own endpoint on its background engines.
+  Because the auto-sync thread starts before the HTTP listener binds,
+  every daemon start with pending embed work logged
+  `WARN daemon embed failed; falling back to local embedder ...
+  Connection refused` — a spurious fault in the journal, plus a doomed
+  round-trip per background tick. Delegation is now skipped when this
+  process *is* the daemon.
+- **Each MCP session now records which inference path it took.** The
+  delegate-vs-local decision is made once at session start and is sticky
+  for the session's entire life, but nothing logged it — so a session
+  that fell back and eager-loaded a ~150MB reranker was indistinguishable
+  at runtime from one that delegated, and the only symptom was
+  unattributable resident memory days later. Falling back now logs at
+  WARN (visible at the default log level, which is `warn`); delegating
+  logs at INFO.
 
 ## [0.16.0] - 2026-07-23
 ### Added
