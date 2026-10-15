@@ -3,6 +3,26 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [0.17.1] - 2026-10-15
+
+### Fixed
+
+- **The proxy counted a screenshot as its base64, not as an image.** A
+  `tool_result` holding an image was measured by serializing it, so 400 KB of
+  base64 read as ~50,000 tokens where the API bills an image at most ~1,600.
+  Every deduped or pruned screenshot was logged at that size: the savings
+  ledger recorded single requests "saving" up to 798k tokens. The same number
+  fed the `--max-request-tokens` breaker, so a request carrying screenshots
+  could be refused as oversize. Images now count a flat 1,600; two different
+  screenshots are still never treated as duplicates. Ledger rows written
+  before this fix keep their old values.
+- **`mimir report` netted the session brief against savings.** The brief is
+  recorded as a cost (`before = 0`), and the report summed it raw, so a quiet
+  day showed negative "tokens saved". It now excludes cost sources exactly as
+  `mimir savings` does.
+- **`mimir report` columns ran together past 999.9k.** Large values now read
+  `324.8M` / `1.5B`, and every column has a separating space.
+
 ## [0.17.0] - 2026-10-15
 
 ### Added
