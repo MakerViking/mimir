@@ -300,7 +300,9 @@ enum Command {
     Link {
         a: Option<String>,
         b: Option<String>,
-        /// links|about|relates|mentions|describes|supersedes…
+        /// links|about|relates|mentions|describes|supersedes|summarizes|
+        /// derived_from. `co_recalled` is not in the vocabulary here: the
+        /// store writes those for itself from what you actually recall.
         #[arg(long, default_value = "relates")]
         rel: String,
         /// Auto-link memories to code symbols their text mentions

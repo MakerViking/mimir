@@ -12,7 +12,9 @@
 //! one second resolve by arrival order (one is silently kept, the other
 //! dropped). Tombstones ride along as `deleted_at`. Local-only signals
 //! (strength, access_count, recall_event) and embeddings are never synced; a
-//! peer recomputes embeddings locally.
+//! peer recomputes embeddings locally. `co_recalled` edges are local-only for
+//! the same reason and are filtered in BOTH directions — see `changes_since`
+//! and the edge loop in `apply_changes`.
 
 use rusqlite::{params, Connection, OptionalExtension, Row, TransactionBehavior};
 use serde::{Deserialize, Serialize};
@@ -86,8 +88,9 @@ pub fn project_is_syncable(meta: &serde_json::Value) -> bool {
 }
 
 /// "Changed since `since`" = syncable memories whose latest activity
-/// (max of updated_at and deleted_at) is newer than `since`, plus all edges
-/// among synced memories (sparse; shipped whole and upserted idempotently).
+/// (max of updated_at and deleted_at) is newer than `since`, plus all
+/// *authored* edges among synced memories (sparse; shipped whole and upserted
+/// idempotently).
 pub fn changes_since(conn: &Connection, since: i64) -> Result<SyncBatch> {
     let mut stmt = conn.prepare(&format!(
         "SELECT m.uid, m.subkind, m.title, m.body, m.tags_text, m.pinned, m.content_hash, m.meta,
@@ -124,6 +127,15 @@ pub fn changes_since(conn: &Connection, since: i64) -> Result<SyncBatch> {
 
     // Edges between two syncable memories (each endpoint global, or in a
     // sync-enabled keyed project).
+    //
+    // `co_recalled` is excluded because it is not a claim anyone authored: it
+    // is what THIS install observed about its own opens, per-machine and
+    // regenerable from local `recall_event` rows. Shipping it would forge that
+    // history on the peer — and its Hebbian weight and `meta.last_fired_at`
+    // are meaningless there, since the wire carries neither the meta nor the
+    // peer's own decay clock. Filtered here in SQL rather than in the Rust
+    // map, so the rel never reaches the batch at all (and `snapshot`, which is
+    // the file transport's whole payload, can't leak it either).
     let mut estmt = conn.prepare(
         "SELECT s.uid, d.uid, e.rel, e.weight, e.created_at
          FROM edge e
@@ -132,6 +144,7 @@ pub fn changes_since(conn: &Connection, since: i64) -> Result<SyncBatch> {
          LEFT JOIN node sp ON sp.id = s.project_id AND sp.kind='project'
          LEFT JOIN node dp ON dp.id = d.project_id AND dp.kind='project'
          WHERE s.kind='memory' AND d.kind='memory'
+           AND e.rel <> 'co_recalled'
            AND (s.project_id IS NULL OR (json_extract(sp.meta,'$.sync')=1
                     AND json_extract(sp.meta,'$.portable_key') IS NOT NULL))
            AND (d.project_id IS NULL OR (json_extract(dp.meta,'$.sync')=1
@@ -269,6 +282,16 @@ pub fn apply_changes(conn: &Connection, batch: &SyncBatch) -> Result<ApplyStats>
         let src = store::get_node_by_uid(&tx, &e.src_uid).ok();
         let dst = store::get_node_by_uid(&tx, &e.dst_uid).ok();
         match (src, dst, e.rel.parse::<Rel>()) {
+            // A co-activation edge is an observation the receiving store makes
+            // about its OWN opens, so an inbound one is a claim about a history
+            // that never happened here. Rejected at the door rather than left
+            // to the sender's filter: a peer on an older or unfiltered build
+            // still ships them, and `store::link` would write the peer's weight
+            // with no `meta.last_fired_at` — which reads back as never-decayed
+            // and could push a fabricated partner over the visibility floor.
+            // Counted as skipped, like a dangling endpoint: it is a row this
+            // store declined, not an error that should fail the batch.
+            (_, _, Ok(Rel::CoRecalled)) => stats.edges_skipped += 1,
             (Some(s), Some(d), Ok(rel)) => {
                 store::link(&tx, s.id, d.id, rel, e.weight)?;
                 stats.edges_upserted += 1;
@@ -612,6 +635,72 @@ mod tests {
         // Now deliver everything → edge resolves.
         let s = apply_changes(&b, &full).unwrap();
         assert_eq!(s.edges_upserted, 1);
+    }
+
+    #[test]
+    fn coactivation_edge_stays_local() {
+        let a = db::open_in_memory().unwrap();
+        let x = mem(&a, "node x");
+        let y = mem(&a, "node y");
+        // Control: an authored edge between a DIFFERENT pair, which must still
+        // ship. Without it, a bug that dropped every edge would pass this test.
+        // It has to be another pair — `record_coactivation` never fires for a
+        // pair that already has an authored edge, so the two cannot coexist.
+        let p = mem(&a, "node p");
+        let q = mem(&a, "node q");
+        store::link(&a, p.id, q.id, Rel::Relates, 1.0).unwrap();
+
+        // Earn the co_recalled edge the way the store does — two opens inside
+        // the window — rather than hand-writing the row, so this test also
+        // fails if the real writer ever starts producing something else.
+        crate::learn::record_opened(&a, x.id).unwrap();
+        crate::learn::record_opened(&a, y.id).unwrap();
+        let local: i64 = a
+            .query_row(
+                "SELECT count(*) FROM edge WHERE rel='co_recalled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(local, 1, "co-activation edge exists locally to begin with");
+
+        let batch = snapshot(&a).unwrap();
+        let rels: Vec<&str> = batch.edges.iter().map(|e| e.rel.as_str()).collect();
+        assert!(
+            !rels.contains(&"co_recalled"),
+            "derived edge must not ship: {rels:?}"
+        );
+        assert_eq!(rels, vec!["relates"], "authored edge still ships: {rels:?}");
+    }
+
+    #[test]
+    fn inbound_coactivation_edge_is_rejected() {
+        let a = db::open_in_memory().unwrap();
+        let x = mem(&a, "node x");
+        let y = mem(&a, "node y");
+        let mut batch = snapshot(&a).unwrap();
+        // A peer running an unfiltered (older or newer) build: its nodes are
+        // fine, its co-activation edge is not ours to hold.
+        batch.edges.push(SyncEdge {
+            src_uid: x.uid.clone(),
+            dst_uid: y.uid.clone(),
+            rel: "co_recalled".into(),
+            weight: 0.9,
+            created_at: 1,
+        });
+
+        let b = db::open_in_memory().unwrap();
+        let s = apply_changes(&b, &batch).unwrap();
+        assert_eq!(s.edges_upserted, 0, "{s:?}");
+        assert_eq!(s.edges_skipped, 1, "{s:?}");
+        let landed: i64 = b
+            .query_row(
+                "SELECT count(*) FROM edge WHERE rel='co_recalled'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(landed, 0, "peer's co-activation edge must not land");
     }
 
     #[test]

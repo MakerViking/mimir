@@ -160,7 +160,9 @@ pub struct LinkArgs {
     pub a: String,
     /// Target node reference.
     pub b: String,
-    /// Relation: relates | about | links | mentions | supersedes (default relates).
+    /// Relation: relates | about | links | mentions (default relates).
+    /// Refused here: `supersedes` (use the `supersede` tool) and
+    /// `co_recalled` (the store derives those from observed usage).
     #[serde(default)]
     pub rel: Option<String>,
 }
@@ -473,7 +475,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Link two nodes (memory/doc/code) so context surfaces together. Note: `supersedes` is NOT accepted here — use the `supersede` tool, which also retires the old node."
+        description = "Link two nodes (memory/doc/code) so context surfaces together. Note: `supersedes` is NOT accepted here — use the `supersede` tool, which also retires the old node. `co_recalled` is NOT accepted either — the store writes those itself from observed usage, so a hand-authored one forges a co-activation that never happened; use `relates`."
     )]
     async fn link(&self, Parameters(args): Parameters<LinkArgs>) -> String {
         self.blocking(move |m| {
@@ -493,6 +495,23 @@ impl MimirServer {
                     "link does not accept rel=\"supersedes\": it records an edge but does \
                      NOT retire the old node, so it would look like a supersede and change \
                      nothing. Use the `supersede` tool instead (it sets both)."
+                        .into(),
+                )));
+            }
+            // `co_recalled` is not a claim, it is an observation the store made
+            // about its own usage: two memories opened in the same stretch of
+            // work. Hand-authoring one forges a usage record that never
+            // happened. Worse, `learn::record_coactivation` deliberately skips
+            // any pair that already carries an authored edge, so the forgery is
+            // not a harmless white lie — it permanently suppresses the genuine
+            // co-activation signal for that pair.
+            if rel == Rel::CoRecalled {
+                return Err(engine_err(mimir_core::error::Error::Invalid(
+                    "link does not accept rel=\"co_recalled\": the store derives those \
+                     from observed co-recall and refuses to draw one for a pair that \
+                     already has an authored edge, so hand-authoring one fakes usage \
+                     that never happened AND blocks the real signal for that pair \
+                     forever. Use rel=\"relates\" for a link you actually mean."
                         .into(),
                 )));
             }
@@ -1917,6 +1936,48 @@ mod tests {
         assert!(
             refused.contains("supersede") && refused.contains("NOT retire"),
             "expected a pointer at the supersede tool, got: {refused}"
+        );
+
+        // The neighbouring rel still works — this is a targeted refusal, not
+        // a broken link tool.
+        let ok = s
+            .link(Parameters(LinkArgs {
+                a,
+                b,
+                rel: Some("relates".into()),
+            }))
+            .await;
+        assert!(ok.contains("relates"), "relates should still link: {ok}");
+    }
+
+    /// `link` must refuse `co_recalled`. It is derived from observed usage, and
+    /// the store skips drawing a real one for any pair that already has an
+    /// authored edge — so a hand-written one would not just fake a co-recall,
+    /// it would permanently mask the genuine one for that pair.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn link_refuses_the_co_recalled_rel() {
+        let (_dir, s) = server();
+        let a = s
+            .remember(Parameters(remember_args("first fact here", "note")))
+            .await;
+        let b = s
+            .remember(Parameters(remember_args("second fact here", "note")))
+            .await;
+        let (a, b) = (
+            a.split_whitespace().nth(1).unwrap().to_string(),
+            b.split_whitespace().nth(1).unwrap().to_string(),
+        );
+
+        let refused = s
+            .link(Parameters(LinkArgs {
+                a: a.clone(),
+                b: b.clone(),
+                rel: Some("co_recalled".into()),
+            }))
+            .await;
+        assert!(
+            refused.contains("co_recalled") && refused.contains("co-recall"),
+            "expected a derived-edge refusal, got: {refused}"
         );
 
         // The neighbouring rel still works — this is a targeted refusal, not

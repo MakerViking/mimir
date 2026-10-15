@@ -126,6 +126,11 @@ str_enum!(MutationOp {
     Review => "review",
 });
 
+// Edge relations. All are authored — by a person, by the code-graph
+// extractor, or by an importer — except `CoRecalled`, which the store
+// observes for itself (see `learn::record_coactivation`). That one is
+// derived, per-machine and regenerable, so it is excluded from replication
+// and from export rather than shipped as if it were a claim anyone made.
 str_enum!(Rel {
     Links => "links",
     Mentions => "mentions",
@@ -140,6 +145,7 @@ str_enum!(Rel {
     Imports => "imports",
     Defines => "defines",
     MemberOf => "member_of",
+    CoRecalled => "co_recalled",
 });
 
 /// Where a query or capture applies.

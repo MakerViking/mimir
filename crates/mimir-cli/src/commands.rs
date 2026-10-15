@@ -1268,7 +1268,17 @@ pub fn recall(
             );
         }
         if linked && !json {
-            for edge in store::edges_of(&mimir.conn, hit.node.id)?.iter().take(4) {
+            // `edges_of` is an unordered `src=?1 OR dst=?1`, so the four slots
+            // go to whatever the table hands back first. A node can carry 32
+            // derived co_recall edges and only one or two authored ones, which
+            // is exactly the wrong way round for a flag whose whole job is to
+            // show the links somebody drew. The "often recalled with" line in
+            // the full record is where the derived ones belong.
+            for edge in store::edges_of(&mimir.conn, hit.node.id)?
+                .iter()
+                .filter(|e| e.rel != Rel::CoRecalled)
+                .take(4)
+            {
                 let other_id = if edge.src == hit.node.id {
                     edge.dst
                 } else {
@@ -1815,9 +1825,11 @@ pub fn reproject(json: bool, reference: &str, project: Option<String>, global: b
     Ok(())
 }
 
-pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
-    let mimir = Mimir::open()?;
-    let rel: Rel = rel.parse()?;
+/// The relations `mimir link` will not author, and why. Lives apart from
+/// `link` because `link` opens the store before it ever looks at the
+/// relation, and a refusal that needs a database on disk to exercise is a
+/// refusal nobody tests.
+fn reject_unauthorable_rel(rel: Rel) -> Result<()> {
     // See the same guard in the MCP `link` tool: the `supersedes` edge and the
     // `superseded_by` column are independent, and only the column hides a node
     // from recall. Allowing it here would silently record a retirement that
@@ -1829,6 +1841,26 @@ pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
              <old> <new>` instead (it sets both)."
         );
     }
+    // `co_recalled` is not a claim anybody makes: the store writes it for
+    // itself when it observes two memories opened together. Hand-authoring one
+    // forges a usage record for a co-recall that never happened — and because
+    // the observer skips any pair that already has an authored edge, it would
+    // also suppress the real edge if that pair ever does get recalled together.
+    if rel == Rel::CoRecalled {
+        bail!(
+            "`--rel co_recalled` is the store's own observation of memories recalled \
+             together — writing one by hand forges usage that never happened, and it \
+             would stop the store recording the real co-recall for that pair. Use \
+             `link --rel relates` for a link you actually mean."
+        );
+    }
+    Ok(())
+}
+
+pub fn link(a: &str, b: &str, rel: &str) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let rel: Rel = rel.parse()?;
+    reject_unauthorable_rel(rel)?;
     let src = resolve_any(&mimir, a)?;
     let dst = resolve_any(&mimir, b)?;
     store::link(&mimir.conn, src.id, dst.id, rel, 1.0)?;
@@ -1964,10 +1996,20 @@ pub fn link_scan(dry_run: bool, all_projects: bool) -> Result<()> {
     // Every edge, once. The inner loop asks "is this pair already linked?"
     // per candidate, and re-reading the table per project turned that into
     // the dominant cost on a store with a hundred thousand symbols.
+    //
+    // The set is rel-agnostic, so a derived co_recall edge in it would read as
+    // "already linked" and cost the pair its real `about` edge, silently. Today
+    // co_recalled only joins memory to memory and this scan links memory to
+    // symbol, so the two cannot actually collide — the exclusion is here so
+    // that stays true if the observer ever learns to relate other kinds.
     let mut existing: std::collections::HashSet<(i64, i64)> = Default::default();
     {
-        let mut stmt = mimir.conn.prepare("SELECT src, dst FROM edge")?;
-        let mut rows = stmt.query([])?;
+        let mut stmt = mimir
+            .conn
+            .prepare("SELECT src, dst FROM edge WHERE rel != ?1")?;
+        // Bound rather than inlined so the stored spelling comes from the enum
+        // and cannot drift away from it in a string literal here.
+        let mut rows = stmt.query([Rel::CoRecalled.as_str()])?;
         while let Some(r) = rows.next()? {
             let (s, d): (i64, i64) = (r.get(0)?, r.get(1)?);
             existing.insert((s, d));
@@ -2833,5 +2875,39 @@ mod link_scan_hint_tests {
         set_last_scan(&conn, 45);
         let hint = link_scan_hint(&conn).expect("should nudge again");
         assert!(hint.contains("45d ago"), "{hint}");
+    }
+}
+
+#[cfg(test)]
+mod link_rel_guard_tests {
+    use super::reject_unauthorable_rel;
+    use mimir_core::model::Rel;
+
+    /// A hand-written `co_recalled` edge is a forged usage record, and it
+    /// would also cost the pair its real derived edge later (the observer
+    /// skips pairs that already carry an authored one). The message has to
+    /// leave the user somewhere to go, so it names the relation they meant.
+    #[test]
+    fn co_recalled_is_refused_and_points_at_relates() {
+        let err = reject_unauthorable_rel(Rel::CoRecalled)
+            .expect_err("co_recalled must not be authorable")
+            .to_string();
+        assert!(err.contains("co_recalled"), "{err}");
+        assert!(err.contains("relates"), "{err}");
+    }
+
+    /// The pre-existing refusal, kept honest now that it shares a function.
+    #[test]
+    fn supersedes_is_still_refused() {
+        assert!(reject_unauthorable_rel(Rel::Supersedes).is_err());
+    }
+
+    /// Everything a person can legitimately draw still passes — a guard
+    /// that over-refuses is worse than the forgery it prevents.
+    #[test]
+    fn authored_relations_pass() {
+        for rel in [Rel::Relates, Rel::About, Rel::Links, Rel::Mentions] {
+            assert!(reject_unauthorable_rel(rel).is_ok(), "{rel} was refused");
+        }
     }
 }

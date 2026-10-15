@@ -127,6 +127,12 @@ const STEM_PREFIX: usize = 5;
 /// simply head-truncate, which is what this code replaced anyway.
 const MATCH_SCAN_CHARS: usize = 20_000;
 
+/// Co-activation partners listed on a full record. The store may hold up to
+/// 32 per node; the point of the line is "this belongs with those", which the
+/// strongest few make, and a longer list would cost more context than the
+/// record it annotates.
+const COACTIVATION_SHOWN: usize = 5;
+
 /// Content-bearing query stems, sharing `tokens`/`is_stopword` with the FTS
 /// leg so the snippet can't drift from what actually matched.
 fn query_stems(query: &str) -> Vec<String> {
@@ -395,6 +401,13 @@ pub fn full_record(
         out.push_str(&format!("\ntags: {}", node.tags_text));
     }
     for edge in store::edges_of(conn, node.id)? {
+        // Co-activation is not an authored relation and does not belong in
+        // the arrow list beside edges a person or the extractor meant. It
+        // gets its own line below, ranked and capped; left here it would
+        // print up to 32 unordered rows and bury the real links.
+        if edge.rel == crate::model::Rel::CoRecalled {
+            continue;
+        }
         let (arrow, other_id) = if edge.src == node.id {
             ("→", edge.dst)
         } else {
@@ -406,6 +419,24 @@ pub fn full_record(
                 edge.rel,
                 short_uid(other.kind, &other.uid),
                 other.title.as_deref().unwrap_or("")
+            ));
+        }
+    }
+    // What the store noticed on its own: memories repeatedly opened in the
+    // same stretch of work as this one. Labelled as observed, because every
+    // other line in this record is something somebody asserted.
+    let partners = crate::learn::coactivation_partners(conn, node.id, crate::model::now_unix())?;
+    if !partners.is_empty() {
+        let shown = partners
+            .iter()
+            .take(COACTIVATION_SHOWN)
+            .filter_map(|(id, _)| store::get_node(conn, *id).ok())
+            .map(|other| short_uid(other.kind, &other.uid))
+            .collect::<Vec<_>>();
+        if !shown.is_empty() {
+            out.push_str(&format!(
+                "\noften recalled with: {} (observed co-recall, not an authored link)",
+                shown.join(", ")
             ));
         }
     }

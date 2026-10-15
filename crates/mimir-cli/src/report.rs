@@ -61,11 +61,17 @@ pub fn report(json: bool) -> Result<()> {
         ("doc chunks indexed", node_counts("chunk")?),
         ("symbols extracted", node_counts("symbol")?),
         (
+            // `count(*) FROM edge` would fold in the store's own co_recall
+            // observations, and this row is labelled as work somebody did: a
+            // week of heavy recalling would read as a week of heavy linking.
+            // The predicate lives in WHERE rather than inside the four period
+            // sums so the all-time column is filtered the same way — filtering
+            // only the periods leaves a total that no column adds up to.
             "links created",
             counts(
                 "SELECT COALESCE(sum(created_at>=?1),0), COALESCE(sum(created_at>=?2),0),
                         COALESCE(sum(created_at>=?3),0), COALESCE(sum(created_at>=?4),0),
-                        count(*) FROM edge",
+                        count(*) FROM edge WHERE rel <> 'co_recalled'",
             )?,
         ),
         (

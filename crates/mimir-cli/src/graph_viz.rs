@@ -8,6 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
+use mimir_core::model::Rel;
 use mimir_core::Mimir;
 use serde_json::json;
 
@@ -72,9 +73,22 @@ fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Re
 
     // One pass over the edge table serves both the degree map here and the
     // included-set filtering at the end (it was two full scans before).
+    //
+    // co_recalled is excluded at the query, not at render time, because this
+    // scan also feeds `degree` — which sets node radius and orders the symbol
+    // budget below. Dropping those edges later would still leave the picture
+    // reshaped by links nobody can see. And they are dense memory↔memory
+    // springs the layout would visibly bunch. The alternative — draw them and
+    // let the viewer switch them off — doesn't exist here: the legend is built
+    // from node KINDS, not rels, so there is no per-rel toggle and a wrong
+    // default could not be undone at view time. Excluding is reversible.
+    //
+    // The spelling comes from the enum, not a literal, so a rename there
+    // cannot leave this filter silently matching nothing.
+    let co_recalled = Rel::CoRecalled.as_str();
     let all_edges: Vec<(i64, i64, String)> = {
-        let mut stmt = conn.prepare("SELECT src, dst, rel FROM edge")?;
-        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let mut stmt = conn.prepare("SELECT src, dst, rel FROM edge WHERE rel <> ?1")?;
+        let rows = stmt.query_map([co_recalled], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
     let mut degree: HashMap<i64, i64> = HashMap::new();
@@ -157,12 +171,21 @@ fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Re
     if !mem_ids.is_empty() {
         // Chunked: the id list appears twice in the query, and SQLite caps
         // bound parameters at 32766 — a big store would abort otherwise.
+        //
+        // Both halves exclude co_recalled. This expansion has no project
+        // filter, and co-activation crosses projects by construction (a global
+        // memory opened next to a project one), so without the rel test it
+        // would pull foreign-project memories in as first-class nodes and
+        // spend the budget computed below on them. Interpolated rather than
+        // bound because the id list already fills the anonymous `?` slots
+        // twice; it is the enum's own constant, not user input.
         for chunk in mem_ids.chunks(8_000) {
             let placeholders = vec!["?"; chunk.len()].join(",");
             let sql = format!(
                 "SELECT {COLS} FROM node WHERE {live} AND id IN (
-                   SELECT dst FROM edge WHERE src IN ({placeholders})
-                   UNION SELECT src FROM edge WHERE dst IN ({placeholders}))"
+                   SELECT dst FROM edge WHERE rel <> '{co_recalled}' AND src IN ({placeholders})
+                   UNION
+                   SELECT src FROM edge WHERE rel <> '{co_recalled}' AND dst IN ({placeholders}))"
             );
             let params: Vec<&dyn rusqlite::ToSql> = chunk
                 .iter()
@@ -637,3 +660,57 @@ for(const k of kinds){
 </script>
 </body></html>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimir_core::Mimir;
+
+    fn node(m: &Mimir, uid: &str, kind: &str, title: &str, project: Option<i64>) -> i64 {
+        m.conn
+            .execute(
+                "INSERT INTO node (uid, kind, project_id, title, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, 1, 1)",
+                rusqlite::params![uid, kind, project, title],
+            )
+            .unwrap();
+        m.conn.last_insert_rowid()
+    }
+
+    fn edge(m: &Mimir, src: i64, dst: i64, rel: &str) {
+        m.conn
+            .execute(
+                "INSERT INTO edge (src, dst, rel, created_at) VALUES (?1, ?2, ?3, 1)",
+                rusqlite::params![src, dst, rel],
+            )
+            .unwrap();
+    }
+
+    /// co_recalled must be invisible to the viz in every way it could show:
+    /// as a drawn edge, as a node the expansion dragged in from another
+    /// project, as degree (radius / budget order), and in the HUD count.
+    #[test]
+    fn co_recalled_edges_never_reach_the_viz() {
+        let m = Mimir::open_in_memory().unwrap();
+        let proj = node(&m, "p:here", "project", "here", None);
+        let other = node(&m, "p:elsewhere", "project", "elsewhere", None);
+        let mine = node(&m, "m:mine", "memory", "MINE", Some(proj));
+        let doc = node(&m, "d:doc", "doc", "DOC", None);
+        let foreign = node(&m, "m:foreign", "memory", "FOREIGNMEM", Some(other));
+
+        edge(&m, mine, doc, "about");
+        // Written through the enum so a rename can't turn this into a test
+        // that inserts a rel nothing filters and then passes anyway.
+        edge(&m, mine, foreign, Rel::CoRecalled.as_str());
+
+        let out = render(&m, proj, "here", 500).unwrap();
+        assert!(!out.contains(Rel::CoRecalled.as_str()), "{out}");
+        assert!(!out.contains("FOREIGNMEM"), "{out}");
+        // The HUD has to agree with what is drawn: project + memory + doc,
+        // and the one authored edge.
+        assert!(out.contains("3 nodes · 1 edges"), "{out}");
+        // Degree feeds node radius and the symbol budget, so a co_recalled
+        // edge counted there would deform the layout even while unrendered.
+        assert!(!out.contains("\"deg\":2"), "{out}");
+    }
+}

@@ -251,8 +251,8 @@ pub fn qmd_collections(yml: &str) -> Vec<(String, String)> {
 
 // ---------- Export ----------
 
-/// Everything (except embeddings, which are derived) as JSONL:
-/// node lines then edge lines, suitable for backup or migration.
+/// Everything (except embeddings and co-recall edges, which are derived) as
+/// JSONL: node lines then edge lines, suitable for backup or migration.
 pub fn export_jsonl(conn: &Connection, out: &mut dyn std::io::Write) -> Result<usize> {
     use crate::store::{row_to_node, NODE_COLS};
     let mut count = 0usize;
@@ -276,10 +276,19 @@ pub fn export_jsonl(conn: &Connection, out: &mut dyn std::io::Write) -> Result<u
         writeln!(out, "{line}").map_err(|e| Error::Invalid(format!("write: {e}")))?;
         count += 1;
     }
+    // `co_recalled` edges are this machine's observation of how its own store
+    // got used — not a link anybody authored. On the machine that imports the
+    // file they would assert a co-recall that never happened there, and no
+    // importer knows how to place one anyway (weight and `last_fired_at` are
+    // meaningless without the recall history that produced them). Dropping
+    // them here is only half the job: export is one way off this machine and
+    // replication is the other, so the same exclusion has to hold there too —
+    // filtering either path alone still lets them travel.
     let mut stmt = conn.prepare(
         "SELECT s.uid, d.uid, e.rel, e.weight FROM edge e
          JOIN node s ON s.id = e.src JOIN node d ON d.id = e.dst
-         WHERE s.deleted_at IS NULL AND d.deleted_at IS NULL ORDER BY e.id",
+         WHERE s.deleted_at IS NULL AND d.deleted_at IS NULL
+           AND e.rel <> 'co_recalled' ORDER BY e.id",
     )?;
     let edges: Vec<(String, String, String, f64)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
@@ -393,5 +402,42 @@ mod tests {
         assert_eq!(lines[0]["type"], "node");
         assert_eq!(lines[2]["type"], "edge");
         assert_eq!(lines[2]["rel"], "relates");
+    }
+
+    #[test]
+    fn export_omits_co_recall_edges() {
+        let conn = db::open_in_memory().unwrap();
+        let mk = |t: &str| {
+            crate::store::insert_node(&conn, {
+                let mut n = crate::model::NewNode::new(crate::model::Kind::Memory);
+                n.title = Some(t.into());
+                n.body = Some(t.into());
+                n
+            })
+            .unwrap()
+        };
+        let a = mk("a");
+        let b = mk("b");
+        let c = mk("c");
+        crate::store::link(&conn, a.id, b.id, crate::model::Rel::Relates, 1.0).unwrap();
+        // Written with raw SQL on purpose: `store::link` is the authoring door
+        // and nothing outside `learn` is supposed to walk through it with this
+        // rel, so the test forges the row the way the store itself does rather
+        // than depending on that door staying open.
+        conn.execute(
+            "INSERT INTO edge (src, dst, rel, weight, created_at)
+             VALUES (?1, ?2, 'co_recalled', 0.9, 0)",
+            [a.id, c.id],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        // 3 nodes + the authored edge; the derived one must not be in the file
+        // at all — a consumer that simply ignores an unknown rel is not enough,
+        // because the export is also a backup a human reads.
+        let count = export_jsonl(&conn, &mut buf).unwrap();
+        assert_eq!(count, 4);
+        let out = String::from_utf8(buf).unwrap();
+        assert!(!out.contains("co_recalled"), "{out}");
+        assert!(out.contains("\"rel\":\"relates\""), "{out}");
     }
 }

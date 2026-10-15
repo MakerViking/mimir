@@ -367,6 +367,15 @@ pub fn link(conn: &Connection, src: i64, dst: i64, rel: Rel, weight: f64) -> Res
     Ok(())
 }
 
+/// Every edge touching `node_id`, in either direction.
+///
+/// A row whose `rel` this binary does not recognise is SKIPPED, not fatal.
+/// The previous behaviour turned an unknown rel into a
+/// `FromSqlConversionFailure` that failed the whole query, which meant a
+/// store written by a newer build could make `get` explode on an older one —
+/// and the two do coexist, because the CLI and the MCP server are installed
+/// separately and upgrade at different times. Dropping the row degrades one
+/// annotation; failing the query loses the whole record.
 pub fn edges_of(conn: &Connection, node_id: i64) -> Result<Vec<Edge>> {
     let mut stmt = conn.prepare(
         "SELECT id, src, dst, rel, weight, meta, created_at FROM edge
@@ -376,24 +385,21 @@ pub fn edges_of(conn: &Connection, node_id: i64) -> Result<Vec<Edge>> {
         .query_map([node_id], |row| {
             let rel_text: String = row.get("rel")?;
             let meta_text: String = row.get("meta")?;
-            Ok(Edge {
+            let Ok(rel) = rel_text.parse::<Rel>() else {
+                return Ok(None);
+            };
+            Ok(Some(Edge {
                 id: row.get("id")?,
                 src: row.get("src")?,
                 dst: row.get("dst")?,
-                rel: rel_text.parse().map_err(|e: Error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })?,
+                rel,
                 weight: row.get("weight")?,
                 meta: serde_json::from_str(&meta_text).unwrap_or(serde_json::Value::Null),
                 created_at: row.get("created_at")?,
-            })
+            }))
         })?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(edges)
+        .collect::<rusqlite::Result<Vec<Option<Edge>>>>()?;
+    Ok(edges.into_iter().flatten().collect())
 }
 
 /// Find or create the project node for a filesystem root.

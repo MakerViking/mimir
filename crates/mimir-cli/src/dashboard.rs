@@ -174,6 +174,12 @@ fn render(mimir: &Mimir) -> Result<String> {
     let imports = q1("SELECT count(*) FROM edge WHERE rel='imports'")?;
     let links =
         q1("SELECT count(*) FROM edge WHERE rel IN ('about','relates','links','mentions')")?;
+    // Counted separately and shown on its own row rather than added to `links`
+    // above: these are edges the store derived from watching itself, so adding
+    // them to a number a reader takes as authored work would quietly turn that
+    // row into machine activity. Hiding them entirely was the other option and
+    // is worse — the rows exist and take space, so they should be legible.
+    let co_recalled = q1("SELECT count(*) FROM edge WHERE rel='co_recalled'")?;
     let embedded = q1("SELECT count(*) FROM embedding")?;
     // Kind list mirrors `embed::embed_pending`'s eligibility filter exactly —
     // drawing from the shared constant means a kind added there (e.g. the
@@ -439,6 +445,7 @@ fn render(mimir: &Mimir) -> Result<String> {
         .replace("{{CALLS_H}}", &fmt_n(calls_heuristic))
         .replace("{{IMPORTS}}", &fmt_n(imports))
         .replace("{{LINKS}}", &fmt_n(links))
+        .replace("{{CO_RECALLED}}", &fmt_n(co_recalled))
         .replace("{{EMBEDDED}}", &fmt_n(embedded))
         .replace("{{COVERAGE}}", &format!("{coverage:.0}"))
         .replace("{{MODEL}}", &esc(&mimir.config.embedding.model))
@@ -689,6 +696,7 @@ footer span{margin-left:auto}
       <div><span>calls heuristic</span><b>{{CALLS_H}}</b></div>
       <div><span>import edges</span><b>{{IMPORTS}}</b></div>
       <div><span>memory↔code links</span><b class="teal">{{LINKS}}</b></div>
+      <div><span>co-recalled (observed)</span><b>{{CO_RECALLED}}</b></div>
       <div><span>embedded</span><b>{{EMBEDDED}} ({{COVERAGE}}%)</b></div>
       <div><span>model</span><b>{{MODEL}}</b></div>
       <div><span>superseded</span><b>{{SUPERSEDED}}</b></div>
