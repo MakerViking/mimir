@@ -3,19 +3,7 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
-## [Unreleased]
-
-### Fixed
-
-- **An ambiguous symbol name now says which definitions it matched.**
-  `mimir graph node tessellate` used to refuse with
-  `(matches tessellate, tessellate)`: two identical names and nothing to
-  retry with. Each candidate is now listed with its id, path and span
-  (`c:9HZ5P6 [function rust] src/m0.rs:1-1 dup`), so
-  the id can be passed straight back. The count is the true total; it was
-  capped at 6.
-
-## [0.17.0] - 2026-08-26
+## [0.17.0] - 2026-10-15
 
 ### Added
 
@@ -312,6 +300,14 @@ the `mimir-mem` crate, and the on-disk schema move together.
   "never miss this" and a lexical heuristic must not overrule it.
 
 ### Fixed
+
+- **An ambiguous symbol name now says which definitions it matched.**
+  `mimir graph node tessellate` used to refuse with
+  `(matches tessellate, tessellate)`: two identical names and nothing to
+  retry with. Each candidate is now listed with its id, path and span
+  (`c:9HZ5P6 [function rust] src/m0.rs:1-1 dup`), so
+  the id can be passed straight back. The count is the true total; it was
+  capped at 6.
 
 - **`install.sh` could not install anything, on any platform.** The one-liner
   in the README fetches this script from `main`, so this was live for every
