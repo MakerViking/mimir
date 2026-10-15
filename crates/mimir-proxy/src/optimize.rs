@@ -80,6 +80,11 @@ const KEEP_RECENT_MESSAGES: usize = 6;
 const PRUNE_MIN_TOKENS: usize = 200;
 /// Only dedup a block whose text is larger than this.
 const DEDUP_MIN_TOKENS: usize = 100;
+/// What one image costs in input tokens. The API bills an image at about
+/// width*height/750 after resizing its long edge to at most 1568 px, which
+/// tops out near 1,600. Its base64 `data` is NOT text: read as text, one
+/// screenshot came out at hundreds of thousands of tokens.
+const IMAGE_TOKENS: usize = 1_600;
 const PRUNE_PLACEHOLDER: &str = "[older tool result elided by mimir proxy]";
 const DEDUP_PLACEHOLDER: &str = "[identical to an earlier block — elided by mimir proxy]";
 
@@ -168,6 +173,27 @@ fn block_text(block: &Value) -> Option<String> {
     }
 }
 
+/// Billed-token estimate for one content block: text as text, an image as
+/// [`IMAGE_TOKENS`], never the base64 behind it. `block_text` stays the
+/// block's IDENTITY (two different screenshots must never dedup); this is its
+/// COST. Other block types count 0, keeping `count_request_tokens` an
+/// under-estimate.
+fn block_tokens(block: &Value) -> usize {
+    match block.get("type").and_then(|t| t.as_str()) {
+        Some("text") => block
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map_or(0, tokens::count),
+        Some("image") => IMAGE_TOKENS,
+        Some("tool_result") => match block.get("content") {
+            Some(Value::String(s)) => tokens::count(s),
+            Some(Value::Array(items)) => items.iter().map(block_tokens).sum(),
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
 fn set_block_text(block: &mut Value, placeholder: &str) {
     if let Some(obj) = block.as_object_mut() {
         if obj.contains_key("text") {
@@ -193,11 +219,7 @@ pub fn count_request_tokens(req: &Value) -> usize {
 
     total += match req.get("system") {
         Some(Value::String(s)) => tokens::count(s),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter_map(block_text)
-            .map(|t| tokens::count(&t))
-            .sum(),
+        Some(Value::Array(blocks)) => blocks.iter().map(block_tokens).sum(),
         _ => 0,
     };
 
@@ -205,11 +227,7 @@ pub fn count_request_tokens(req: &Value) -> usize {
         for msg in msgs {
             total += match msg.get("content") {
                 Some(Value::String(s)) => tokens::count(s),
-                Some(Value::Array(blocks)) => blocks
-                    .iter()
-                    .filter_map(block_text)
-                    .map(|t| tokens::count(&t))
-                    .sum(),
+                Some(Value::Array(blocks)) => blocks.iter().map(block_tokens).sum(),
                 _ => 0,
             };
         }
@@ -245,7 +263,7 @@ fn dedup_blocks(req: &mut Value, opt: &mut Optimization) {
         };
         for b in blocks.iter_mut() {
             let Some(text) = block_text(b) else { continue };
-            let toks = tokens::count(&text);
+            let toks = block_tokens(b);
             if toks < DEDUP_MIN_TOKENS {
                 continue;
             }
@@ -277,7 +295,7 @@ fn prune_old_tool_results(req: &mut Value, opt: &mut Optimization) {
                 continue;
             }
             let Some(text) = block_text(b) else { continue };
-            let toks = tokens::count(&text);
+            let toks = block_tokens(b);
             if toks > PRUNE_MIN_TOKENS && text != DEDUP_PLACEHOLDER {
                 opt.pruned += toks.saturating_sub(tokens::count(PRUNE_PLACEHOLDER));
                 set_block_text(b, PRUNE_PLACEHOLDER);
@@ -382,14 +400,15 @@ mod tests {
 
     #[test]
     fn count_request_tokens_ignores_unknown_block_types() {
-        // An image block carries no countable text; it must not panic or
-        // inflate the estimate via its base64 payload.
+        // An image costs a bounded IMAGE_TOKENS, never its base64 payload read
+        // as text. Not 0: an image at 0 falls under DEDUP_MIN_TOKENS, and a
+        // repeated screenshot would stop being elided.
         let req = json!({
             "messages": [{"role":"user","content":[
                 {"type":"image","source":{"type":"base64","data":"AAAA".repeat(500)}}
             ]}]
         });
-        assert_eq!(count_request_tokens(&req), 0);
+        assert_eq!(count_request_tokens(&req), IMAGE_TOKENS);
     }
 
     #[test]
@@ -465,6 +484,47 @@ mod tests {
         assert_eq!(
             out["messages"][0]["content"][0]["content"],
             PRUNE_PLACEHOLDER
+        );
+    }
+
+    /// A screenshot tool_result: base64 PNG data, the shape Read returns for an image.
+    fn screenshot_result(seed: char) -> Value {
+        json!({"type": "tool_result", "tool_use_id": "t", "content": [
+            {"type": "image", "source": {"type": "base64", "media_type": "image/png",
+             "data": seed.to_string().repeat(400_000)}}
+        ]})
+    }
+
+    #[test]
+    fn an_image_counts_as_an_image_not_as_its_base64() {
+        // 400 KB of base64 is ~100k "tokens" read as text; the API bills an
+        // image at most IMAGE_TOKENS. Measured 2026-10-15: the ledger logged
+        // single requests "saving" 798k tokens from deduped screenshots.
+        let req = json!({"messages": [{"role": "user", "content": [screenshot_result('A')]}]});
+        assert_eq!(count_request_tokens(&req), IMAGE_TOKENS);
+    }
+
+    #[test]
+    fn dedup_of_a_repeated_screenshot_saves_an_image_worth() {
+        let req = json!({"messages": [
+            {"role": "user", "content": [screenshot_result('A')]},
+            {"role": "user", "content": [screenshot_result('A')]},
+        ]});
+        let (_, opt) = optimize_request(req, opts(false, true, false));
+        assert!(opt.deduped > 0 && opt.deduped <= IMAGE_TOKENS, "{opt:?}");
+    }
+
+    #[test]
+    fn two_different_screenshots_are_not_duplicates() {
+        let req = json!({"messages": [
+            {"role": "user", "content": [screenshot_result('A')]},
+            {"role": "user", "content": [screenshot_result('B')]},
+        ]});
+        let (out, opt) = optimize_request(req, opts(false, true, false));
+        assert_eq!(opt.deduped, 0);
+        assert!(
+            out.to_string().contains("BBBB"),
+            "the second image must survive"
         );
     }
 }
