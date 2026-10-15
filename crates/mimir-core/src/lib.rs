@@ -31,6 +31,7 @@ pub mod savings;
 pub mod scope;
 pub mod search;
 pub mod secrets;
+pub mod shadow;
 pub mod store;
 pub mod strength;
 pub mod tokens;

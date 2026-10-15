@@ -223,7 +223,7 @@ pub const COACTIVATION_VISIBLE: f64 = 0.5;
 /// How close together two opens must fall to count as the same stretch of
 /// work. Long enough to span a detour, short enough that yesterday's session
 /// is not "the same stretch".
-const COACTIVATION_WINDOW_SECS: i64 = 30 * 60;
+pub const COACTIVATION_WINDOW_SECS: i64 = 30 * 60;
 
 /// Most co-activation edges kept per node, weakest evicted first. Without a
 /// cap, a memory opened in every session pairs with the entire store and its

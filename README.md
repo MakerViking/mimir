@@ -304,6 +304,30 @@ hook. The query text stays on this machine (not synced, not exported), a query
 the secrets scanner flags is never written, and rows age out with
 `[learn] event_retention_days`. Turn it off with `[learn] log_misses = false`.
 
+### Shadow ranking: test a ranking idea on real use before it ships
+
+The retrieval eval proves a ranking change doesn't break the questions
+someone wrote down; it can't say whether the change helps the questions
+agents actually ask. Shadow mode runs a candidate ranking beside the live one
+on every recall, keeps its order when the two differ, and scores both on what
+the agent opened from that page — while recall keeps returning the live
+order.
+
+```sh
+mimir shadow            # candidate vs live: MRR of the opened hit, wins/losses, sign test
+mimir shadow --days 30
+```
+
+The one candidate today is phase 2 of co-activation: lift a memory that is
+co-recalled with one you opened in the last 30 minutes. Two honest limits.
+The comparison **favours live**, because agents open what they were shown
+near the top, so a shadow lead is real evidence and a shadow deficit isn't
+evidence of harm. And it needs data: a co-activation edge only counts once
+the pair has been opened together on several separate days, so expect
+nothing for the first week or two. Nothing promotes itself — a winning
+candidate goes live as an ordinary ranking change, through the eval gate.
+`[learn] shadow_ranking = false` turns it off.
+
 ### The fast path (recommended setup)
 
 Three commands get you the lowest-latency configuration Mimir has — measured

@@ -1231,6 +1231,14 @@ pub fn recall(
         .map(|(rank, hit)| (hit.node.id, rank as i64, hit.score))
         .collect();
     store::record_shown(&mimir.conn, query_hash.as_bytes(), &shown)?;
+    if mimir.config.learn.shadow_ranking {
+        mimir_core::shadow::observe(
+            &mimir.conn,
+            query_hash.as_bytes(),
+            &hits,
+            mimir_core::model::now_unix(),
+        );
+    }
     if let Some(report) = mimir_core::consolidate::maybe_auto(
         &mimir.conn,
         &mimir.config.embedding.model,
@@ -1618,6 +1626,62 @@ pub fn misses(
         "\nEach of these got no strong match: nothing that both shares the query's \
          words and ranks near the top of both search legs.\nWrite the memory that \
          answers it (`mimir remember`), or `mimir misses --dismiss <id>` if it was noise."
+    );
+    Ok(())
+}
+
+/// Shadow-ranking scoreboard: each candidate against the live ranking.
+pub fn shadow(days: Option<u32>, json: bool) -> Result<()> {
+    let mimir = Mimir::open()?;
+    let since = days.map_or(0, |d| mimir_core::model::now_unix() - i64::from(d) * 86_400);
+    let e = mimir_core::shadow::evaluate(&mimir.conn, mimir_core::shadow::COACTIVATION, since)?;
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "candidate": e.candidate,
+                "pages": e.pages,
+                "decided": e.decided,
+                "live_mrr": e.live_mrr,
+                "shadow_mrr": e.shadow_mrr,
+                "wins": e.wins,
+                "losses": e.losses,
+                "ties": e.ties,
+                "sign_test_p": e.sign_test_p(),
+                "verdict": e.verdict(),
+            })
+        );
+        return Ok(());
+    }
+    println!(
+        "candidate: {} — boost a memory co-recalled with one opened in the last 30 min",
+        e.candidate
+    );
+    println!(
+        "pages it would have reordered: {}   decided by an open: {}",
+        e.pages, e.decided
+    );
+    if e.decided > 0 {
+        println!(
+            "MRR of the opened hit   live {:.3}   shadow {:.3}",
+            e.live_mrr, e.shadow_mrr
+        );
+        let p = e
+            .sign_test_p()
+            .map_or("-".to_string(), |p| format!("{p:.3}"));
+        println!(
+            "shadow ranked it higher {} · lower {} · same {}   (sign test p = {p})",
+            e.wins, e.losses, e.ties
+        );
+    }
+    println!("verdict: {}", e.verdict());
+    if !mimir.config.learn.shadow_ranking {
+        println!("(shadow ranking is off: `[learn] shadow_ranking = false`)");
+    }
+    println!(
+        "\nAgents open what they were shown near the top, and they were shown the live \
+         order — so this comparison favours live.\nA shadow lead is real evidence; a \
+         shadow deficit is not evidence of harm. Nothing goes live from here on its own."
     );
     Ok(())
 }

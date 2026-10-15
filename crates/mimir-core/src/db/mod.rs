@@ -127,6 +127,11 @@ fn prune_events_once(conn: &Connection, days: u32) {
         Ok(_) => {}
         Err(err) => tracing::warn!(%err, "recall_event prune failed"),
     }
+    match crate::shadow::prune(conn, cutoff) {
+        Ok(n) if n > 0 => tracing::info!(rows = n, days, "pruned old shadow_rank rows"),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(%err, "shadow_rank prune failed"),
+    }
     match crate::misses::prune(conn, cutoff) {
         Ok(n) if n > 0 => tracing::info!(rows = n, days, "pruned old recall_miss rows"),
         Ok(_) => {}

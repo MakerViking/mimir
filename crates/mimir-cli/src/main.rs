@@ -390,6 +390,14 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// How candidate ranking signals running in shadow compare with the live
+    /// ranking, scored on what agents actually opened. Nothing here changes
+    /// what recall returns.
+    Shadow {
+        /// Only pages from the last N days (default: everything kept).
+        #[arg(long)]
+        days: Option<u32>,
+    },
     /// What the secret guard turned away — fingerprints and counts, never
     /// the refused values.
     Refusals {
@@ -996,6 +1004,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             resolved,
             limit,
         } => commands::misses(dismiss, all, resolved, limit, cli.json),
+        Command::Shadow { days } => commands::shadow(days, cli.json),
         Command::Refusals { limit } => commands::refusals(limit),
         Command::Audit { reference, limit } => {
             commands::audit(reference.as_deref(), limit, cli.json)

@@ -306,6 +306,14 @@ impl MimirServer {
                 .map(|(rank, hit)| (hit.node.id, rank as i64, hit.score))
                 .collect();
             store::record_shown(&m.conn, query_hash.as_bytes(), &shown).map_err(engine_err)?;
+            if m.config.learn.shadow_ranking {
+                mimir_core::shadow::observe(
+                    &m.conn,
+                    query_hash.as_bytes(),
+                    &hits,
+                    mimir_core::model::now_unix(),
+                );
+            }
             let projects = store::project_titles(&m.conn).map_err(engine_err)?;
             let ids: Vec<i64> = hits.iter().map(|h| h.node.id).collect();
             let stale = mimir_core::grounding::stale_ids(&m.conn, &ids).unwrap_or_default();

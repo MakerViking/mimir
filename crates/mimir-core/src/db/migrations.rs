@@ -349,6 +349,29 @@ CREATE TABLE recall_miss (
 CREATE UNIQUE INDEX recall_miss_key ON recall_miss(query_key, COALESCE(project_id, -1));
 CREATE INDEX recall_miss_open ON recall_miss(last_at) WHERE resolved_at IS NULL;
 "#,
+    // Shadow ranking (`shadow`): a candidate ranking signal's order for a
+    // real recall page, kept only when it differs from the live order, so
+    // the two can later be scored against what the agent opened from that
+    // page. One row per hit of a differing page.
+    //
+    // Its own table rather than an `event = 'shadow'` row in `recall_event`:
+    // that ledger is the store's record of what actually happened, and
+    // several readers count it whole (`mimir report`'s top-recalled list,
+    // the dashboard's total). A counterfactual mixed into it would be
+    // counted as an impression by each of them, and by every reader written
+    // after them.
+    r#"
+CREATE TABLE shadow_rank (
+    id          INTEGER PRIMARY KEY,
+    candidate   TEXT NOT NULL,
+    query_hash  BLOB NOT NULL,
+    at          INTEGER NOT NULL,
+    node_id     INTEGER NOT NULL,
+    live_rank   INTEGER NOT NULL,
+    shadow_rank INTEGER NOT NULL
+);
+CREATE INDEX shadow_rank_at ON shadow_rank(candidate, at);
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -516,6 +539,13 @@ mod tests {
             crate::misses::counts(&conn, 0).unwrap(),
             (1, 0),
             "upgraded store must be able to write the miss ledger"
+        );
+        assert_eq!(
+            crate::shadow::evaluate(&conn, crate::shadow::COACTIVATION, 0)
+                .unwrap()
+                .pages,
+            0,
+            "upgraded store must be able to read the shadow ledger"
         );
     }
 

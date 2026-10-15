@@ -26,9 +26,22 @@ the `mimir-mem` crate, and the on-disk schema move together.
   secrets scanner flags, ages out with `[learn] event_retention_days`, and
   `[learn] log_misses = false` turns it off.
 
+- **Co-activation edges (phase 1).** Two memories opened within 30 minutes
+  of each other strengthen a derived `co_recalled` edge (Hebbian, one fire
+  per pair per day, 30-day half-life, at most 32 per node). Recorded only —
+  ranking is untouched. Not synced or exported; `link` refuses to author one.
+- **Shadow ranking — `mimir shadow`.** A candidate ranking runs beside the
+  live one on every explicit recall; where the orders differ both are kept,
+  and each later `opened` is scored against the page it came from (MRR of the
+  opened hit, wins/losses, exact sign test). Recall output never changes and
+  nothing promotes itself. First candidate: lift memories co-recalled with
+  one opened in the last 30 minutes. The report says plainly that the
+  comparison favours live. `[learn] shadow_ranking = false` to disable.
+
 ### Changed
 
-- **Schema v13** adds the `recall_miss` table. As with every schema bump, a
+- **Schema v13** adds the `recall_miss` table, **v14** the `shadow_rank`
+  table. As with every schema bump, a
   store opened by this binary is refused by older ones (`SchemaTooNew`):
   reinstall, then restart running `mimir mcp` servers.
 

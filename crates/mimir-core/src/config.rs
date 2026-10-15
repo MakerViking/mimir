@@ -285,6 +285,12 @@ pub struct LearnConfig {
     /// is never written, and rows age out on `event_retention_days`. `false`
     /// stops new rows; existing ones remain until pruned or dismissed.
     pub log_misses: bool,
+    /// Run candidate ranking signals in shadow beside the live ranking
+    /// (`mimir shadow`): each recall page gets the candidate's order too,
+    /// kept only when it differs, and later scored against what the agent
+    /// opened. Never changes what recall returns. Costs one indexed lookup
+    /// per recall, and a write only on pages the candidate would reorder.
+    pub shadow_ranking: bool,
 }
 
 impl Default for LearnConfig {
@@ -292,6 +298,7 @@ impl Default for LearnConfig {
         LearnConfig {
             event_retention_days: 180,
             log_misses: true,
+            shadow_ranking: true,
         }
     }
 }
