@@ -66,7 +66,7 @@ pub struct Summary {
 /// them — a cost event must never net against real savings, which the raw
 /// `before - after` sums would silently do. They remain visible in
 /// `by_source` (its per-source `Totals::saved()` clamps to 0).
-const COST_SOURCES_SQL: &str = "('brief')";
+pub const COST_SOURCES_SQL: &str = "('brief')";
 
 /// One-scan equivalent of calling `totals` for day/week/month/all.
 pub fn summary(conn: &Connection, now: i64) -> Result<Summary> {

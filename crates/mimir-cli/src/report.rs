@@ -82,17 +82,7 @@ pub fn report(json: bool) -> Result<()> {
         ("results shown", event_counts("shown")?),
         ("memories opened", event_counts("opened")?),
         ("marked useful", event_counts("useful")?),
-        (
-            "tokens saved",
-            counts(
-                "SELECT COALESCE(sum(CASE WHEN at>=?1 THEN tokens_before-tokens_after END),0),
-                        COALESCE(sum(CASE WHEN at>=?2 THEN tokens_before-tokens_after END),0),
-                        COALESCE(sum(CASE WHEN at>=?3 THEN tokens_before-tokens_after END),0),
-                        COALESCE(sum(CASE WHEN at>=?4 THEN tokens_before-tokens_after END),0),
-                        COALESCE(sum(tokens_before-tokens_after),0)
-                 FROM savings_event",
-            )?,
-        ),
+        ("tokens saved", counts(&saved_sql())?),
     ];
 
     // Most-recalled memories this month, for a human hook at the bottom.
@@ -146,13 +136,13 @@ pub fn report(json: bool) -> Result<()> {
     );
     print!("{:<20}", "");
     for (name, _) in PERIODS {
-        print!("{name:>7}");
+        print!(" {name:>7}");
     }
     println!();
     for (label, vals) in &rows {
         print!("{label:<20}");
         for v in vals {
-            print!("{:>7}", human(*v));
+            print!(" {:>7}", human(*v));
         }
         println!();
     }
@@ -176,8 +166,28 @@ pub fn report(json: bool) -> Result<()> {
     Ok(())
 }
 
+/// The five period sums of tokens saved. Cost sources (the session brief,
+/// recorded with `before = 0`) are excluded exactly as `mimir savings` excludes
+/// them: summed raw they net against real savings and a quiet day reads negative.
+fn saved_sql() -> String {
+    let cost = mimir_core::savings::COST_SOURCES_SQL;
+    format!(
+        "SELECT COALESCE(sum(CASE WHEN at>=?1 THEN tokens_before-tokens_after END),0),
+                COALESCE(sum(CASE WHEN at>=?2 THEN tokens_before-tokens_after END),0),
+                COALESCE(sum(CASE WHEN at>=?3 THEN tokens_before-tokens_after END),0),
+                COALESCE(sum(CASE WHEN at>=?4 THEN tokens_before-tokens_after END),0),
+                COALESCE(sum(tokens_before-tokens_after),0)
+         FROM savings_event WHERE source NOT IN {cost}"
+    )
+}
+
 fn human(n: i64) -> String {
-    if n >= 10_000 {
+    let a = n.unsigned_abs();
+    if a >= 1_000_000_000 {
+        format!("{:.1}B", n as f64 / 1e9)
+    } else if a >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if a >= 10_000 {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
@@ -221,5 +231,32 @@ mod tests {
     fn human_compacts_large_numbers() {
         assert_eq!(super::human(263), "263");
         assert_eq!(super::human(29_040), "29.0k");
+        // These ran into the next column as "324828.6k1459542.9k" (2026-10-15).
+        assert_eq!(super::human(324_828_600), "324.8M");
+        assert_eq!(super::human(1_459_542_900), "1.5B");
+    }
+
+    #[test]
+    fn tokens_saved_does_not_net_the_brief_against_savings() {
+        use mimir_core::savings::{record, source};
+        let m = mimir_core::Mimir::open_in_memory().unwrap();
+        record(
+            &m.conn,
+            None,
+            source::OUTLINE,
+            1_000,
+            100,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        record(&m.conn, None, source::BRIEF, 0, 500, serde_json::json!({})).unwrap();
+        let all: i64 = m
+            .conn
+            .query_row(&super::saved_sql(), [0, 0, 0, 0], |r| r.get(4))
+            .unwrap();
+        assert_eq!(
+            all, 900,
+            "the brief's 500 injected tokens are a cost, not negative savings"
+        );
     }
 }
