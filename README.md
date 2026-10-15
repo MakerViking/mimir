@@ -271,6 +271,39 @@ mimir link --scan --all-projects             # ~600 links on a mature store
 `mimir doctor` reminds you if you have code graphs and have never scanned,
 and goes quiet once you have.
 
+### Weak matches and the miss ledger: what the store couldn't answer
+
+Every ranked list has a #1, including the list for a question the store knows
+nothing about. So recall labels each hit by the *evidence* behind it rather
+than its score: a hit is `strong` when it contains the query's words **and**
+both the lexical and the semantic search rank it in their own top 10.
+Anything else gets one word on its line:
+
+```
+m:46MBBK [decision 10-15 weak] Release process: bump versions, update CHANGELOG…
+```
+
+Measured on the labelled retrieval corpus with the real embedding model, a
+`weak` hit is relevant about 2% of the time and a `strong` one about 55%
+(`eval::strength`; numbers and the two rules tried and rejected are in
+`crates/mimir-core/src/strength.rs`). `--json` carries `"strength"` on every
+hit.
+
+A recall whose page has no `strong` hit is a **miss**, and misses are kept:
+
+```sh
+mimir misses                 # most-asked unanswered queries, this project + global
+mimir misses --all           # every project
+mimir misses --dismiss 12    # it was noise, not a gap
+```
+
+That list is what to write down next. A row resolves itself the next time the
+same question gets a strong answer, and `mimir report` counts what's open.
+Only explicit recalls (CLI and MCP) feed it — never the per-prompt inject
+hook. The query text stays on this machine (not synced, not exported), a query
+the secrets scanner flags is never written, and rows age out with
+`[learn] event_retention_days`. Turn it off with `[learn] log_misses = false`.
+
 ### The fast path (recommended setup)
 
 Three commands get you the lowest-latency configuration Mimir has — measured

@@ -317,6 +317,38 @@ CREATE TABLE review (
 CREATE UNIQUE INDEX review_finding ON review(kind, node_id, COALESCE(other_id, -1));
 CREATE INDEX review_open ON review(at) WHERE disposition IS NULL;
 "#,
+    // Miss ledger: what agents asked for that the store could not answer.
+    //
+    // `recall_event` keys on node_id, so a recall that found nothing wrote
+    // nothing — the store could say which memories were useful and never
+    // which ones were missing, and the second is the list worth acting on.
+    // A miss is a page with no `strong` hit (`strength::is_miss`).
+    //
+    // Unlike every other ledger here this keeps the query TEXT, because a
+    // hash of a question nobody can read back answers nothing. Two guards
+    // make that safe to hold: a query the secrets scanner flags is never
+    // written (`misses::observe`), and the table is per-machine — not
+    // replicated, not exported — like `recall_event` itself.
+    //
+    // One row per (normalised query, project): asking again bumps `count`,
+    // which is the ranking signal; a later `strong` answer to the same query
+    // stamps `resolved_at`, so the list empties itself as memories get
+    // written.
+    r#"
+CREATE TABLE recall_miss (
+    id          INTEGER PRIMARY KEY,
+    query       TEXT NOT NULL,
+    query_key   BLOB NOT NULL,
+    project_id  INTEGER,
+    hits        INTEGER NOT NULL,
+    count       INTEGER NOT NULL DEFAULT 1,
+    first_at    INTEGER NOT NULL,
+    last_at     INTEGER NOT NULL,
+    resolved_at INTEGER
+);
+CREATE UNIQUE INDEX recall_miss_key ON recall_miss(query_key, COALESCE(project_id, -1));
+CREATE INDEX recall_miss_open ON recall_miss(last_at) WHERE resolved_at IS NULL;
+"#,
 ];
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
@@ -469,6 +501,21 @@ mod tests {
             crate::audit::history(&conn, node_id).unwrap().len(),
             1,
             "upgraded store must be able to write the mutation ledger"
+        );
+        // And the miss ledger (v13), whose upsert targets an expression
+        // index — the shape most likely to work on a fresh store and fail on
+        // an upgraded one.
+        crate::misses::observe(
+            &conn,
+            "a question from after the upgrade",
+            None,
+            &[crate::strength::MatchStrength::Weak],
+            1_700_000_000,
+        );
+        assert_eq!(
+            crate::misses::counts(&conn, 0).unwrap(),
+            (1, 0),
+            "upgraded store must be able to write the miss ledger"
         );
     }
 

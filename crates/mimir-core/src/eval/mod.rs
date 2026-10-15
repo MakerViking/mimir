@@ -28,6 +28,7 @@
 pub mod brief;
 pub mod fixtures;
 pub mod forget;
+pub mod strength;
 
 use std::collections::HashSet;
 

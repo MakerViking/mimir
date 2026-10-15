@@ -3,6 +3,35 @@
 All notable changes are documented here. Versions follow semver; the CLI,
 the `mimir-mem` crate, and the on-disk schema move together.
 
+## [Unreleased]
+
+### Added
+
+- **Recall says when a hit is weak.** A ranked list always has a #1, so the
+  score cannot tell "the answer" from "the least-bad thing in the store".
+  Each hit is now labelled by evidence instead: `strong` when it contains the
+  query's words and both the lexical and semantic legs rank it in their own
+  top 10, otherwise `weak` — one word on the compact line (CLI and MCP),
+  `"strength"` in `--json`. Calibrated against the labelled retrieval corpus
+  with the real model: weak hits are relevant ~2% of the time, strong ~55%.
+  A three-tier version (with `likely`) and two stricter matching rules were
+  measured and rejected; the numbers are in `strength.rs`, and
+  `eval::strength` gates the rule in `cargo test`.
+- **`mimir misses` — what agents asked that the store couldn't answer.** A
+  recall with no strong hit is recorded (query text, count, last asked), most
+  asked first; the row resolves itself when the same question later gets a
+  strong answer, and reopens if that answer goes away. `mimir report` gains an
+  "unanswered queries" row. Explicit recalls only — the inject hook never
+  feeds it. Per-machine (not synced or exported), never stores a query the
+  secrets scanner flags, ages out with `[learn] event_retention_days`, and
+  `[learn] log_misses = false` turns it off.
+
+### Changed
+
+- **Schema v13** adds the `recall_miss` table. As with every schema bump, a
+  store opened by this binary is refused by older ones (`SchemaTooNew`):
+  reinstall, then restart running `mimir mcp` servers.
+
 ## [0.17.1] - 2026-10-15
 
 ### Fixed

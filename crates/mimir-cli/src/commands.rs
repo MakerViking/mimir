@@ -1201,9 +1201,27 @@ pub fn recall(
         as_of,
         text,
     };
-    let mut hits = mimir.search_with(&query, rerank)?;
+    let (mut hits, legs) = mimir.search_with_evidence(&query, rerank)?;
+    let mut strengths = mimir_core::strength::classify_page(&hits, &query.text, &legs);
+    // Judged on the page as retrieved, before `--min-score` trims it: a
+    // threshold the caller chose is not evidence the store lacks an answer.
+    // A time-sliced view (`--since`, `--as-of`) is not a question to the
+    // store as it stands, so it never feeds the ledger either.
+    if mimir.config.learn.log_misses && query.since.is_none() && as_of.is_none() {
+        mimir_core::misses::observe(
+            &mimir.conn,
+            &query.text,
+            mimir_core::misses::scope_project(&query.scope),
+            &strengths,
+            mimir_core::model::now_unix(),
+        );
+    }
     if let Some(min) = min_score {
-        hits.retain(|hit| hit.score >= min);
+        (hits, strengths) = hits
+            .into_iter()
+            .zip(strengths)
+            .filter(|(hit, _)| hit.score >= min)
+            .unzip();
     }
 
     let query_hash = blake3::hash(query.text.as_bytes());
@@ -1247,10 +1265,11 @@ pub fn recall(
         &hits.iter().map(|h| h.node.id).collect::<Vec<_>>(),
     )
     .unwrap_or_default();
-    for hit in &hits {
+    for (hit, strength) in hits.iter().zip(&strengths) {
         if json {
             let mut value = node_json(&hit.node, &projects);
             value["score"] = serde_json::json!(hit.score);
+            value["strength"] = serde_json::json!(strength.as_str());
             println!("{value}");
         } else if full {
             print_full(&hit.node, &mimir, &projects)?;
@@ -1263,7 +1282,10 @@ pub fn recall(
                     &projects,
                     mimir.config.output.snippet_chars,
                     Some(&query.text),
-                    stale.contains(&hit.node.id)
+                    mimir_core::format::HitMarks {
+                        stale_grounding: stale.contains(&hit.node.id),
+                        weak_match: *strength == mimir_core::strength::MatchStrength::Weak,
+                    }
                 )
             );
         }
@@ -1517,6 +1539,85 @@ pub fn grounding(stale_only: bool, limit: usize) -> Result<()> {
     println!(
         "\nStale means the thing it pointed at is gone, not that the memory is \
          wrong.\nRe-link with `mimir link`, retire with `mimir supersede`, or leave it."
+    );
+    Ok(())
+}
+
+/// The miss ledger: recall queries that came back with no strong match.
+pub fn misses(
+    dismiss: Option<i64>,
+    all: bool,
+    resolved: bool,
+    limit: usize,
+    json: bool,
+) -> Result<()> {
+    let mimir = Mimir::open()?;
+    if let Some(id) = dismiss {
+        if !mimir_core::misses::dismiss(&mimir.conn, id)? {
+            return Err(anyhow!("no miss #{id} (see `mimir misses`)"));
+        }
+        println!("dismissed miss #{id}");
+        return Ok(());
+    }
+    let project = if all {
+        None
+    } else {
+        mimir_core::misses::scope_project(&read_scope(&mimir, false, false)?)
+    };
+    let rows = mimir_core::misses::list(&mimir.conn, project, resolved, limit)?;
+    let projects = store::project_titles(&mimir.conn)?;
+    if json {
+        for m in &rows {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "id": m.id,
+                    "query": m.query,
+                    "project": m.project_id.and_then(|id| projects.get(&id)),
+                    "hits": m.hits,
+                    "count": m.count,
+                    "first_at": m.first_at,
+                    "last_at": m.last_at,
+                    "resolved_at": m.resolved_at,
+                })
+            );
+        }
+        return Ok(());
+    }
+    if rows.is_empty() {
+        println!("no misses — every recall logged here found a strong match");
+        if !mimir.config.learn.log_misses {
+            println!("(logging is off: `[learn] log_misses = false`)");
+        }
+        return Ok(());
+    }
+    println!(
+        "{:>5} {:>5}  {:<6} {:<12} query",
+        "id", "asked", "last", "project"
+    );
+    for m in &rows {
+        let project = m
+            .project_id
+            .and_then(|id| projects.get(&id))
+            .map_or("-", String::as_str);
+        let state = match (m.resolved_at, m.hits) {
+            (Some(_), _) => "  (answered since)",
+            (None, 0) => "  (nothing came back)",
+            (None, _) => "",
+        };
+        println!(
+            "{:>5} {:>5}  {:<6} {:<12} {}{state}",
+            m.id,
+            m.count,
+            mimir_core::format::month_day(m.last_at),
+            project,
+            m.query
+        );
+    }
+    println!(
+        "\nEach of these got no strong match: nothing that both shares the query's \
+         words and ranks near the top of both search legs.\nWrite the memory that \
+         answers it (`mimir remember`), or `mimir misses --dismiss <id>` if it was noise."
     );
     Ok(())
 }
@@ -2436,7 +2537,13 @@ fn line_q(
     snippet_chars: usize,
     query: Option<&str>,
 ) -> String {
-    line_with_grounding(node, projects, snippet_chars, query, false)
+    line_with_grounding(
+        node,
+        projects,
+        snippet_chars,
+        query,
+        mimir_core::format::HitMarks::default(),
+    )
 }
 
 /// [`line_for_query`] plus the stale-grounding marker. Separate so the many
@@ -2449,13 +2556,13 @@ fn line_with_grounding(
     projects: &HashMap<i64, String>,
     snippet_chars: usize,
     query: Option<&str>,
-    stale: bool,
+    marks: mimir_core::format::HitMarks,
 ) -> String {
     let project = node
         .project_id
         .and_then(|id| projects.get(&id))
         .map(String::as_str);
-    mimir_core::format::agent_line_for_query(node, project, snippet_chars, query, stale)
+    mimir_core::format::agent_line_for_query(node, project, snippet_chars, query, marks)
 }
 
 fn print_full(node: &Node, mimir: &Mimir, projects: &HashMap<i64, String>) -> Result<()> {

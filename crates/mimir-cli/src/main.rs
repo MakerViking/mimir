@@ -373,6 +373,23 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Recall queries the store had no answer for: what agents keep asking
+    /// that nobody has written down. Most-asked first. A row resolves itself
+    /// when a later recall of the same question finds a strong match.
+    Misses {
+        /// Remove this row (from the list): noise, not a gap.
+        #[arg(long)]
+        dismiss: Option<i64>,
+        /// Every project's misses, not just this one's and the global ones.
+        #[arg(long)]
+        all: bool,
+        /// Include questions a later recall answered.
+        #[arg(long)]
+        resolved: bool,
+        /// How many to list.
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
     /// What the secret guard turned away — fingerprints and counts, never
     /// the refused values.
     Refusals {
@@ -973,6 +990,12 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             commands::mark(&reference, useful)
         }
         Command::Consolidate { dry_run } => commands::consolidate(dry_run),
+        Command::Misses {
+            dismiss,
+            all,
+            resolved,
+            limit,
+        } => commands::misses(dismiss, all, resolved, limit, cli.json),
         Command::Refusals { limit } => commands::refusals(limit),
         Command::Audit { reference, limit } => {
             commands::audit(reference.as_deref(), limit, cli.json)

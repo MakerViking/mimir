@@ -257,7 +257,18 @@ fn match_window(text: &str, stems: &[String], snippet_chars: usize) -> Option<St
 /// One-line agent format for a node.
 /// `project` is the display name of the node's project, if scoped.
 pub fn agent_line(node: &Node, project: Option<&str>, snippet_chars: usize) -> String {
-    agent_line_for_query(node, project, snippet_chars, None, false)
+    agent_line_for_query(node, project, snippet_chars, None, HitMarks::default())
+}
+
+/// Per-hit facts a ranked recall knows about and a bare node does not, each
+/// costing one word on the compact line when true and nothing when false.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HitMarks {
+    /// The memory's grounding link points at a symbol that is gone.
+    pub stale_grounding: bool,
+    /// Too little evidence that this hit matches the query at all
+    /// (`strength::MatchStrength::Weak`).
+    pub weak_match: bool,
 }
 
 /// [`agent_line`], but with the search query in hand so the snippet can be
@@ -280,7 +291,7 @@ pub fn agent_line_for_query(
     project: Option<&str>,
     snippet_chars: usize,
     query: Option<&str>,
-    stale_grounding: bool,
+    marks: HitMarks,
 ) -> String {
     let id = short_uid(node.kind, &node.uid);
     let tag = node.subkind.as_deref().unwrap_or(node.kind.as_str());
@@ -333,8 +344,19 @@ pub fn agent_line_for_query(
     // ran `get` on that exact hit afterwards — which, in a recall loop,
     // is nobody. Costs a word on the hits that have it and nothing on the
     // rest.
-    let stale = if stale_grounding { " stale-link" } else { "" };
-    let mut line = format!("{id} [{tag}{scope} {date}{uses}{doubt}{validity}{stale}] {title}");
+    let stale = if marks.stale_grounding {
+        " stale-link"
+    } else {
+        ""
+    };
+    // Same asymmetry again: `strong` is what a hit is supposed to be, so it
+    // goes unsaid; `weak` changes what an agent should do — check before
+    // acting, or treat the page as "the store doesn't know". Measured
+    // (`eval::strength`): a weak hit is relevant ~2% of the time, a strong
+    // one ~55%.
+    let weak = if marks.weak_match { " weak" } else { "" };
+    let mut line =
+        format!("{id} [{tag}{scope} {date}{uses}{doubt}{validity}{stale}{weak}] {title}");
     if let Some(body) = node.body.as_deref() {
         let flat = collapse_ws(body);
         let stems = query.map(query_stems).unwrap_or_default();
@@ -711,7 +733,13 @@ mod tests {
             "head truncation should miss the match: {blind}"
         );
 
-        let aware = agent_line_for_query(&node, None, 120, Some("prompt cache breakpoints"), false);
+        let aware = agent_line_for_query(
+            &node,
+            None,
+            120,
+            Some("prompt cache breakpoints"),
+            HitMarks::default(),
+        );
         assert!(
             aware.contains("breakpoints"),
             "snippet should be centred on the match: {aware}"
@@ -723,7 +751,13 @@ mod tests {
     fn query_aware_snippet_falls_back_when_nothing_matches() {
         let node = breadcrumb_chunk();
         assert_eq!(
-            agent_line_for_query(&node, None, 120, Some("kubernetes ingress"), false),
+            agent_line_for_query(
+                &node,
+                None,
+                120,
+                Some("kubernetes ingress"),
+                HitMarks::default()
+            ),
             agent_line(&node, None, 120),
             "a query with no lexical match must not change the line"
         );
@@ -734,7 +768,7 @@ mod tests {
         let node = breadcrumb_chunk();
         // "compress" is inside the head window, which already shows it.
         assert_eq!(
-            agent_line_for_query(&node, None, 120, Some("compress"), false),
+            agent_line_for_query(&node, None, 120, Some("compress"), HitMarks::default()),
             agent_line(&node, None, 120),
         );
     }

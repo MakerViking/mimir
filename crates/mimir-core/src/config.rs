@@ -278,12 +278,20 @@ pub struct LearnConfig {
     ///
     /// [`effective_retention_days`]: LearnConfig::effective_retention_days
     pub event_retention_days: u32,
+    /// Keep the miss ledger (`mimir misses`): the text of explicit recall
+    /// queries that came back with no `strong` hit, so the gaps agents keep
+    /// hitting can be written down. On by default — the text stays on this
+    /// machine (never synced or exported), a query the secrets scanner flags
+    /// is never written, and rows age out on `event_retention_days`. `false`
+    /// stops new rows; existing ones remain until pruned or dismissed.
+    pub log_misses: bool,
 }
 
 impl Default for LearnConfig {
     fn default() -> Self {
         LearnConfig {
             event_retention_days: 180,
+            log_misses: true,
         }
     }
 }
@@ -653,6 +661,7 @@ mod learn_config_tests {
     fn zero_means_never_prune() {
         let cfg = LearnConfig {
             event_retention_days: 0,
+            ..LearnConfig::default()
         };
         assert_eq!(cfg.effective_retention_days(), None);
     }
@@ -666,6 +675,7 @@ mod learn_config_tests {
     fn below_floor_is_clamped_up_to_the_floor() {
         let cfg = LearnConfig {
             event_retention_days: 7,
+            ..LearnConfig::default()
         };
         assert_eq!(cfg.effective_retention_days(), Some(60));
     }
@@ -674,6 +684,7 @@ mod learn_config_tests {
     fn exactly_at_the_floor_is_not_clamped_further() {
         let cfg = LearnConfig {
             event_retention_days: 60,
+            ..LearnConfig::default()
         };
         assert_eq!(cfg.effective_retention_days(), Some(60));
     }

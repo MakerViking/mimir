@@ -85,6 +85,16 @@ pub fn report(json: bool) -> Result<()> {
                  FROM recall_event WHERE query_hash IS NOT NULL",
             )?,
         ),
+        // Distinct questions last missed in the period and still open — the
+        // count a person can act on, not how many times agents retried.
+        (
+            "unanswered queries",
+            counts(
+                "SELECT COALESCE(sum(last_at>=?1),0), COALESCE(sum(last_at>=?2),0),
+                        COALESCE(sum(last_at>=?3),0), COALESCE(sum(last_at>=?4),0), count(*)
+                 FROM recall_miss WHERE resolved_at IS NULL",
+            )?,
+        ),
         ("results shown", event_counts("shown")?),
         ("memories opened", event_counts("opened")?),
         ("marked useful", event_counts("useful")?),
@@ -168,6 +178,12 @@ pub fn report(json: bool) -> Result<()> {
     }
     if let Some(ts) = last_consolidate {
         println!("last consolidation    {}", date(ts));
+    }
+    if rows
+        .iter()
+        .any(|(label, vals)| *label == "unanswered queries" && vals[4] > 0)
+    {
+        println!("unanswered queries    `mimir misses` lists them, most-asked first");
     }
     Ok(())
 }

@@ -22,6 +22,7 @@ pub mod index;
 pub mod inject;
 pub mod learn;
 pub mod memory;
+pub mod misses;
 pub mod model;
 pub mod replicate;
 pub mod review;
@@ -31,6 +32,7 @@ pub mod scope;
 pub mod search;
 pub mod secrets;
 pub mod store;
+pub mod strength;
 pub mod tokens;
 
 use std::path::Path;
@@ -310,6 +312,19 @@ impl Mimir {
     /// `[rerank] auto` and the per-query gates say it should — see
     /// `should_auto_rerank`.
     pub fn search_with(&mut self, query: &SearchQuery, rerank: bool) -> Result<Vec<Hit>> {
+        Ok(self.search_with_evidence(query, rerank)?.0)
+    }
+
+    /// [`Mimir::search_with`], plus the per-leg ranked id lists the hits were
+    /// fused from (`legs[0]` = FTS, `legs[1]` = vector iff a model ran) —
+    /// what `strength::classify` needs to say how much evidence stands behind
+    /// each hit. The legs are the pre-rerank retrieval: reranking reorders
+    /// the page, it does not change what either retriever found.
+    pub fn search_with_evidence(
+        &mut self,
+        query: &SearchQuery,
+        rerank: bool,
+    ) -> Result<(Vec<Hit>, Vec<Vec<i64>>)> {
         let explicit = rerank;
         let rerank = rerank || self.should_auto_rerank(query);
         let mut fetch_query = query.clone();
@@ -319,10 +334,10 @@ impl Mimir {
 
         let query_vec = self.query_embedding(&query.text);
         let alpha = self.config.scoring.impression_alpha;
-        let mut hits = match query_vec {
+        let (mut hits, legs) = match query_vec {
             Some(v) => {
                 let model = self.config.embedding.model.clone();
-                search::search_hybrid_scored(
+                search::search_hybrid_with_legs_scored(
                     &self.conn,
                     &fetch_query,
                     Some((&model, &v)),
@@ -335,7 +350,7 @@ impl Mimir {
             // otherwise a cold/model-less process would silently bypass a
             // configured impression_alpha instead of degrading to BM25-only
             // *and* keeping the damp, same as `search_with_legs` does.
-            None => search::search_hybrid_scored(
+            None => search::search_hybrid_with_legs_scored(
                 &self.conn,
                 &fetch_query,
                 None,
@@ -369,7 +384,7 @@ impl Mimir {
             }
         }
         hits.truncate(query.limit);
-        Ok(hits)
+        Ok((hits, legs))
     }
 
     /// Rank `docs` against `text`, best-first `(doc_index, score)`. Priority:

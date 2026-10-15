@@ -8,10 +8,11 @@
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
-use mimir_core::format::{agent_line, agent_line_for_query};
+use mimir_core::format::{agent_line, agent_line_for_query, HitMarks};
 use mimir_core::memory::{self, RememberOutcome};
 use mimir_core::model::{short_uid, Kind, MemoryType, Rel, Scope};
 use mimir_core::search::SearchQuery;
+use mimir_core::strength::MatchStrength;
 use mimir_core::{store, Mimir};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -240,7 +241,7 @@ impl MimirServer {
     }
 
     #[tool(
-        description = "Search memories, docs and code in one ranked list (hybrid BM25+semantic). ~25-token line per hit."
+        description = "Search memories, docs and code in one ranked list (hybrid BM25+semantic). ~25-token line per hit; `weak` = little evidence it matches the query."
     )]
     async fn recall(&self, Parameters(args): Parameters<RecallArgs>) -> String {
         let project_id = self.project_id;
@@ -280,7 +281,21 @@ impl MimirServer {
                 include_superseded: args.include_superseded,
                 as_of,
             };
-            let hits = m.search_with(&query, args.rerank).map_err(engine_err)?;
+            let (hits, legs) = m
+                .search_with_evidence(&query, args.rerank)
+                .map_err(engine_err)?;
+            let strengths = mimir_core::strength::classify_page(&hits, &query.text, &legs);
+            // Same rule as the CLI: a time-sliced view is not a question to
+            // the store as it stands, so `as_of` never feeds the ledger.
+            if m.config.learn.log_misses && query.as_of.is_none() {
+                mimir_core::misses::observe(
+                    &m.conn,
+                    &query.text,
+                    mimir_core::misses::scope_project(&query.scope),
+                    &strengths,
+                    mimir_core::model::now_unix(),
+                );
+            }
             if hits.is_empty() {
                 return Ok("no results".into());
             }
@@ -295,7 +310,7 @@ impl MimirServer {
             let ids: Vec<i64> = hits.iter().map(|h| h.node.id).collect();
             let stale = mimir_core::grounding::stale_ids(&m.conn, &ids).unwrap_or_default();
             let mut out = Vec::new();
-            for hit in &hits {
+            for (hit, strength) in hits.iter().zip(&strengths) {
                 let project = hit
                     .node
                     .project_id
@@ -306,7 +321,10 @@ impl MimirServer {
                     project,
                     m.config.output.snippet_chars,
                     Some(&query.text),
-                    stale.contains(&hit.node.id),
+                    HitMarks {
+                        stale_grounding: stale.contains(&hit.node.id),
+                        weak_match: *strength == MatchStrength::Weak,
+                    },
                 ));
             }
             Ok(out.join("\n"))
@@ -1906,6 +1924,73 @@ mod tests {
 
         let body = s.get(Parameters(GetArgs { r#ref: id })).await;
         assert!(body.contains("SCRAM"), "get: {body}");
+    }
+
+    /// The agent surface carries both new signals: a hit with no evidence
+    /// behind it says `weak` on its line, and a page with nothing better
+    /// lands in the miss ledger — while a real answer to the same question
+    /// later resolves it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn recall_marks_weak_hits_and_feeds_the_miss_ledger() {
+        let (_dir, s) = server();
+        s.remember(Parameters(remember_args(
+            "SCRAM auth rejects non-ASCII passwords",
+            "gotcha",
+        )))
+        .await;
+        let recall = |query: &str| {
+            s.recall(Parameters(RecallArgs {
+                query: query.into(),
+                kind: None,
+                limit: None,
+                all_projects: true,
+                rerank: false,
+                include_superseded: false,
+                as_of: None,
+            }))
+        };
+        let open_misses = || {
+            let engine = s.engine.clone();
+            move || {
+                let m = engine.lock().unwrap();
+                mimir_core::misses::list(&m.conn, None, false, 10)
+                    .unwrap()
+                    .into_iter()
+                    .map(|miss| miss.query)
+                    .collect::<Vec<_>>()
+            }
+        };
+
+        // No embedder in tests, so this is the lexical-only path. Nothing
+        // shares a word: an empty page, which is a miss.
+        assert_eq!(recall("sourdough hydration ratio").await, "no results");
+        // One shared word of three: the hit comes back, marked weak.
+        let partial = recall("passwords reset flow").await;
+        assert!(
+            partial.contains("SCRAM") && partial.contains(" weak]"),
+            "{partial}"
+        );
+        assert_eq!(
+            open_misses()(),
+            vec!["sourdough hydration ratio", "passwords reset flow"]
+        );
+
+        s.remember(Parameters(remember_args(
+            "Passwords reset flow sends a magic link, never a temporary password",
+            "decision",
+        )))
+        .await;
+        let answered = recall("passwords reset flow").await;
+        let first = answered.lines().next().unwrap_or_default();
+        assert!(
+            first.contains("magic link") && !first.contains(" weak]"),
+            "{answered}"
+        );
+        assert_eq!(
+            open_misses()(),
+            vec!["sourdough hydration ratio"],
+            "a strong answer resolves its own miss and no other"
+        );
     }
 
     /// `link` must refuse `supersedes`. The edge and the `superseded_by`

@@ -127,6 +127,11 @@ fn prune_events_once(conn: &Connection, days: u32) {
         Ok(_) => {}
         Err(err) => tracing::warn!(%err, "recall_event prune failed"),
     }
+    match crate::misses::prune(conn, cutoff) {
+        Ok(n) if n > 0 => tracing::info!(rows = n, days, "pruned old recall_miss rows"),
+        Ok(_) => {}
+        Err(err) => tracing::warn!(%err, "recall_miss prune failed"),
+    }
 }
 
 /// One `injection_log`/`session_state` prune pass, `SESSION_STATE_RETENTION_DAYS`
