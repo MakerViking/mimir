@@ -1373,7 +1373,7 @@ fn ctor_type(value: Node, src: &str) -> Option<String> {
                 .child_by_field_name("function")
                 .or_else(|| value.named_child(0))?;
             let name = match callee.kind() {
-                "scoped_identifier" => callee.child_by_field_name("path").map(&text),
+                "scoped_identifier" => callee.child_by_field_name("path").map(text),
                 "identifier" | "simple_identifier" => Some(text(callee)),
                 _ => None,
             }?;
