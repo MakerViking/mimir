@@ -24,36 +24,42 @@ pub use queries::CodeGraph;
 pub use store_graph::{check, update, Drift, GraphStats};
 
 /// Resolve a symbol by short id, exact qualified name, or bare name.
-/// Bare-name matches must be unique; ambiguity lists the candidates.
+/// Bare-name matches must be unique; ambiguity lists the candidates as
+/// `symbol_line`s (id, path, span) so the caller can pick one by id: a bare
+/// list of names ("tessellate, tessellate") gives nothing to retry with.
 pub fn resolve_symbol(conn: &Connection, project_id: i64, reference: &str) -> Result<Node> {
+    /// Candidates shown in an ambiguity error; the count reported is the true total.
+    const SHOWN: usize = 6;
     if let Ok(node) = store::resolve_ref(conn, reference) {
         if matches!(node.kind, mimir_core::model::Kind::Symbol) {
             return Ok(node);
         }
     }
-    let mut stmt = conn.prepare(&format!(
-        "SELECT {NODE_COLS} FROM node
+    let filter = "FROM node
          WHERE kind = 'symbol' AND project_id = ?1 AND deleted_at IS NULL
-           AND (title = ?2 OR json_extract(meta, '$.name') = ?2)
-         LIMIT 6"
+           AND (title = ?2 OR json_extract(meta, '$.name') = ?2)";
+    let params = rusqlite::params![project_id, reference];
+    let total: i64 = conn.query_row(&format!("SELECT COUNT(*) {filter}"), params, |r| r.get(0))?;
+    let total = total as usize;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} {filter} ORDER BY path, span_start LIMIT {SHOWN}"
     ))?;
     let matches: Vec<Node> = stmt
-        .query_map(rusqlite::params![project_id, reference], row_to_node)?
+        .query_map(params, row_to_node)?
         .collect::<rusqlite::Result<_>>()?;
-    match matches.len() {
+    match total {
         0 => Err(Error::NotFound(format!("symbol '{reference}'"))),
         1 => Ok(matches.into_iter().next().unwrap()),
-        n => Err(Error::AmbiguousRef(
-            format!(
-                "{reference} (matches {})",
-                matches
-                    .iter()
-                    .filter_map(|m| m.title.as_deref())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            n,
-        )),
+        n => {
+            let mut shown: Vec<String> = matches.iter().map(symbol_line).collect();
+            if n > SHOWN {
+                shown.push(format!("and {} more", n - SHOWN));
+            }
+            Err(Error::AmbiguousRef(
+                format!("{reference} (matches {})", shown.join("; ")),
+                n,
+            ))
+        }
     }
 }
 
@@ -487,5 +493,42 @@ mod tests {
         let drift = check(&mimir.conn, &proj, dir.path()).unwrap();
         assert!(!drift.is_stale(), "{drift:?}");
         assert_eq!(drift.unchanged, 2);
+    }
+
+    #[test]
+    fn an_ambiguous_name_lists_each_candidate_by_id_and_path() {
+        let dir = tempfile::tempdir().unwrap();
+        for i in 0..8 {
+            write(
+                dir.path(),
+                &format!("src/m{i}.rs"),
+                "pub fn dup() -> u8 { 0 }\n",
+            );
+        }
+        let mimir = Mimir::open_in_memory().unwrap();
+        let proj = project(&mimir.conn, dir.path());
+        let mut conn = mimir.conn;
+        update(&mut conn, &proj, dir.path()).unwrap();
+
+        let err = resolve_symbol(&conn, proj.id, "dup").unwrap_err();
+        let Error::AmbiguousRef(detail, n) = &err else {
+            panic!("expected AmbiguousRef, got {err:?}");
+        };
+        // The TRUE total, not the number shown.
+        assert_eq!(*n, 8, "{detail}");
+        assert!(detail.contains("src/m0.rs:1-1"), "{detail}");
+        assert!(detail.contains("and 2 more"), "{detail}");
+        // Every listed id resolves back to a symbol: that is the point of listing it.
+        let ids: Vec<&str> = detail
+            .split(|c: char| c.is_whitespace() || c == '(')
+            .filter(|t| t.starts_with("c:"))
+            .collect();
+        assert_eq!(ids.len(), 6, "{detail}");
+        for id in ids {
+            assert_eq!(
+                resolve_symbol(&conn, proj.id, id).unwrap().title.as_deref(),
+                Some("dup")
+            );
+        }
     }
 }
