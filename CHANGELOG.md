@@ -306,6 +306,15 @@ Recall, injection, embeddings:
 Hooks, init, daemon, MCP (re-run `mimir init --hooks` to get the new hook
 script):
 
+- **Warm auto-recall took 13 to 99 s per prompt on a store with large code
+  graphs**, so the hook gave up and fell back to the cold path. The daemon
+  kept every embedding in one in-memory matrix and reread all of it after
+  any other process's commit: on the store this was found on, 2.9 GB of
+  code-symbol vectors to search 1,814 memories. The cache now holds one
+  matrix per kind and loads a kind the first time a search asks for it, so
+  a memory recall reads only memory vectors (tens of ms again). A search
+  that includes code still reloads the symbols after a commit elsewhere.
+
 - **Warm auto-recall searched the wrong project.** The daemon scoped every
   prompt to the directory it was started in; started by systemd, that is no
   project, so it searched all of them. The hook script (v5) sends the
