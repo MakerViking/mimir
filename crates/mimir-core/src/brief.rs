@@ -19,13 +19,23 @@ use crate::config::{BriefConfig, ScoringConfig};
 use crate::error::Result;
 use crate::format::{collapse_ws, truncate_chars};
 use crate::learn::{self, ImpressionStats};
-use crate::model::{short_uid, Node, Scope};
+use crate::model::{short_uid, MemoryType, Node, Scope};
 use crate::store;
 
 /// Fixed preamble; costs ~7 tokens and is only emitted when at least one
 /// line survives selection (an empty brief prints nothing at all,
 /// matching `rules show`'s silent-empty precedent).
 pub const HEADER: &str = "Mimir guards (do not violate):";
+
+/// The "shown recently in another session" window. A memory briefed in ANY
+/// session inside it is left out of a start-up brief, and one briefed in a
+/// *different* session inside it is left out of a recap. It covers the
+/// unverified case where a resume (or a client's compact) mints a fresh
+/// session id — without it, a fresh id would re-show the identical brief
+/// minutes later. Defined here, once: the hook (`mimir brief show`) and the
+/// eval's session replay must suppress over the same window, or the eval
+/// measures a brief nobody ships.
+pub const RECENT_SHOWN_SECS: i64 = 6 * 3600;
 
 /// Items not touched for longer than this render a visible age tag —
 /// pin exempts decay everywhere else (and must keep doing so), so a
@@ -50,15 +60,23 @@ pub struct Brief {
 /// the memory subset (~1k rows at 100k-node scale, sub-ms). Deliberately
 /// no LIMIT: a cap here would have to sort by some proxy key, and any
 /// proxy that isn't the real Stage-2 score silently drops old-but-vital
-/// candidates (adversarial-review blocker). `subkind` is the admission
-/// gate; `pinned` is only a scoring boost, never an admission path — a
-/// pinned note/idea is not a drift preventer.
+/// candidates (adversarial-review blocker). The memory's type is the
+/// admission gate — the preventer types, [`MemoryType::is_preventer`], whose
+/// names the SQL list below is built from; `pinned` is only a scoring
+/// boost, never an admission path — a pinned note/idea is not a drift
+/// preventer.
 pub fn candidates(conn: &Connection, scope: Scope) -> Result<Vec<Node>> {
+    let preventers = MemoryType::ALL
+        .iter()
+        .filter(|mtype| mtype.is_preventer())
+        .map(|mtype| format!("'{mtype}'"))
+        .collect::<Vec<_>>()
+        .join(",");
     let sql = format!(
         "SELECT {} FROM node n
          WHERE n.kind = 'memory' AND n.deleted_at IS NULL
            AND n.superseded_by IS NULL
-           AND n.subkind IN ('gotcha','decision')
+           AND n.subkind IN ({preventers})
            AND {}",
         store::NODE_COLS,
         crate::search::scope_sql(scope)
@@ -88,13 +106,12 @@ pub fn rank(
         .into_iter()
         .map(|node| {
             let effective = learn::effective_strength(&node, now);
-            let recency_term =
-                if learn::half_life_days(node.kind, node.subkind.as_deref()).is_some() {
-                    1.0 + scoring.recency_alpha * learn::recency_factor(&node, now)
-                } else {
-                    1.0
-                };
-            let prior = learn::type_prior(node.subkind.as_deref());
+            let recency_term = if learn::node_half_life_days(&node).is_some() {
+                1.0 + scoring.recency_alpha * learn::recency_factor(&node, now)
+            } else {
+                1.0
+            };
+            let prior = learn::node_type_prior(&node);
             let stats = impressions.get(&node.id).copied().unwrap_or_default();
             let damp = learn::impression_damp(&stats, scoring.impression_alpha, now);
             let affinity = if current_project.is_some() && node.project_id == current_project {
@@ -112,11 +129,15 @@ pub fn rank(
             Ranked { node, score }
         })
         .collect();
-    // Deterministic order: score, then freshness, then rowid.
+    // Deterministic order: score, then freshness, then rowid. Freshness is
+    // that of the text: a pin or a tag put on an old guard moves its
+    // `updated_at` and must not move it up this list.
     out.sort_by(|a, b| {
         b.score
             .total_cmp(&a.score)
-            .then(b.node.updated_at.cmp(&a.node.updated_at))
+            .then(
+                crate::text_clock::decided_at(&b.node).cmp(&crate::text_clock::decided_at(&a.node)),
+            )
             .then(a.node.id.cmp(&b.node.id))
     });
     out
@@ -144,6 +165,12 @@ pub fn select(
     let rules_norm = rules_body.map(normalize);
     let mut pool: Vec<Node> = candidates(conn, scope)?
         .into_iter()
+        // The candidate query's WHERE clause can rule out a tombstone and a
+        // superseded node, but not an expired one: expiry lives in `meta`.
+        // The brief has no relevance check to fall back on, so a guard that
+        // stopped being true on a declared date must be stopped here — the
+        // design's "match recall's default" means all of it, not two thirds.
+        .filter(|n| n.lifecycle(now).is_current())
         .filter(|n| {
             rules_norm
                 .as_deref()
@@ -291,6 +318,11 @@ pub fn compose(ranked: &[Ranked], cfg: &BriefConfig, budget_tokens: usize, now: 
 /// framing outlives symbols), compact node ref (a few tokens buys `mimir
 /// get` traceability), age tag past the staleness horizon, body bounded
 /// to `line_chars`.
+///
+/// The prefix is the memory's own type. [`candidates`] admits only the two
+/// preventer types, so those are the two prefixes a brief carries; a node of
+/// any other type handed to [`compose`] directly is named for what it is
+/// rather than passed off as a gotcha.
 fn render_line(node: &Node, line_chars: usize, now: i64) -> String {
     let Some(raw) = node.body.as_deref().or(node.title.as_deref()) else {
         return String::new();
@@ -299,12 +331,14 @@ fn render_line(node: &Node, line_chars: usize, now: i64) -> String {
     if body.is_empty() {
         return String::new();
     }
-    let label = match node.subkind.as_deref() {
-        Some("decision") => "DECISION",
-        _ => "GOTCHA",
+    let label = match node.memory_type() {
+        Some(MemoryType::Decision) => "DECISION".to_string(),
+        Some(MemoryType::Gotcha) => "GOTCHA".to_string(),
+        _ => node.type_label().to_uppercase(),
     };
     let refid = short_uid(node.kind, &node.uid);
-    let age_days = (now - node.updated_at) / 86_400;
+    // The age of what it says, not of the last pin or tag put on it.
+    let age_days = (now - crate::text_clock::decided_at(node)) / 86_400;
     let age = if age_days > STALE_AFTER_DAYS {
         let months = age_days / 30;
         if months >= 12 {
@@ -571,6 +605,51 @@ mod tests {
             "content duplicated in rules pack must be dropped"
         );
         assert!(ids.contains(&c.id));
+    }
+
+    /// The age tag is the age of what the guard says. Pinning it, anchoring
+    /// it or giving it a trigger moves `updated_at` (so the change syncs)
+    /// and must not make a six-month-old guard read as written today.
+    #[test]
+    fn annotating_an_old_guard_does_not_make_it_look_new() {
+        use crate::model::Actor;
+        type Annotate = fn(&Connection, i64);
+        let annotate: [(&str, Annotate); 3] = [
+            ("pin", |c, id| {
+                crate::store::set_pinned(c, id, true, Actor::Human, None).unwrap()
+            }),
+            ("anchor", |c, id| {
+                crate::anchors::set_anchors(c, id, &["Cargo.toml".into()]).unwrap()
+            }),
+            ("trigger", |c, id| {
+                crate::store::set_fires_when(c, id, &["borrow checker".into()]).unwrap()
+            }),
+        ];
+        for (what, annotate) in annotate {
+            let conn = db::open_in_memory().unwrap();
+            let g = remember(&conn, "watch the borrow checker", MemoryType::Gotcha, None);
+            let old_ts = now_unix() - 200 * 86_400;
+            conn.execute(
+                "UPDATE node SET updated_at = ?1, created_at = ?1 WHERE id = ?2",
+                [old_ts, g.id],
+            )
+            .unwrap();
+            annotate(&conn, g.id);
+            let node = crate::store::get_node(&conn, g.id).unwrap();
+            assert!(node.updated_at > old_ts, "{what}: the row was written");
+
+            let ranked = select(
+                &conn,
+                Scope::Global,
+                &HashSet::new(),
+                None,
+                &crate::config::Config::default(),
+                now_unix(),
+            )
+            .unwrap();
+            let brief = compose(&ranked, &BriefConfig::default(), 150, now_unix());
+            assert!(brief.text.contains("(6mo)"), "{what}: {}", brief.text);
+        }
     }
 
     /// Rendering: labels, ref, stale-age tag, pre-fill truncation bound.

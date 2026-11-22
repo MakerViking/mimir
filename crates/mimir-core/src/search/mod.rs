@@ -4,6 +4,28 @@
 //! is supplied) + an identifier-exact phrase leg (when the query text
 //! contains code-identifier-shaped fragments, e.g. `Foo::bar`). RRF is
 //! scale-free, so adding legs never requires re-tuning.
+//!
+//! # The `legs` a search returns
+//!
+//! The `*_with_legs` functions also hand back the ranked id lists the hits
+//! were fused from, for the callers that need to know why a hit ranked
+//! where it did (`inject`'s relevance floor, `strength`'s match label):
+//!
+//! - `legs[0]` is the lexical (FTS) leg: always present, possibly empty.
+//! - `legs[1]` is the vector leg, present only when one **ran** — a query
+//!   embedding was supplied *and* the leg ranked at least one node. A model
+//!   with nothing to compare the query against (nothing embedded yet,
+//!   vectors left over from another model, a dimension mismatch, a filter no
+//!   embedded node passes) yields no list at all, the same as no model.
+//!   An empty list would read as "the semantic retriever found nothing that
+//!   agrees", and a reader that requires agreement would then refuse every
+//!   hit on a store that answers fine with no model loaded.
+//! - The identifier leg feeds fusion and is never in `legs`: the two slots
+//!   above are fixed positions, and a third list would shift them.
+//!
+//! Readers ask [`vector_leg`] rather than indexing. "There is a `legs[1]`"
+//! and "a vector leg ran" are the same fact only because this module keeps
+//! them so.
 
 pub mod fts;
 pub mod vector;
@@ -71,6 +93,11 @@ pub struct SearchQuery {
     /// cache would mean carrying every tombstone in a hot in-memory matrix
     /// forever to serve a rare query; `mimir recall --as-of` says so in its
     /// output instead.
+    ///
+    /// A memory edited since `as_of` comes back with the title and body it
+    /// had then (`reword_as_of`). Both legs still match against the
+    /// current text — only the current text is indexed — so such a memory
+    /// is found by today's wording and shown in the old one.
     pub as_of: Option<i64>,
 }
 
@@ -95,6 +122,94 @@ pub(crate) fn scope_sql(scope: Scope) -> String {
         Scope::All => "1=1".into(),
         Scope::Global => "n.project_id IS NULL".into(),
         Scope::Project(id) => format!("(n.project_id = {id} OR n.project_id IS NULL)"),
+    }
+}
+
+/// What one search can reach: a scope for memories and a scope for
+/// everything else.
+///
+/// A [`Scope`] answers "which projects" with one project for every kind of
+/// node. That is right in every checkout but one. A git linked worktree
+/// reads its memories from its repository's project and its code and docs
+/// from its own (`Mimir::projects_for_cwd`), and a recall there is one
+/// ranked list drawn from both. Two searches merged afterwards would rank
+/// two fused lists against each other by scores that were never fused
+/// together, so the pair goes into the legs and there is one fusion.
+///
+/// `memories` is [`Kind::Memory`]. Every other kind a search returns
+/// answers to `code_and_docs`, because every one of them is derived from,
+/// or attached to, the files of one checkout: doc chunks, files and their
+/// collection, the annotation written on one of those (filed under its
+/// target's project), symbols, code chunks, communities.
+///
+/// The pair is asked in SQL by the lexical legs ([`Reach::sql`]) and in
+/// Rust by the vector leg, which filters cached rows ([`Reach::admits`]).
+/// The test `reach_has_one_answer_in_sql_and_rust` holds the two to one
+/// answer.
+///
+/// The functions that take a `Reach` (the `*_within` ones) read it instead
+/// of [`SearchQuery::scope`]; a caller of those sets the query's scope to
+/// `memories`, which is what the miss ledger keys a recall by. The
+/// functions without one pass [`Reach::uniform`] of the query's scope.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reach {
+    /// Where memories are read.
+    pub memories: Scope,
+    /// Where everything that is not a memory is read.
+    pub code_and_docs: Scope,
+}
+
+impl Reach {
+    /// One scope for every kind: what a bare [`Scope`] means.
+    pub fn uniform(scope: Scope) -> Reach {
+        Reach {
+            memories: scope,
+            code_and_docs: scope,
+        }
+    }
+
+    /// Whether memories and everything else are read in the same scope.
+    pub fn is_uniform(self) -> bool {
+        self.memories == self.code_and_docs
+    }
+
+    /// The scope a node of `kind` answers to.
+    pub fn scope_of(self, kind: Kind) -> Scope {
+        self.scope_of_kind_named(kind.as_str())
+    }
+
+    /// [`Reach::scope_of`] for a kind as the `node.kind` column spells it,
+    /// for a reader that has the column and no [`Kind`] (the vector leg's
+    /// cached rows). A spelling this build does not know is not a memory.
+    pub(crate) fn scope_of_kind_named(self, kind: &str) -> Scope {
+        if kind == Kind::Memory.as_str() {
+            self.memories
+        } else {
+            self.code_and_docs
+        }
+    }
+
+    /// Whether a node of `kind` owned by `project_id` (`None` = global) is
+    /// within reach. The Rust twin of [`Reach::sql`].
+    pub fn admits(self, kind: Kind, project_id: Option<i64>) -> bool {
+        self.scope_of(kind).admits(project_id)
+    }
+
+    /// SQL predicate (aliased table `n`) for this reach.
+    ///
+    /// A uniform reach is exactly [`scope_sql`] of its one scope, character
+    /// for character: outside a linked worktree a search runs the statement
+    /// it always ran, so no plan and no ranking can move there.
+    pub(crate) fn sql(self) -> String {
+        if self.is_uniform() {
+            return scope_sql(self.memories);
+        }
+        let memory = Kind::Memory.as_str();
+        format!(
+            "((n.kind = '{memory}' AND {}) OR (n.kind <> '{memory}' AND {}))",
+            scope_sql(self.memories),
+            scope_sql(self.code_and_docs)
+        )
     }
 }
 
@@ -182,19 +297,20 @@ pub fn search_hybrid_scored(
 }
 
 /// Same as [`search_hybrid`], but also returns the raw per-leg ranked id
-/// lists (`legs[0]` = FTS, `legs[1]` = vector iff `vector_query` was
-/// supplied) before RRF fusion. Used by callers that need to know *why* a
-/// hit ranked where it did — e.g. the auto-recall relevance floor, which
-/// requires lexical+semantic agreement on the top hit before injecting it
+/// lists before RRF fusion, in the shape the module docs describe (`legs[0]`
+/// lexical, `legs[1]` the vector leg when one ran — read it with
+/// [`vector_leg`]). Used by callers that need to know *why* a hit ranked
+/// where it did — e.g. the auto-recall relevance floor, which requires
+/// lexical+semantic agreement on the top hit before injecting it
 /// unprompted. `search_hybrid` is a thin wrapper over this so the scoring
 /// formula has one source of truth.
 ///
 /// A third, identifier-exact leg (see `fts::identifier_leg`) also feeds
 /// RRF fusion below when the query has an identifier-shaped fragment, but
-/// is deliberately NOT added to the returned `legs`: callers index it by
-/// fixed position (`legs[1]` == vector iff requested), and inserting a
-/// third leg would shift that when no vector leg exists. Folding it
-/// straight into `rrf` keeps `legs`'s shape exactly as documented above.
+/// is deliberately NOT added to the returned `legs`: the two slots are
+/// fixed positions, and inserting a third leg would shift them when no
+/// vector leg exists. Folding it straight into `rrf` keeps `legs`'s shape
+/// exactly as documented.
 ///
 /// No impression damp — see [`search_hybrid_with_legs_scored`] for that;
 /// this wrapper stays at the always-safe `alpha = 0.0` no-op so existing
@@ -223,16 +339,43 @@ pub fn search_hybrid_with_legs_scored(
     cache: &mut Option<vector::MatrixCache>,
     impression_alpha: f64,
 ) -> Result<(Vec<Hit>, Vec<Vec<i64>>)> {
+    search_hybrid_with_legs_scored_within(
+        conn,
+        query,
+        Reach::uniform(query.scope),
+        vector_query,
+        cache,
+        impression_alpha,
+    )
+}
+
+/// [`search_hybrid_with_legs_scored`] over a [`Reach`]: memories from one
+/// scope and everything else from another, in one fusion. Every leg filters
+/// by `reach`; `query.scope` is not read.
+pub fn search_hybrid_with_legs_scored_within(
+    conn: &Connection,
+    query: &SearchQuery,
+    reach: Reach,
+    vector_query: Option<(&str, &[f32])>,
+    cache: &mut Option<vector::MatrixCache>,
+    impression_alpha: f64,
+) -> Result<(Vec<Hit>, Vec<Vec<i64>>)> {
     let t_fts = std::time::Instant::now();
-    let mut legs: Vec<Vec<i64>> = vec![fts::leg(conn, query, LEG_CAP)?];
+    let mut legs: Vec<Vec<i64>> = vec![fts::leg_within(conn, query, reach, LEG_CAP)?];
     let fts_elapsed = t_fts.elapsed();
     let t_vec = std::time::Instant::now();
     if let Some((model, qvec)) = vector_query {
-        legs.push(vector::leg(conn, cache, model, qvec, query, LEG_CAP)?);
+        let leg = vector::leg_within(conn, cache, model, qvec, query, reach, LEG_CAP)?;
+        // A leg that ranked nothing did not run (see the module docs). It
+        // contributes nothing to fusion either way, so the hits are the
+        // same; what changes is that no reader mistakes it for a verdict.
+        if !leg.is_empty() {
+            legs.push(leg);
+        }
     }
     let vec_elapsed = t_vec.elapsed();
     let t_ident = std::time::Instant::now();
-    let ident_leg = fts::identifier_leg(conn, query, LEG_CAP)?;
+    let ident_leg = fts::identifier_leg_within(conn, query, reach, LEG_CAP)?;
     let ident_elapsed = t_ident.elapsed();
 
     let mut rrf: HashMap<i64, f64> = HashMap::new();
@@ -285,15 +428,14 @@ pub fn search_hybrid_with_legs_scored(
             // is the *max* of that (0,1] range, so applying it unconditionally
             // would hand every non-decaying kind a permanent boost relative to
             // every aging memory instead of leaving them recency-neutral.
-            let recency_term =
-                if crate::learn::half_life_days(node.kind, node.subkind.as_deref()).is_some() {
-                    1.0 + query.recency_alpha * crate::learn::recency_factor(&node, now)
-                } else {
-                    1.0
-                };
+            let recency_term = if crate::learn::node_half_life_days(&node).is_some() {
+                1.0 + query.recency_alpha * crate::learn::recency_factor(&node, now)
+            } else {
+                1.0
+            };
             // Optional type-priority boost (config scoring.type_prior_alpha):
             // gotcha/decision nudged over an equally-matching note/idea.
-            let prior = crate::learn::type_prior(node.subkind.as_deref());
+            let prior = crate::learn::node_type_prior(&node);
             let base = rrf[&node.id];
             // Code content dwarfs memories on a real corpus, so it needs a
             // damping multiplier to keep it from drowning out memories in
@@ -334,6 +476,11 @@ pub fn search_hybrid_with_legs_scored(
         seen.insert(hasher.finish())
     });
     hits.truncate(query.limit);
+    if let Some(at) = query.as_of {
+        for hit in &mut hits {
+            reword_as_of(conn, &mut hit.node, at)?;
+        }
+    }
     tracing::debug!(
         ?fts_elapsed,
         ?vec_elapsed,
@@ -344,6 +491,41 @@ pub fn search_hybrid_with_legs_scored(
         "search_hybrid: timing split"
     );
     Ok((hits, legs))
+}
+
+/// Give a memory the title and body it carried at `at`, when it has been
+/// edited since ([`crate::revision::text_at`]); otherwise leave it alone.
+///
+/// Applied to the page an as-of search returns, so every surface that
+/// prints a hit — the compact line, `--full`, `--json`, the MCP tool, the
+/// match-strength label — reads the wording of then without having to know
+/// to ask. An error is returned rather than swallowed: falling back to
+/// today's text under a past date is the confident wrong answer the
+/// revision table exists to prevent.
+///
+/// Only the text travels back. Retrieval itself still runs over the current
+/// index, so a memory is found by what it says now and shown as it read
+/// then; tags, links and the rest of the row are as they stand today.
+fn reword_as_of(conn: &Connection, node: &mut Node, at: i64) -> Result<()> {
+    if node.kind != Kind::Memory {
+        return Ok(());
+    }
+    if let Some(then) = crate::revision::text_at(conn, node.id, at)? {
+        node.title = then.title;
+        node.body = then.body;
+    }
+    Ok(())
+}
+
+/// The vector leg of a `legs` list, if one ran for that query — the one
+/// reading of the protocol in the module docs.
+///
+/// `None` covers every way of having no semantic ranking: no model, a
+/// BM25-only search, or a model with nothing usable to rank. An empty slot
+/// counts as `None` too, so legs assembled by hand cannot smuggle the
+/// "ran, found nothing" state back in.
+pub fn vector_leg(legs: &[Vec<i64>]) -> Option<&[i64]> {
+    legs.get(1).map(Vec::as_slice).filter(|leg| !leg.is_empty())
 }
 
 #[cfg(test)]
@@ -481,6 +663,88 @@ mod tests {
         assert_eq!(hits[0].node.id, old);
     }
 
+    /// As-of recall says it shows "what the store held then". For a memory
+    /// edited since, that is the wording it had then: `memory::edit` keeps
+    /// it for exactly this query, and until something read it the answer
+    /// was today's text under a past date.
+    #[test]
+    fn as_of_shows_the_wording_a_memory_had_then() {
+        use crate::memory::{self, Edit};
+        let conn = db::open_in_memory().unwrap();
+        let id = add(
+            &conn,
+            Kind::Memory,
+            None,
+            "deploy region is eu-west-1",
+            "deploy region is eu-west-1",
+        )
+        .id;
+        conn.execute("UPDATE node SET created_at = 1000 WHERE id = ?1", [id])
+            .unwrap();
+        // Edited now, long after the instant asked about below.
+        memory::edit(
+            &conn,
+            id,
+            Edit {
+                text: Some("deploy region is eu-north-1".into()),
+                ..Default::default()
+            },
+            crate::model::Actor::Human,
+            None,
+        )
+        .unwrap();
+        let untouched = add(
+            &conn,
+            Kind::Memory,
+            None,
+            "deploy region for staging",
+            "deploy region for staging is local",
+        )
+        .id;
+        conn.execute(
+            "UPDATE node SET created_at = 1000 WHERE id = ?1",
+            [untouched],
+        )
+        .unwrap();
+        let text_of = |hits: &[Hit], id: i64| {
+            let hit = hits.iter().find(|h| h.node.id == id).expect("hit present");
+            (
+                hit.node.title.clone().unwrap(),
+                hit.node.body.clone().unwrap(),
+            )
+        };
+
+        let now_hits = search(&conn, &q("deploy region")).unwrap();
+        assert_eq!(
+            text_of(&now_hits, id).1,
+            "deploy region is eu-north-1",
+            "the present tense reads the current text"
+        );
+
+        let mut then = q("deploy region");
+        then.as_of = Some(2000);
+        let then_hits = search(&conn, &then).unwrap();
+        assert_eq!(
+            text_of(&then_hits, id),
+            (
+                "deploy region is eu-west-1".to_string(),
+                "deploy region is eu-west-1".to_string()
+            ),
+            "as of 2000 it still said eu-west-1"
+        );
+        assert_eq!(
+            text_of(&then_hits, untouched).1,
+            "deploy region for staging is local",
+            "a memory never edited since keeps its one wording"
+        );
+
+        // Asked about an instant after the edit, the edit is what was held.
+        let mut later = q("deploy region");
+        later.as_of = Some(crate::model::now_unix() + 60);
+        let later_hits = search(&conn, &later).unwrap();
+        assert_eq!(text_of(&later_hits, id).1, "deploy region is eu-north-1");
+    }
+
     /// Valid time and transaction time are different axes. Declaring that a
     /// fact stopped being true must not hide it — that is what `expires_at`
     /// is for, and conflating them would make the label unusable.
@@ -498,6 +762,62 @@ mod tests {
         );
         assert_eq!(hits[0].node.valid_at(1_600_000_000), Some(true));
         assert_eq!(hits[0].node.valid_at(1_800_000_000), Some(false));
+    }
+
+    /// The `legs` protocol from the module docs, end to end: a vector slot
+    /// exists exactly when the vector leg ranked something.
+    #[test]
+    fn a_vector_leg_is_reported_only_when_it_ranked_something() {
+        let conn = db::open_in_memory().unwrap();
+        let id = add(&conn, Kind::Memory, None, "gamma runbook", "restart it").id;
+        let embedded_as = |model: &str, vec: &[f32]| {
+            conn.execute(
+                "INSERT OR REPLACE INTO embedding (node_id, model, dim, vec, content_hash)
+                 VALUES (?1, ?2, ?3, ?4, x'00')",
+                rusqlite::params![id, model, vec.len() as i64, crate::embed::to_blob(vec)],
+            )
+            .unwrap();
+        };
+        let legs_for = |query: &SearchQuery, vector_query: Option<(&str, &[f32])>| {
+            search_hybrid_with_legs(&conn, query, vector_query, &mut None)
+                .unwrap()
+                .1
+        };
+        let query = q("gamma runbook");
+        let live: (&str, &[f32]) = ("live", &[1.0, 0.0]);
+
+        assert_eq!(legs_for(&query, None), vec![vec![id]], "no model");
+        assert_eq!(
+            legs_for(&query, Some(live)),
+            vec![vec![id]],
+            "a model, nothing embedded"
+        );
+        embedded_as("retired", &[1.0, 0.0]);
+        assert_eq!(
+            legs_for(&query, Some(live)),
+            vec![vec![id]],
+            "vectors from another model"
+        );
+        embedded_as("live", &[1.0, 0.0, 0.0]);
+        assert_eq!(
+            legs_for(&query, Some(live)),
+            vec![vec![id]],
+            "a dimension the query does not have"
+        );
+        embedded_as("live", &[1.0, 0.0]);
+        let mut docs_only = q("gamma runbook");
+        docs_only.kinds = vec![Kind::Chunk];
+        assert_eq!(
+            legs_for(&docs_only, Some(live)),
+            vec![Vec::<i64>::new()],
+            "a filter no embedded node passes; the lexical slot stays, empty"
+        );
+
+        let legs = legs_for(&query, Some(live));
+        assert_eq!(legs, vec![vec![id], vec![id]], "the leg ran");
+        assert_eq!(vector_leg(&legs), Some(&[id][..]));
+        assert_eq!(vector_leg(&legs[..1]), None);
+        assert_eq!(vector_leg(&[vec![id], vec![]]), None);
     }
 
     #[test]
@@ -647,6 +967,366 @@ mod tests {
         query.scope = Scope::Project(project.id + 999);
         let hits = search(&conn, &query).unwrap();
         assert_eq!(hits.len(), 1); // only the global one leaks across projects
+    }
+
+    /// Every scope shape a half of a reach can take, over two projects.
+    fn scope_shapes(a: i64, b: i64) -> [Scope; 4] {
+        [
+            Scope::All,
+            Scope::Global,
+            Scope::Project(a),
+            Scope::Project(b),
+        ]
+    }
+
+    /// What a search can reach is asked in SQL by the lexical legs and in
+    /// Rust by the vector leg. Hold both to one answer: every kind of node,
+    /// owned by each of three projects and by none, under every pair of
+    /// scopes. And a uniform pair is the old predicate, character for
+    /// character, so a search outside a linked worktree runs the statement
+    /// it always ran.
+    #[test]
+    fn reach_has_one_answer_in_sql_and_rust() {
+        let conn = db::open_in_memory().unwrap();
+        let project = |path: &str| store::ensure_project(&conn, path, "p").unwrap().id;
+        let (a, b, c) = (project("/abs/a"), project("/abs/b"), project("/abs/c"));
+        let mut nodes = Vec::new();
+        for kind in Kind::ALL {
+            for owner in [None, Some(a), Some(b), Some(c)] {
+                nodes.push(add(&conn, *kind, owner, "a node", "of some kind"));
+            }
+        }
+
+        let mut split_pairs = 0;
+        for memories in scope_shapes(a, b) {
+            for code_and_docs in scope_shapes(a, b) {
+                let reach = Reach {
+                    memories,
+                    code_and_docs,
+                };
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT n.id FROM node n WHERE {} ORDER BY n.id",
+                        reach.sql()
+                    ))
+                    .unwrap();
+                let in_sql: Vec<i64> = stmt
+                    .query_map([], |r| r.get(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<_>>()
+                    .unwrap();
+                // The fixture nodes, and the three project rows themselves
+                // (kind `project`, owned by nobody).
+                let in_rust: Vec<i64> = [a, b, c]
+                    .into_iter()
+                    .filter(|_| reach.admits(Kind::Project, None))
+                    .chain(
+                        nodes
+                            .iter()
+                            .filter(|n| reach.admits(n.kind, n.project_id))
+                            .map(|n| n.id),
+                    )
+                    .collect();
+                assert_eq!(in_sql, in_rust, "{reach:?}");
+
+                if reach.is_uniform() {
+                    assert_eq!(reach, Reach::uniform(memories));
+                    assert_eq!(reach.sql(), scope_sql(memories), "{reach:?}");
+                } else {
+                    split_pairs += 1;
+                    assert_ne!(reach.sql(), scope_sql(memories), "{reach:?}");
+                    assert_ne!(reach.sql(), scope_sql(code_and_docs), "{reach:?}");
+                }
+            }
+        }
+        assert_eq!(split_pairs, 12, "every pair of different scopes was asked");
+
+        // The pair a linked worktree has, spelled out once.
+        let worktree = Reach {
+            memories: Scope::Project(a),
+            code_and_docs: Scope::Project(b),
+        };
+        for kind in Kind::ALL {
+            let is_memory = *kind == Kind::Memory;
+            assert_eq!(worktree.admits(*kind, Some(a)), is_memory, "{kind}");
+            assert_eq!(worktree.admits(*kind, Some(b)), !is_memory, "{kind}");
+            assert!(!worktree.admits(*kind, Some(c)), "{kind}");
+            assert!(worktree.admits(*kind, None), "{kind}: global is in reach");
+            assert_eq!(
+                worktree.scope_of(*kind),
+                worktree.scope_of_kind_named(kind.as_str())
+            );
+        }
+        assert_eq!(
+            worktree.scope_of_kind_named("a-kind-from-a-newer-build"),
+            worktree.code_and_docs
+        );
+    }
+
+    /// A linked worktree's store: the repository's project (`home`) holds
+    /// the memories and the main checkout's own code and docs; the
+    /// worktree's project (`own`) holds the code and docs of its branch.
+    /// Every node says "quorum", so one query finds whatever is in reach.
+    struct TwoProjects {
+        home: i64,
+        own: i64,
+        /// title → id, for every node of the fixture.
+        ids: HashMap<&'static str, i64>,
+    }
+
+    impl TwoProjects {
+        fn new(conn: &Connection) -> TwoProjects {
+            let home = store::ensure_project(conn, "/repo/main", "main")
+                .unwrap()
+                .id;
+            let own = store::ensure_project(conn, "/repo/wt", "wt").unwrap().id;
+            let other = store::ensure_project(conn, "/elsewhere", "other")
+                .unwrap()
+                .id;
+            let fixture: [(&'static str, Kind, Option<i64>); 12] = [
+                ("home memory", Kind::Memory, Some(home)),
+                ("global memory", Kind::Memory, None),
+                ("stray memory", Kind::Memory, Some(own)),
+                ("other memory", Kind::Memory, Some(other)),
+                ("own symbol", Kind::Symbol, Some(own)),
+                ("own doc", Kind::Chunk, Some(own)),
+                ("own code", Kind::CodeChunk, Some(own)),
+                ("global doc", Kind::Chunk, None),
+                ("home symbol", Kind::Symbol, Some(home)),
+                ("home doc", Kind::Chunk, Some(home)),
+                ("home code", Kind::CodeChunk, Some(home)),
+                ("other symbol", Kind::Symbol, Some(other)),
+            ];
+            let ids = fixture
+                .into_iter()
+                .map(|(title, kind, owner)| {
+                    let body = format!("quorum loss, as the {title} tells it");
+                    (title, add(conn, kind, owner, title, &body).id)
+                })
+                .collect();
+            TwoProjects { home, own, ids }
+        }
+
+        fn reach(&self) -> Reach {
+            Reach {
+                memories: Scope::Project(self.home),
+                code_and_docs: Scope::Project(self.own),
+            }
+        }
+
+        /// The fixture titles behind `ids`, sorted.
+        fn titles(&self, ids: impl IntoIterator<Item = i64>) -> Vec<&'static str> {
+            let mut titles: Vec<&'static str> = ids
+                .into_iter()
+                .map(|id| {
+                    *self
+                        .ids
+                        .iter()
+                        .find(|(_, known)| **known == id)
+                        .map(|(title, _)| title)
+                        .expect("a fixture node")
+                })
+                .collect();
+            titles.sort_unstable();
+            titles
+        }
+    }
+
+    /// The decision in one query: the repository's memories and the
+    /// worktree's own symbols, docs and code come back together, fused once;
+    /// the main checkout's symbols, docs and code do not, and neither does a
+    /// memory filed under the worktree's own row or anything of a third
+    /// project.
+    #[test]
+    fn one_search_reads_memories_from_one_project_and_code_and_docs_from_another() {
+        let conn = db::open_in_memory().unwrap();
+        let store = TwoProjects::new(&conn);
+        let mut query = q("quorum");
+        query.limit = 50;
+        query.scope = Scope::Project(store.home);
+        let within = |query: &SearchQuery| {
+            let (hits, legs) = search_hybrid_with_legs_scored_within(
+                &conn,
+                query,
+                store.reach(),
+                None,
+                &mut None,
+                0.0,
+            )
+            .unwrap();
+            (
+                store.titles(hits.iter().map(|h| h.node.id)),
+                store.titles(legs[0].iter().copied()),
+            )
+        };
+
+        let (hits, lexical_leg) = within(&query);
+        assert_eq!(
+            hits,
+            [
+                "global doc",
+                "global memory",
+                "home memory",
+                "own code",
+                "own doc",
+                "own symbol",
+            ]
+        );
+        assert_eq!(
+            lexical_leg, hits,
+            "the leg itself is filtered, not the page"
+        );
+
+        // The kind filters `recall --kind` offers, each on its own half.
+        query.kinds = vec![Kind::Symbol, Kind::CodeChunk];
+        assert_eq!(within(&query).0, ["own code", "own symbol"], "--kind code");
+        query.kinds = vec![Kind::File, Kind::Chunk, Kind::Annotation];
+        assert_eq!(within(&query).0, ["global doc", "own doc"], "--kind doc");
+        query.kinds = vec![Kind::Memory];
+        assert_eq!(
+            within(&query).0,
+            ["global memory", "home memory"],
+            "--kind memory"
+        );
+
+        // Through the functions that take no reach, the query's scope is
+        // the scope of everything, as it always was.
+        query.kinds = vec![];
+        let uniform = |scope: Scope| {
+            let mut query = query.clone();
+            query.scope = scope;
+            store.titles(search(&conn, &query).unwrap().iter().map(|h| h.node.id))
+        };
+        assert_eq!(
+            uniform(Scope::Project(store.home)),
+            [
+                "global doc",
+                "global memory",
+                "home code",
+                "home doc",
+                "home memory",
+                "home symbol",
+            ]
+        );
+        assert_eq!(
+            uniform(Scope::Project(store.own)),
+            [
+                "global doc",
+                "global memory",
+                "own code",
+                "own doc",
+                "own symbol",
+                "stray memory",
+            ]
+        );
+    }
+
+    /// The identifier leg is not in `legs`, so it is asked directly: a
+    /// symbol named in the query is found in the worktree's graph and not
+    /// in the main checkout's.
+    #[test]
+    fn the_identifier_leg_reads_the_same_reach() {
+        let conn = db::open_in_memory().unwrap();
+        let store = TwoProjects::new(&conn);
+        let named = |owner: i64, title: &str| {
+            add(
+                &conn,
+                Kind::Symbol,
+                Some(owner),
+                title,
+                "fn retry_with_backoff()",
+            )
+            .id
+        };
+        let in_worktree = named(store.own, "retry_with_backoff in the worktree");
+        let in_main = named(store.home, "retry_with_backoff in main");
+        let query = q("how does retry_with_backoff decide");
+
+        let within = fts::identifier_leg_within(&conn, &query, store.reach(), LEG_CAP).unwrap();
+        assert_eq!(within, [in_worktree]);
+        let mut everywhere = fts::identifier_leg(&conn, &query, LEG_CAP).unwrap();
+        everywhere.sort_unstable();
+        assert_eq!(everywhere, [in_worktree, in_main], "uniform: `Scope::All`");
+
+        // And it is that leg, with that reach, the fusion is fed: the main
+        // checkout's symbol does not come back through it.
+        let (hits, _) = search_hybrid_with_legs_scored_within(
+            &conn,
+            &query,
+            store.reach(),
+            None,
+            &mut None,
+            0.0,
+        )
+        .unwrap();
+        let found: Vec<i64> = hits.iter().map(|h| h.node.id).collect();
+        assert!(found.contains(&in_worktree), "{found:?}");
+        assert!(!found.contains(&in_main), "{found:?}");
+    }
+
+    /// The vector leg filters cached rows in Rust; it has to admit the same
+    /// nodes the lexical leg's SQL does. Every node carries the same
+    /// vector, so the leg ranks whatever its filter lets through.
+    #[test]
+    fn the_vector_leg_reads_the_same_reach() {
+        let conn = db::open_in_memory().unwrap();
+        let store = TwoProjects::new(&conn);
+        for id in store.ids.values() {
+            conn.execute(
+                "INSERT INTO embedding (node_id, model, dim, vec, content_hash)
+                 VALUES (?1, 'live', 2, ?2, x'00')",
+                rusqlite::params![id, crate::embed::to_blob(&[1.0, 0.0])],
+            )
+            .unwrap();
+        }
+        let mut query = q("quorum");
+        query.limit = 50;
+        let live: (&str, &[f32]) = ("live", &[1.0, 0.0]);
+        let mut cache = None;
+
+        let (hits, legs) = search_hybrid_with_legs_scored_within(
+            &conn,
+            &query,
+            store.reach(),
+            Some(live),
+            &mut cache,
+            0.0,
+        )
+        .unwrap();
+        let in_reach = [
+            "global doc",
+            "global memory",
+            "home memory",
+            "own code",
+            "own doc",
+            "own symbol",
+        ];
+        let semantic = vector_leg(&legs).expect("the vector leg ran");
+        assert_eq!(store.titles(semantic.iter().copied()), in_reach);
+        assert_eq!(store.titles(legs[0].iter().copied()), in_reach);
+        assert_eq!(store.titles(hits.iter().map(|h| h.node.id)), in_reach);
+
+        // A kind filter narrows each half and never crosses to the other.
+        query.kinds = vec![Kind::Symbol, Kind::CodeChunk];
+        let leg = vector::leg_within(&conn, &mut cache, "live", live.1, &query, store.reach(), 50)
+            .unwrap();
+        assert_eq!(store.titles(leg), ["own code", "own symbol"]);
+
+        // The leg that takes no reach filters by the query's scope alone.
+        query.kinds = vec![];
+        query.scope = Scope::Project(store.home);
+        let leg = vector::leg(&conn, &mut cache, "live", live.1, &query, 50).unwrap();
+        assert_eq!(
+            store.titles(leg),
+            [
+                "global doc",
+                "global memory",
+                "home code",
+                "home doc",
+                "home memory",
+                "home symbol",
+            ]
+        );
     }
 
     #[test]

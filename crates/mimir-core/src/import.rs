@@ -30,9 +30,31 @@ struct Incoming {
     created_at: Option<i64>,
 }
 
+/// Is this exact text held by any memory that was not deleted, whatever its
+/// state?
+fn already_stored(conn: &Connection, text: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM node
+                        WHERE kind = 'memory' AND content_hash = ?1 AND deleted_at IS NULL)",
+        [memory::content_hash(text)],
+        |r| r.get(0),
+    )?)
+}
+
 fn store_all(conn: &Connection, items: Vec<Incoming>) -> Result<ImportStats> {
     let mut stats = ImportStats::default();
     for item in items {
+        // "Re-running an import never duplicates" is a stronger promise than
+        // capture makes. `remember` lets a person state again a fact whose
+        // old copy was superseded or expired; an import file is not a
+        // person restating anything, it is the same text arriving again, and
+        // the copy this store retired must stay retired. So the import
+        // treats every stored copy as a duplicate, current or not. (A copy
+        // that was forgotten is `remember`'s own refusal, below.)
+        if already_stored(conn, &item.text)? {
+            stats.skipped_duplicates += 1;
+            continue;
+        }
         let outcome = memory::remember(
             conn,
             Remember {
@@ -50,9 +72,17 @@ fn store_all(conn: &Connection, items: Vec<Incoming>) -> Result<ImportStats> {
         )?;
         match outcome {
             RememberOutcome::Created(node) => {
+                // Only `created_at` takes the date the note was written.
+                // `updated_at` stays at the moment of the import, because
+                // that is when this row changed in *this* store, and two
+                // things read it as exactly that: sync pushes rows changed
+                // since its cursor (a row backdated behind the cursor was
+                // never sent), and the decay pass leaves alone what changed
+                // recently (a backdated import was archived by the very next
+                // weekly pass, before anyone had a chance to recall it).
                 if let Some(at) = item.created_at {
                     conn.execute(
-                        "UPDATE node SET created_at = ?2, updated_at = ?2 WHERE id = ?1",
+                        "UPDATE node SET created_at = ?2 WHERE id = ?1",
                         rusqlite::params![node.id, at],
                     )?;
                 }
@@ -263,6 +293,19 @@ pub fn export_jsonl(conn: &Connection, out: &mut dyn std::io::Write) -> Result<u
         .query_map([], row_to_node)?
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
+    // `superseded_by` is a rowid, which means nothing outside this file's
+    // store; the replacement is named by uid, as on the sync wire. Without
+    // it a restored backup has the `supersedes` edges and every retired
+    // memory live again — the edge is a rendering of the column, not a
+    // source for it.
+    let mut stmt = conn.prepare(
+        "SELECT m.id, r.uid FROM node m JOIN node r ON r.id = m.superseded_by
+         WHERE m.deleted_at IS NULL",
+    )?;
+    let replaced_by: std::collections::HashMap<i64, String> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
     for n in &nodes {
         let line = serde_json::json!({
             "type": "node", "uid": n.uid, "kind": n.kind.as_str(),
@@ -272,6 +315,7 @@ pub fn export_jsonl(conn: &Connection, out: &mut dyn std::io::Write) -> Result<u
             "meta": n.meta, "created_at": n.created_at,
             "updated_at": n.updated_at, "strength": n.strength,
             "pinned": n.pinned, "access_count": n.access_count,
+            "superseded_by": replaced_by.get(&n.id),
         });
         writeln!(out, "{line}").map_err(|e| Error::Invalid(format!("write: {e}")))?;
         count += 1;
@@ -309,6 +353,74 @@ mod tests {
     use super::*;
     use crate::db;
 
+    /// An import keeps the date a note was written and still counts as a
+    /// change made now. Backdating `updated_at` as well put the row behind
+    /// the sync cursor (it was never pushed) and made it old enough for the
+    /// next weekly decay pass to archive on sight.
+    #[test]
+    fn an_import_is_dated_when_written_and_changed_when_imported() {
+        let conn = db::open_in_memory().unwrap();
+        let before = crate::model::now_unix();
+        let export = "1 recent thought(s):\n\n\
+1. [1/15/2024] (idea)\n   Build a thing that does stuff.\n";
+        assert_eq!(openbrain(&conn, export).unwrap().imported, 1);
+
+        let (created, updated): (i64, i64) = conn
+            .query_row(
+                "SELECT created_at, updated_at FROM node WHERE kind = 'memory'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            created < before - 365 * 86_400,
+            "written in 2024: {created}"
+        );
+        assert!(
+            updated >= before,
+            "changed in this store just now: {updated}"
+        );
+
+        // Sync sends it: it changed after any cursor cut before the import.
+        let batch = crate::replicate::changes_since(&conn, before - 1).unwrap();
+        assert_eq!(batch.nodes.len(), 1);
+
+        // And the decay pass does not archive it on its first run.
+        let report = crate::consolidate::consolidate(&conn, "test-model", false).unwrap();
+        assert_eq!(report.archived, 0, "{report:?}");
+    }
+
+    /// Re-running an import never duplicates, including what this store has
+    /// since retired. Capture lets a person restate a superseded fact; an
+    /// import file arriving again is not that, and re-created the retired
+    /// copy on every run.
+    #[test]
+    fn re_importing_does_not_bring_back_what_was_superseded() {
+        let conn = db::open_in_memory().unwrap();
+        let export = "2 recent thought(s):\n\n\
+1. [6/11/2026] (observation - deploys)\n   Deploys go out on fridays.\n\n\
+2. [6/12/2026] (observation - deploys)\n   Release trains leave on tuesdays only.\n";
+        assert_eq!(openbrain(&conn, export).unwrap().imported, 2);
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM node WHERE kind = 'memory' ORDER BY created_at")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        crate::store::supersede(&conn, ids[0], ids[1], crate::model::Actor::Human, None).unwrap();
+
+        let again = openbrain(&conn, export).unwrap();
+
+        assert_eq!((again.imported, again.skipped_duplicates), (0, 2));
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM node WHERE kind = 'memory'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 2);
+    }
+
     #[test]
     fn openbrain_round_trip() {
         let conn = db::open_in_memory().unwrap();
@@ -335,6 +447,34 @@ mod tests {
         assert_eq!(subkind, "insight");
         assert!(tags.contains("rust") && tags.contains("mcp"));
         assert_eq!(crate::format::full_date(created), "2026-06-11");
+    }
+
+    /// A backup that drops which memories were retired restores them all as
+    /// current. The node line names the replacement by uid.
+    #[test]
+    fn export_names_the_replacement_of_a_superseded_memory() {
+        use crate::model::{Actor, Kind, NewNode, Rel};
+        let conn = db::open_in_memory().unwrap();
+        let memory = |body: &str| {
+            let mut new = NewNode::new(Kind::Memory);
+            new.body = Some(body.into());
+            crate::store::insert_node(&conn, new).unwrap()
+        };
+        let old = memory("the cert is renewed by hand");
+        let new = memory("the cert renews itself through ACME");
+        crate::store::set_superseded(&conn, old.id, new.id, Actor::Human, None).unwrap();
+        crate::store::link(&conn, new.id, old.id, Rel::Supersedes, 1.0).unwrap();
+
+        let mut out = Vec::new();
+        export_jsonl(&conn, &mut out).unwrap();
+        let lines: Vec<serde_json::Value> = String::from_utf8(out)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let node = |uid: &str| lines.iter().find(|l| l["uid"] == uid).unwrap();
+        assert_eq!(node(&old.uid)["superseded_by"], new.uid.as_str());
+        assert!(node(&new.uid)["superseded_by"].is_null());
     }
 
     #[test]

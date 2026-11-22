@@ -17,12 +17,80 @@ use crate::error::{Error, Result};
 use crate::model::{now_unix, Kind, NewNode, Node};
 use crate::store::{self, row_to_node, NODE_COLS};
 
+/// What a collection holds, which decides how its root is walked and how
+/// its files are chunked: `Docs` is markdown chunked by heading, `Code` is
+/// source chunked by tree-sitter symbol (see `chunker::chunk_source`).
+///
+/// Recorded as text in the collection node's `meta.kind`. This is the one
+/// place that text is written from and read back into, so a kind is one of
+/// these two or it is refused — it cannot be a third string that every
+/// reader then has to have an opinion about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CollectionKind {
+    Docs,
+    Code,
+}
+
+impl CollectionKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollectionKind::Docs => "docs",
+            CollectionKind::Code => "code",
+        }
+    }
+
+    /// The kind of an existing collection node. A collection registered
+    /// before the field existed has none and is `Docs`; so is one whose
+    /// stored kind is not a word this build knows, because that is how such
+    /// a row has always been indexed.
+    pub fn of(collection: &Node) -> CollectionKind {
+        collection
+            .meta
+            .get("kind")
+            .and_then(|v| v.as_str())
+            .and_then(|text| text.parse().ok())
+            .unwrap_or(CollectionKind::Docs)
+    }
+}
+
+impl std::str::FromStr for CollectionKind {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "docs" => Ok(CollectionKind::Docs),
+            "code" => Ok(CollectionKind::Code),
+            other => Err(Error::Invalid(format!(
+                "unknown collection kind '{other}' (docs|code)"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for CollectionKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Register (or return the existing) collection for a docs root.
 ///
-/// `kind` is the collection's content type — "docs" (markdown, chunked by
-/// heading) or "code" (source, chunked by tree-sitter symbol; see
-/// `chunker::chunk_source`) — recorded in `meta.kind` and read back by
-/// `index_collection` to pick the walk filter and chunker.
+/// `kind` is the collection's content type — "docs" or "code", parsed into
+/// a [`CollectionKind`]; anything else is refused. See
+/// [`add_collection_of_kind`], which this forwards to.
+pub fn add_collection(
+    conn: &Connection,
+    root: &Path,
+    name: &str,
+    project_id: Option<i64>,
+    kind: &str,
+) -> Result<Node> {
+    add_collection_of_kind(conn, root, name, project_id, kind.parse()?)
+}
+
+/// Register (or return the existing) collection of `kind` for a root.
+///
+/// The kind is recorded in `meta.kind` and read back by `index_collection`
+/// to pick the walk filter and chunker.
 ///
 /// Collections are keyed by (path, kind), not path alone: a docs collection
 /// and a code collection can coexist at the same root (they walk disjoint
@@ -30,13 +98,14 @@ use crate::store::{self, row_to_node, NODE_COLS};
 /// what `mimir code add <root>` on a root already auto-registered for docs
 /// needs. Re-adding the same (path, kind) returns the existing node
 /// unchanged; a different kind at an already-registered path creates a
-/// second, independent collection rather than silently no-opping.
-pub fn add_collection(
+/// second, independent collection rather than silently no-opping. Looking
+/// one up again is [`find_collections`], which takes the same pair.
+pub fn add_collection_of_kind(
     conn: &Connection,
     root: &Path,
     name: &str,
     project_id: Option<i64>,
-    kind: &str,
+    kind: CollectionKind,
 ) -> Result<Node> {
     if !root.is_dir() {
         return Err(Error::Invalid(format!(
@@ -45,17 +114,9 @@ pub fn add_collection(
         )));
     }
     let canonical = crate::scope::canonical_root(root);
-    let existing = conn
-        .query_row(
-            &format!(
-                "SELECT {NODE_COLS} FROM node
-                 WHERE kind = 'collection' AND path = ?1 AND deleted_at IS NULL
-                 AND COALESCE(json_extract(meta, '$.kind'), 'docs') = ?2"
-            ),
-            params![&canonical, kind],
-            row_to_node,
-        )
-        .optional()?;
+    let existing = live_collections(conn, "path", &canonical)?
+        .into_iter()
+        .find(|node| CollectionKind::of(node) == kind);
     if let Some(node) = existing {
         return Ok(node);
     }
@@ -63,19 +124,15 @@ pub fn add_collection(
     new.title = Some(name.to_string());
     new.path = Some(canonical);
     new.project_id = project_id;
-    new.meta = Some(serde_json::json!({ "kind": kind }));
+    new.meta = Some(serde_json::json!({ "kind": kind.as_str() }));
     store::insert_node(conn, new)
 }
 
-/// A collection's content type, as recorded by `add_collection`. Absent
-/// (pre-existing collections indexed before this field existed) defaults
-/// to "docs" so old collections keep behaving exactly as before.
-fn collection_kind(collection: &Node) -> &str {
-    collection
-        .meta
-        .get("kind")
-        .and_then(|v| v.as_str())
-        .unwrap_or("docs")
+/// A collection's content type as the word `meta.kind` uses for it — how
+/// the tests below spell their expectations; see [`CollectionKind::of`].
+#[cfg(test)]
+fn collection_kind(collection: &Node) -> &'static str {
+    CollectionKind::of(collection).as_str()
 }
 
 pub fn list_collections(conn: &Connection) -> Result<Vec<Node>> {
@@ -89,32 +146,59 @@ pub fn list_collections(conn: &Connection) -> Result<Vec<Node>> {
     Ok(rows)
 }
 
-/// Find a collection by name or by (canonical) path.
-pub fn find_collection(conn: &Connection, reference: &str) -> Result<Node> {
-    let by_name = conn
-        .query_row(
-            &format!(
-                "SELECT {NODE_COLS} FROM node
-                 WHERE kind = 'collection' AND title = ?1 AND deleted_at IS NULL"
-            ),
-            [reference],
-            row_to_node,
-        )
-        .optional()?;
-    if let Some(node) = by_name {
-        return Ok(node);
+/// Live collections whose `column` (`title` or `path`) equals `value`,
+/// oldest first.
+fn live_collections(conn: &Connection, column: &str, value: &str) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} FROM node
+         WHERE kind = 'collection' AND {column} = ?1 AND deleted_at IS NULL
+         ORDER BY id"
+    ))?;
+    let rows = stmt
+        .query_map([value], row_to_node)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(rows)
+}
+
+/// Every live collection `reference` names, oldest first: by name, or
+/// failing that by (canonical) path — and, when `kind` is given, of that
+/// kind only.
+///
+/// More than one can match. A docs and a code collection may share a root
+/// (see [`add_collection_of_kind`]) and usually share the name derived from
+/// it, so a name or a path alone does not identify a collection; the pair
+/// with its kind does. Callers that mean one kind say so, and callers that
+/// mean "whatever is registered here" get all of it rather than whichever
+/// row came first.
+pub fn find_collections(
+    conn: &Connection,
+    reference: &str,
+    kind: Option<CollectionKind>,
+) -> Result<Vec<Node>> {
+    let of_kind = |nodes: Vec<Node>| -> Vec<Node> {
+        nodes
+            .into_iter()
+            .filter(|node| kind.is_none_or(|kind| CollectionKind::of(node) == kind))
+            .collect()
+    };
+    let by_name = of_kind(live_collections(conn, "title", reference)?);
+    if !by_name.is_empty() {
+        return Ok(by_name);
     }
     let canonical = crate::scope::canonical_root(Path::new(reference));
-    conn.query_row(
-        &format!(
-            "SELECT {NODE_COLS} FROM node
-             WHERE kind = 'collection' AND path = ?1 AND deleted_at IS NULL"
-        ),
-        [&canonical],
-        row_to_node,
-    )
-    .optional()?
-    .ok_or_else(|| Error::NotFound(format!("collection '{reference}'")))
+    Ok(of_kind(live_collections(conn, "path", &canonical)?))
+}
+
+/// Find a collection by name or by (canonical) path: the oldest match of
+/// [`find_collections`] across both kinds. Unambiguous only while one
+/// collection answers to `reference`; a caller that can meet a docs and a
+/// code collection on one root should ask `find_collections` for the kind
+/// it means.
+pub fn find_collection(conn: &Connection, reference: &str) -> Result<Node> {
+    find_collections(conn, reference, None)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::NotFound(format!("collection '{reference}'")))
 }
 
 /// (file_count, chunk_count) of live nodes in a collection.
@@ -147,10 +231,15 @@ pub fn remove_collection(conn: &Connection, collection_id: i64) -> Result<()> {
 }
 
 /// Attach a qmd-style context note to a collection or file node.
+///
+/// The note carries its body hash from the start, like the chunks beside
+/// it: an annotation is embeddable, and a node without a hash is one the
+/// embedder cannot tell from "content changed since it was embedded".
 pub fn annotate(conn: &Connection, target: &Node, text: &str) -> Result<Node> {
     let mut new = NewNode::new(Kind::Annotation);
     new.title = Some(crate::memory::derive_title(text));
     new.body = Some(text.to_string());
+    new.content_hash = Some(blake3::hash(text.as_bytes()).as_bytes().to_vec());
     new.project_id = target.project_id;
     new.collection_id = match target.kind {
         Kind::Collection => Some(target.id),
@@ -257,7 +346,7 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
 
     let mut stats = IndexStats::default();
     let mut seen: HashSet<String> = HashSet::new();
-    let is_code = collection_kind(collection) == "code";
+    let is_code = CollectionKind::of(collection) == CollectionKind::Code;
     let mut walk = ignore::WalkBuilder::new(root);
     // The plain-text/config fallback (below) whitelists a few dotfiles
     // (`.env.example`), which `ignore`'s default hidden-file filter would
@@ -415,11 +504,15 @@ pub fn index_collection(conn: &mut Connection, collection: &Node) -> Result<Inde
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let file_id = match &existing {
             Some(f) => {
+                // `lang` with the rest: it is worked out from this scan like
+                // the hash is, and the chunks written below carry the new
+                // value, so the file row must not keep the one it was first
+                // indexed under.
                 tx.execute(
                     "UPDATE node SET content_hash = ?2, meta = ?3, updated_at = ?4,
-                                     deleted_at = NULL
+                                     lang = ?5, deleted_at = NULL
                      WHERE id = ?1",
-                    params![f.id, hash, file_meta.to_string(), now_unix()],
+                    params![f.id, hash, file_meta.to_string(), now_unix(), file_lang],
                 )?;
                 // Chunks are derived data: replace wholesale.
                 tx.execute("DELETE FROM node WHERE parent_id = ?1", [f.id])?;
@@ -544,6 +637,23 @@ mod tests {
         .unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].node.path.as_deref(), Some("sub/notes.md"));
+    }
+
+    /// A docs note is embeddable, and a node with no `content_hash` reads as
+    /// "needs embedding" (`embed::has_pending`), so the note must be born
+    /// with one, like every chunk the indexer writes.
+    #[test]
+    fn a_docs_note_is_stored_with_its_body_hash() {
+        let (_dir, conn, coll) = setup();
+        let note = annotate(&conn, &coll, "runbooks for the on-call rotation").unwrap();
+        assert_eq!(
+            note.content_hash,
+            Some(
+                blake3::hash(b"runbooks for the on-call rotation")
+                    .as_bytes()
+                    .to_vec()
+            )
+        );
     }
 
     #[test]
@@ -679,6 +789,133 @@ mod tests {
         assert_eq!(again.id, code_coll.id);
         let again = add_collection(&conn, root, "docs", None, "docs").unwrap();
         assert_eq!(again.id, docs_coll.id);
+    }
+
+    /// `auto.docs` plus `mimir code add .` leaves two collections with one
+    /// root and one name. A lookup that takes "the first row" then acts on
+    /// whichever the table hands back; a lookup has to be able to say which
+    /// kind it means, and to see that there are two.
+    #[test]
+    fn a_docs_and_a_code_collection_on_one_root_are_told_apart() {
+        let (_dir, conn, docs_coll) = setup();
+        let root = docs_coll.path.clone().unwrap();
+        let code_coll =
+            add_collection_of_kind(&conn, Path::new(&root), "docs", None, CollectionKind::Code)
+                .unwrap();
+        let ids = |nodes: Vec<Node>| nodes.iter().map(|n| n.id).collect::<Vec<_>>();
+
+        for reference in ["docs", root.as_str()] {
+            assert_eq!(
+                ids(find_collections(&conn, reference, None).unwrap()),
+                vec![docs_coll.id, code_coll.id],
+                "both match {reference:?}, oldest first"
+            );
+            assert_eq!(
+                ids(find_collections(&conn, reference, Some(CollectionKind::Docs)).unwrap()),
+                vec![docs_coll.id]
+            );
+            assert_eq!(
+                ids(find_collections(&conn, reference, Some(CollectionKind::Code)).unwrap()),
+                vec![code_coll.id]
+            );
+        }
+        assert!(find_collections(&conn, "no-such-collection", None)
+            .unwrap()
+            .is_empty());
+        assert_eq!(CollectionKind::of(&docs_coll), CollectionKind::Docs);
+        assert_eq!(CollectionKind::of(&code_coll), CollectionKind::Code);
+
+        // A removed collection is not found under either kind.
+        remove_collection(&conn, code_coll.id).unwrap();
+        assert!(find_collections(&conn, "docs", Some(CollectionKind::Code))
+            .unwrap()
+            .is_empty());
+        assert_eq!(find_collection(&conn, "docs").unwrap().id, docs_coll.id);
+    }
+
+    /// The kind is one of two words, checked where it enters. It used to be
+    /// stored as whatever string arrived, and anything that was not exactly
+    /// "code" was then indexed as docs.
+    #[test]
+    fn a_collection_kind_is_parsed_not_stored_verbatim() {
+        assert_eq!(
+            "docs".parse::<CollectionKind>().unwrap(),
+            CollectionKind::Docs
+        );
+        assert_eq!(
+            "code".parse::<CollectionKind>().unwrap(),
+            CollectionKind::Code
+        );
+        assert!("Code".parse::<CollectionKind>().is_err());
+        assert!("source".parse::<CollectionKind>().is_err());
+
+        let (dir, conn, _docs) = setup();
+        let err = add_collection(&conn, dir.path(), "typo", None, "cdoe").unwrap_err();
+        assert!(err.to_string().contains("cdoe"), "{err}");
+        assert!(
+            find_collections(&conn, "typo", None).unwrap().is_empty(),
+            "nothing was registered under the misspelt kind"
+        );
+
+        // A row written before the kind was recorded, or by a build that
+        // stored something else, still reads the way it has always been
+        // indexed: as docs.
+        let mut legacy = NewNode::new(Kind::Collection);
+        legacy.title = Some("legacy".into());
+        legacy.path = Some("/nowhere".into());
+        let legacy = store::insert_node(&conn, legacy).unwrap();
+        assert_eq!(CollectionKind::of(&legacy), CollectionKind::Docs);
+        conn.execute(
+            "UPDATE node SET meta = '{\"kind\":\"notebook\"}' WHERE id = ?1",
+            [legacy.id],
+        )
+        .unwrap();
+        let odd = store::get_node(&conn, legacy.id).unwrap();
+        assert_eq!(CollectionKind::of(&odd), CollectionKind::Docs);
+    }
+
+    /// A file row is refreshed in place when its content changes, and its
+    /// `lang` is part of what the scan worked out — a row written when the
+    /// file was classified differently must not keep the old word while its
+    /// new chunks carry the new one.
+    #[test]
+    fn reindexing_a_changed_file_refreshes_its_lang() {
+        let (dir, mut conn, coll) = setup();
+        index_collection(&mut conn, &coll).unwrap();
+        let lang_of = |conn: &Connection, kind: &str| -> Vec<String> {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT lang FROM node
+                     WHERE kind = ?1 AND path = 'guide.md' AND deleted_at IS NULL",
+                )
+                .unwrap();
+            let langs = stmt
+                .query_map([kind], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            langs
+        };
+        assert_eq!(lang_of(&conn, "file"), ["markdown"]);
+
+        conn.execute(
+            "UPDATE node SET lang = 'text' WHERE kind = 'file' AND path = 'guide.md'",
+            [],
+        )
+        .unwrap();
+        write(
+            dir.path(),
+            "guide.md",
+            "# Install\n\nrun the new installer\n",
+        );
+        let stats = index_collection(&mut conn, &coll).unwrap();
+        assert_eq!(stats.indexed, 1);
+        assert_eq!(lang_of(&conn, "chunk"), ["markdown"]);
+        assert_eq!(
+            lang_of(&conn, "file"),
+            ["markdown"],
+            "the file row agrees with its own chunks"
+        );
     }
 
     #[test]

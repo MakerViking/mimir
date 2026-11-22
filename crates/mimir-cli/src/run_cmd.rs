@@ -11,7 +11,7 @@ use anyhow::{bail, Result};
 use mimir_core::{savings, tokens, Mimir};
 use serde_json::json;
 
-use crate::filters;
+use crate::filters::{self, Filter};
 
 pub fn run(raw: bool, cmd: Vec<String>) -> Result<()> {
     if cmd.is_empty() {
@@ -33,12 +33,14 @@ pub fn run(raw: bool, cmd: Vec<String>) -> Result<()> {
     let raw_out = String::from_utf8_lossy(&output.stdout).into_owned();
     let raw_err = String::from_utf8_lossy(&output.stderr).into_owned();
 
+    let args: Vec<&str> = cmd[1..].iter().map(String::as_str).collect();
+    let filter = filters::classify(filters::base_program(&program), &args).filter;
     let (out_text, err_text) = if raw {
         (raw_out.clone(), raw_err.clone())
     } else {
         (
-            filters::filter_output(&program, &raw_out),
-            filters::filter_output(&program, &raw_err),
+            filters::filter_with(&filter, &raw_out),
+            filters::filter_with(&filter, &raw_err),
         )
     };
 
@@ -53,10 +55,9 @@ pub fn run(raw: bool, cmd: Vec<String>) -> Result<()> {
         if before > after {
             // Content commands (coreutils/kubectl) are volume-capped, not
             // line-filtered — record them under a distinct ledger source.
-            let source = if filters::is_content(filters::base_program(&program)) {
-                savings::source::CAP
-            } else {
-                savings::source::FILTER
+            let source = match filter {
+                Filter::Content => savings::source::CAP,
+                Filter::Noisy(_) | Filter::Generic => savings::source::FILTER,
             };
             // Best-effort ledger write; never let bookkeeping fail the command.
             if let Ok(mimir) = Mimir::open() {
@@ -76,5 +77,40 @@ pub fn run(raw: bool, cmd: Vec<String>) -> Result<()> {
         }
     }
 
-    std::process::exit(output.status.code().unwrap_or(1));
+    std::process::exit(exit_code(output.status));
+}
+
+/// The exit code `mimir run` passes on. The child's own when it exited; for
+/// a child killed by signal N, `128 + N`, which is what a shell reports for
+/// it — so "the build was OOM-killed" (137) or "interrupted" (130) reads the
+/// same through the wrapper as without it, and not as an ordinary failure.
+fn exit_code(status: std::process::ExitStatus) -> i32 {
+    if let Some(code) = status.code() {
+        return code;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return 128 + signal;
+        }
+    }
+    1
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::exit_code;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    #[test]
+    fn exit_code_is_the_childs_own_or_128_plus_its_signal() {
+        // Raw wait statuses: an exit code sits in the high byte, a
+        // terminating signal in the low seven bits.
+        assert_eq!(exit_code(ExitStatus::from_raw(0)), 0);
+        assert_eq!(exit_code(ExitStatus::from_raw(3 << 8)), 3);
+        assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGKILL)), 137);
+        assert_eq!(exit_code(ExitStatus::from_raw(libc::SIGTERM)), 143);
+    }
 }

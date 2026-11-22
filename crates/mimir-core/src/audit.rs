@@ -20,7 +20,7 @@
 //! of rows a person would ever want to read would be buried under machine
 //! churn, and a log nobody can read is not an audit.
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::Result;
 use crate::model::{now_unix, Actor, Kind, MutationOp};
@@ -45,6 +45,11 @@ pub struct Mutation {
 /// `injection_log`) already fail open for the same reason. A dropped row is
 /// visible as a gap; a spurious error would be a lie about what happened to
 /// the memory.
+///
+/// That argument holds only for a mutation that has already landed. The
+/// operations that run inside [`crate::db::atomic`] use [`try_record`] and
+/// [`try_record_for_kind`] instead: there a failed ledger write undoes the
+/// mutation with it, so reporting the failure is the truth.
 pub fn record(
     conn: &Connection,
     node_id: i64,
@@ -54,17 +59,33 @@ pub fn record(
     before_hash: Option<&[u8]>,
     after_hash: Option<&[u8]>,
 ) {
-    let is_memory: rusqlite::Result<String> =
-        conn.query_row("SELECT kind FROM node WHERE id = ?1", [node_id], |r| {
+    let _ = try_record(conn, node_id, op, actor, reason, before_hash, after_hash);
+}
+
+/// As [`record`], reporting a failed write instead of swallowing it. A node
+/// that is not a memory, or is not there at all, is still not an error:
+/// there is nothing to audit.
+pub(crate) fn try_record(
+    conn: &Connection,
+    node_id: i64,
+    op: MutationOp,
+    actor: Actor,
+    reason: Option<&str>,
+    before_hash: Option<&[u8]>,
+    after_hash: Option<&[u8]>,
+) -> Result<()> {
+    let kind: Option<String> = conn
+        .query_row("SELECT kind FROM node WHERE id = ?1", [node_id], |r| {
             r.get(0)
-        });
-    match is_memory {
-        Ok(kind) if kind == Kind::Memory.as_str() => {}
+        })
+        .optional()?;
+    match kind {
+        Some(kind) if kind == Kind::Memory.as_str() => {}
         // A hard delete removes the row before we can read its kind. The
         // caller passes the kind it saw; see `record_for_kind`.
-        _ => return,
+        _ => return Ok(()),
     }
-    record_for_kind(
+    try_record_for_kind(
         conn,
         Kind::Memory,
         node_id,
@@ -73,7 +94,7 @@ pub fn record(
         reason,
         before_hash,
         after_hash,
-    );
+    )
 }
 
 /// As [`record`], for callers that already know the kind — notably
@@ -89,10 +110,36 @@ pub fn record_for_kind(
     before_hash: Option<&[u8]>,
     after_hash: Option<&[u8]>,
 ) {
+    let _ = try_record_for_kind(
+        conn,
+        kind,
+        node_id,
+        op,
+        actor,
+        reason,
+        before_hash,
+        after_hash,
+    );
+}
+
+/// As [`record_for_kind`], reporting a failed write. For the operations
+/// whose ledger row is part of the change itself — a supersession is dated
+/// by nothing else — and so must roll back with it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_record_for_kind(
+    conn: &Connection,
+    kind: Kind,
+    node_id: i64,
+    op: MutationOp,
+    actor: Actor,
+    reason: Option<&str>,
+    before_hash: Option<&[u8]>,
+    after_hash: Option<&[u8]>,
+) -> Result<()> {
     if kind != Kind::Memory {
-        return;
+        return Ok(());
     }
-    let _ = conn.execute(
+    conn.execute(
         "INSERT INTO mutation (at, node_id, op, actor, reason, before_hash, after_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
@@ -104,7 +151,8 @@ pub fn record_for_kind(
             before_hash,
             after_hash
         ],
-    );
+    )?;
+    Ok(())
 }
 
 fn row_to_mutation(row: &rusqlite::Row) -> rusqlite::Result<Mutation> {
@@ -152,9 +200,23 @@ pub fn recent(conn: &Connection, limit: usize) -> Result<Vec<Mutation>> {
 /// (`set_superseded` bumps `updated_at`, which the next edit overwrites), so
 /// without this row "was it superseded as of March?" has no answer, and
 /// `recall --as-of` could not be correct.
+///
+/// The *earliest* supersede row, not the latest. A superseded memory never
+/// returns to live, so one that was later re-pointed at a different
+/// replacement has been retired since the first row; reading the last one
+/// would bring it back as current for every as-of date in between.
+///
+/// Earliest *for the node that holds this rowid now*. A hard delete frees
+/// its rowid, SQLite may hand it to the next insert, and the ledger keeps
+/// the old rows on purpose — so the last `hard_delete` row for an id marks
+/// where a previous holder's history ends, and a supersede row before it is
+/// not this memory's.
 pub fn superseded_at(conn: &Connection, node_id: i64) -> Result<Option<i64>> {
     Ok(conn.query_row(
-        "SELECT max(at) FROM mutation WHERE node_id = ?1 AND op = 'supersede'",
+        "SELECT min(at) FROM mutation
+         WHERE node_id = ?1 AND op = 'supersede'
+           AND id > COALESCE(
+               (SELECT max(id) FROM mutation WHERE node_id = ?1 AND op = 'hard_delete'), 0)",
         [node_id],
         |r| r.get::<_, Option<i64>>(0),
     )?)
@@ -209,6 +271,57 @@ mod tests {
             superseded_at(&c, old).unwrap(),
             Some(at),
             "an unrelated update must not move when the supersession happened"
+        );
+    }
+
+    /// A superseded memory never returns to live, so re-pointing it at a
+    /// different replacement must not move the date it was retired: every
+    /// `--as-of` between the two would otherwise bring it back as current.
+    #[test]
+    fn re_pointing_keeps_the_first_retirement_date() {
+        let c = conn();
+        let old = memory(&c, "deploys go to eu-west-1");
+        let second = memory(&c, "deploys go to eu-north-1");
+        let third = memory(&c, "deploys go to eu-central-1");
+        store::supersede(&c, old, second, Actor::Human, None).unwrap();
+        // Ledger rows are stamped with the clock; move the first one back so
+        // the two supersessions are a week apart.
+        c.execute(
+            "UPDATE mutation SET at = at - 604800 WHERE node_id = ?1",
+            [old],
+        )
+        .unwrap();
+        let first = superseded_at(&c, old).unwrap().expect("recorded");
+
+        store::supersede(&c, old, third, Actor::Human, Some("moved again")).unwrap();
+
+        assert_eq!(store::get_node(&c, old).unwrap().superseded_by, Some(third));
+        assert_eq!(history(&c, old).unwrap().len(), 2, "both are recorded");
+        assert_eq!(superseded_at(&c, old).unwrap(), Some(first));
+    }
+
+    /// SQLite reuses the rowid of a hard-deleted row, and the ledger keeps
+    /// the delete on purpose. The memory that gets the id next must not
+    /// inherit the date the one before it was superseded.
+    #[test]
+    fn a_reused_rowid_does_not_inherit_the_previous_supersede_date() {
+        let c = conn();
+        let keeper = memory(&c, "the replacement");
+        let first = memory(&c, "the first holder of this rowid");
+        store::supersede(&c, first, keeper, Actor::Human, None).unwrap();
+        c.execute("UPDATE mutation SET at = at - 604800", [])
+            .unwrap();
+        store::hard_delete(&c, first, Actor::Human, Some("purge")).unwrap();
+
+        let second = memory(&c, "a different memory entirely");
+        assert_eq!(second, first, "the fixture relies on rowid reuse");
+        assert_eq!(superseded_at(&c, second).unwrap(), None);
+
+        let before = now_unix();
+        store::supersede(&c, second, keeper, Actor::Human, None).unwrap();
+        assert!(
+            superseded_at(&c, second).unwrap().unwrap() >= before,
+            "its own supersession, not the week-old one of the previous holder"
         );
     }
 

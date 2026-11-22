@@ -9,28 +9,28 @@
 
 mod rules;
 
-pub(crate) use rules::{is_content, is_filterable};
-use rules::{is_signal, verdict, Verdict};
+pub(crate) use rules::{classify, Filter, Hook};
+use rules::{is_signal, Verdict};
 
 /// Above this many kept lines, the generic volume cap kicks in.
 const VOLUME_CAP: usize = 400;
 /// Lines kept verbatim at the head and tail when the cap triggers.
 const VOLUME_EDGE: usize = 60;
 
-/// Filter `raw` output from `program` (the command's argv[0]): strip ANSI, drop
-/// the lines the program's [`rules`] mark as noise, collapse blank runs, and —
-/// if the result is still huge — keep only head + tail + signal lines.
-pub fn filter_output(program: &str, raw: &str) -> String {
+/// Filter `raw` output with the [`Filter`] of the program that printed it:
+/// strip ANSI, drop the lines the program's [`rules`] mark as noise, collapse
+/// blank runs, and — if the result is still huge — keep only head + tail +
+/// signal lines.
+pub fn filter_with(filter: &Filter, raw: &str) -> String {
     if raw.is_empty() {
         return String::new();
     }
     let cleaned = strip_ansi(raw);
-    let base = base_program(program);
 
     // Content commands (coreutils/search/listings/kubectl): their output *is*
     // the signal you asked for, so we never drop individual lines — only bound
     // runaway volume. Non-lossy by construction (head + tail + signal kept).
-    if is_content(base) {
+    if matches!(filter, Filter::Content) {
         let lines: Vec<&str> = cleaned.lines().collect();
         return volume_cap(&lines);
     }
@@ -39,7 +39,7 @@ pub fn filter_output(program: &str, raw: &str) -> String {
     let mut kept: Vec<&str> = Vec::new();
     let mut prev_blank = false;
     for line in cleaned.lines() {
-        if matches!(verdict(base, line), Verdict::Drop) {
+        if matches!(filter.verdict(line), Verdict::Drop) {
             continue;
         }
         let blank = line.trim().is_empty();
@@ -52,6 +52,12 @@ pub fn filter_output(program: &str, raw: &str) -> String {
 
     // Pass 2: any command can still dump thousands of lines — bound the volume.
     volume_cap(&kept)
+}
+
+/// [`filter_with`] the filter of `program` (the command's argv[0]).
+#[cfg(test)]
+pub fn filter_output(program: &str, raw: &str) -> String {
+    filter_with(&classify(base_program(program), &[]).filter, raw)
 }
 
 /// Bound runaway output: under [`VOLUME_CAP`] lines, return them unchanged;

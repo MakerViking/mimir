@@ -9,11 +9,10 @@
 //! Conservative by design: only known-noisy commands are rewritten, and any
 //! command with shell operators (pipes/redirs/&&/;/subshells) is left alone —
 //! rewrapping those is risky and the filters wouldn't see the real output.
+//! Which commands those are is not decided here: `filters::classify` answers
+//! for this hook and for `mimir run` alike.
 
-/// git subcommands worth filtering (clone/fetch progress + status boilerplate).
-const GIT_NOISY_SUBCMDS: &[&str] = &["clone", "pull", "fetch", "push", "status"];
-
-use crate::filters::{base_program, is_filterable};
+use crate::filters::{base_program, classify, Hook};
 
 fn has_shell_operators(cmd: &str) -> bool {
     cmd.contains(|c| {
@@ -21,22 +20,6 @@ fn has_shell_operators(cmd: &str) -> bool {
             c,
             '|' | '&' | ';' | '>' | '<' | '`' | '$' | '(' | ')' | '\n'
         )
-    })
-}
-
-/// True for a command that streams until killed (`tail -f`, `journalctl -f`).
-/// `mimir run` waits for the child to exit, so wrapping these would hang the
-/// agent forever — pass them through untouched. Scoped to the follow-capable
-/// programs so unrelated `-f` flags (e.g. `grep -f patterns`) are unaffected.
-fn is_follow(base: &str, rest: &[&str]) -> bool {
-    if !matches!(base, "tail" | "journalctl") {
-        return false;
-    }
-    rest.iter().any(|a| {
-        *a == "--retry"
-            || a.starts_with("--follow")
-            // any short-flag bundle containing f/F: `-f`, `-F`, `-fn`, `-Fq`, …
-            || (a.starts_with('-') && !a.starts_with("--") && a.contains(['f', 'F']))
     })
 }
 
@@ -52,21 +35,10 @@ pub fn rewritten(cmd: &str) -> Option<String> {
         return None; // already ours
     }
     let rest: Vec<&str> = parts.collect();
-    // Never wrap a follow/stream — it would hang waiting for an exit that never
-    // comes.
-    if is_follow(base, &rest) {
-        return None;
+    match classify(base, &rest).hook {
+        Hook::Wrap => Some(format!("mimir run -- {trimmed}")),
+        Hook::LeaveFollowing | Hook::LeaveQuietSubcommand | Hook::LeaveUnknown => None,
     }
-    // git wraps only its noisy subcommands; everything else with a dedicated
-    // filter or content cap is wrapped wholesale (single source of truth:
-    // `is_filterable`).
-    let eligible = if base == "git" {
-        rest.first()
-            .is_some_and(|sub| GIT_NOISY_SUBCMDS.contains(sub))
-    } else {
-        is_filterable(base)
-    };
-    eligible.then(|| format!("mimir run -- {trimmed}"))
 }
 
 /// CLI entry: prints the rewrite and exits 0, or exits 1 for pass-through.

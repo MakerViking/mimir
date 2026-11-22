@@ -10,13 +10,16 @@
 //! `PRAGMA data_version`. Same-connection embedding mutations do NOT
 //! auto-invalidate (deliberately — recall's own event logging must not
 //! force a rebuild every call); the only same-connection mutator is
-//! `embed_pending`, and `Mimir` drops its cache after calling it.
+//! `embed_pending`, and `Mimir::embed_pending` repairs the cache itself
+//! afterwards: [`MatrixCache::upsert`] patches the embedded rows in for a
+//! small batch, and a bulk batch drops the cache for the next search to
+//! rebuild.
 
 use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::model::Scope;
-use crate::search::SearchQuery;
+use crate::search::{Reach, SearchQuery};
 
 /// Row count above which the dot-product scan fans out across cores.
 const PARALLEL_SCAN_THRESHOLD: usize = 8_192;
@@ -33,6 +36,20 @@ pub struct MatrixCache {
     kind_names: Vec<String>,
     created_at: Vec<i64>,
     stamp: i64,
+}
+
+/// Whether a stored embedding row may join a matrix, fixing the matrix
+/// width from the first row offered (`*dim == 0` means none has been yet).
+///
+/// A row fits when the dimension it declares and the length of the vector
+/// it actually holds both equal that width. The full load and the in-place
+/// patch ask this one question, so a row is in the matrix or out of it
+/// whichever of them saw it.
+fn admits_row(dim: &mut usize, row_dim: i64, vec: &[f32]) -> bool {
+    if *dim == 0 {
+        *dim = row_dim as usize;
+    }
+    row_dim as usize == *dim && vec.len() == *dim
 }
 
 impl MatrixCache {
@@ -64,10 +81,7 @@ impl MatrixCache {
             let row_dim: i64 = row.get(1)?;
             let blob: Vec<u8> = row.get(2)?;
             let vec = crate::embed::from_blob(&blob);
-            if dim == 0 {
-                dim = row_dim as usize;
-            }
-            if vec.len() != dim {
+            if !admits_row(&mut dim, row_dim, &vec) {
                 tracing::warn!(node = id, "embedding dim mismatch; skipping");
                 continue;
             }
@@ -134,10 +148,7 @@ impl MatrixCache {
             let row_dim: i64 = row.get(1)?;
             let blob: Vec<u8> = row.get(2)?;
             let vec = crate::embed::from_blob(&blob);
-            if c.dim == 0 {
-                c.dim = row_dim as usize;
-            }
-            if row_dim as usize != c.dim || vec.len() != c.dim {
+            if !admits_row(&mut c.dim, row_dim, &vec) {
                 tracing::warn!(node = id, "embedding dim mismatch on cache patch; skipping");
                 continue;
             }
@@ -183,6 +194,28 @@ pub fn leg(
     query: &SearchQuery,
     cap: usize,
 ) -> Result<Vec<i64>> {
+    leg_within(
+        conn,
+        cache,
+        model,
+        query_vec,
+        query,
+        Reach::uniform(query.scope),
+        cap,
+    )
+}
+
+/// [`leg`] over a [`Reach`], which is read instead of `query.scope`: each
+/// cached row is admitted by the scope its kind answers to.
+pub fn leg_within(
+    conn: &Connection,
+    cache: &mut Option<MatrixCache>,
+    model: &str,
+    query_vec: &[f32],
+    query: &SearchQuery,
+    reach: Reach,
+    cap: usize,
+) -> Result<Vec<i64>> {
     MatrixCache::ensure(conn, model, cache)?;
     let Some(c) = cache.as_ref() else {
         return Ok(vec![]);
@@ -209,13 +242,15 @@ pub fn leg(
                 .collect(),
         )
     };
+    // The scope each interned kind answers to, worked out once: the rows
+    // carry the kind as an index into `kind_names`.
+    let scope_of_kind: Vec<Scope> = c
+        .kind_names
+        .iter()
+        .map(|name| reach.scope_of_kind_named(name))
+        .collect();
     let score_row = |(i, id): (usize, &i64)| -> Option<(i64, f32)> {
-        let scope_ok = match query.scope {
-            Scope::All => true,
-            Scope::Global => c.project_ids[i].is_none(),
-            Scope::Project(pid) => c.project_ids[i].is_none() || c.project_ids[i] == Some(pid),
-        };
-        if !scope_ok {
+        if !scope_of_kind[c.kind_of[i] as usize].admits(c.project_ids[i]) {
             return None;
         }
         if let Some(kinds) = &kind_filter {
@@ -391,6 +426,31 @@ mod tests {
         assert!(leg(&conn, &mut cache, MODEL, &[1.0, 0.0], &q(), 10)
             .unwrap()
             .is_empty());
+    }
+
+    /// A row whose declared `dim` disagrees with the vector it holds is not
+    /// a row either path can score. The load and the patch used to answer
+    /// that differently, so the same store gave a different matrix depending
+    /// on whether the row arrived before or after the cache was built.
+    #[test]
+    fn a_row_with_a_wrong_declared_dim_is_refused_by_load_and_patch_alike() {
+        let conn = db::open_in_memory().unwrap();
+        let good = add_with_vec(&conn, "good", &[1.0, 0.0]);
+        let add_mislabelled = |title: &str| {
+            let id = add_with_vec(&conn, title, &[0.0, 1.0]);
+            conn.execute("UPDATE embedding SET dim = 3 WHERE node_id = ?1", [id])
+                .unwrap();
+            id
+        };
+
+        let before = add_mislabelled("mislabelled before the load");
+        let mut loaded = None;
+        MatrixCache::ensure(&conn, MODEL, &mut loaded).unwrap();
+        assert_eq!(loaded.as_ref().unwrap().node_ids, vec![good]);
+
+        let after = add_mislabelled("mislabelled after the load");
+        MatrixCache::upsert(&conn, MODEL, &[before, after], &mut loaded).unwrap();
+        assert_eq!(loaded.as_ref().unwrap().node_ids, vec![good]);
     }
 
     #[test]

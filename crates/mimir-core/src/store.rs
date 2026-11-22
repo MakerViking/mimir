@@ -235,6 +235,7 @@ fn resolve_ref_inner(conn: &Connection, reference: &str, include_deleted: bool) 
 }
 
 pub fn touch_updated(conn: &Connection, id: i64) -> Result<()> {
+    crate::text_clock::keep(conn, id)?;
     conn.execute(
         "UPDATE node SET updated_at = ?2 WHERE id = ?1",
         params![id, now_unix()],
@@ -257,62 +258,323 @@ fn audit_subject(conn: &Connection, id: i64) -> (Kind, Option<Vec<u8>>) {
     .unwrap_or((Kind::Memory, None))
 }
 
+/// How a node is named in a message a person reads: the short id they can
+/// paste back into a command, then its title.
+fn describe(node: &Node) -> String {
+    let id = crate::model::short_uid(node.kind, &node.uid);
+    match node.title.as_deref().filter(|t| !t.is_empty()) {
+        Some(title) => format!("{id} \"{}\"", crate::format::truncate_chars(title, 60)),
+        None => id,
+    }
+}
+
 /// Soft-delete `id`. `actor` and `reason` go to the mutation ledger — see
 /// [`crate::audit`] for why they are arguments rather than ambient state.
+///
+/// On a memory that consolidation archived, this turns the archival into a
+/// deliberate forget: `meta.archived` is cleared, so `remember` stops
+/// letting the fact back in, and its prior wordings go. `deleted_at` stays
+/// where the archival put it — that is when the memory left the store, and
+/// it is the date `recall --as-of` reads.
+///
+/// The tombstone, the purge and the ledger row land together or not at all
+/// ([`crate::db::atomic`]).
 pub fn soft_delete(conn: &Connection, id: i64, actor: Actor, reason: Option<&str>) -> Result<()> {
-    let (kind, before) = audit_subject(conn, id);
-    // Bump updated_at too: replication finds tombstones via updated_at, so a
-    // delete that didn't advance it would never propagate.
-    let changed = conn.execute(
-        "UPDATE node SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
-        params![id, now_unix()],
-    )?;
-    // Deleting an already-deleted node changes nothing, so it records
-    // nothing: a ledger that grows on no-ops stops being a history of what
-    // happened.
-    if changed > 0 {
-        // A deletion that leaves prior wordings in `node_revision` has not
-        // deleted anything: recall never reads that table, but `export` and
-        // every backup do. Decay archival deliberately does NOT come through
-        // here (it updates the row directly with `meta.archived`), so history
-        // survives the one case nobody decided.
-        let _ = crate::revision::purge(conn, id);
-        crate::audit::record_for_kind(
-            conn,
-            kind,
-            id,
-            MutationOp::Forget,
-            actor,
-            reason,
-            before.as_deref(),
-            None,
-        );
-    }
-    Ok(())
+    crate::db::atomic(conn, || {
+        let (kind, before) = audit_subject(conn, id);
+        let now = now_unix();
+        // Bump updated_at too: replication finds tombstones via updated_at, so a
+        // delete that didn't advance it would never propagate.
+        let mut changed = conn.execute(
+            "UPDATE node SET deleted_at = ?2, updated_at = ?2 WHERE id = ?1 AND deleted_at IS NULL",
+            params![id, now],
+        )?;
+        if changed == 0 {
+            changed = conn.execute(
+                &format!(
+                    "UPDATE node SET meta = json_remove(meta, '$.archived'), updated_at = ?2
+                     WHERE id = ?1 AND kind = 'memory' AND deleted_at IS NOT NULL AND {}",
+                    crate::lifecycle::ARCHIVED_SQL
+                ),
+                params![id, now],
+            )?;
+        }
+        // Deleting an already-deleted node changes nothing, so it records
+        // nothing: a ledger that grows on no-ops stops being a history of what
+        // happened.
+        if changed > 0 {
+            // A deletion that leaves prior wordings in `node_revision` has not
+            // deleted anything: recall never reads that table, but `export` and
+            // every backup do. Decay archival deliberately does NOT come through
+            // here (it updates the row directly with `meta.archived`), so history
+            // survives the one case nobody decided.
+            crate::revision::purge(conn, id)?;
+            crate::audit::try_record_for_kind(
+                conn,
+                kind,
+                id,
+                MutationOp::Forget,
+                actor,
+                reason,
+                before.as_deref(),
+                None,
+            )?;
+        }
+        Ok(())
+    })
 }
 
+/// Remove `id` for good: the row, its prior wordings and its review findings
+/// go together, and what is left is one ledger row saying it happened.
+///
+/// Refused while another node still names this one in `superseded_by`. The
+/// column is a foreign key, so the DELETE could not succeed anyway; saying
+/// which memories hold it is what lets the caller do something about it.
 pub fn hard_delete(conn: &Connection, id: i64, actor: Actor, reason: Option<&str>) -> Result<()> {
-    // Read the subject first — after the DELETE there is nothing left to ask.
-    let (kind, before) = audit_subject(conn, id);
-    let changed = conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
-    if changed > 0 {
-        let _ = crate::revision::purge(conn, id);
-        crate::audit::record_for_kind(
-            conn,
-            kind,
-            id,
-            MutationOp::HardDelete,
-            actor,
-            reason,
-            before.as_deref(),
-            None,
-        );
-    }
-    Ok(())
+    crate::db::atomic(conn, || {
+        let replaced = superseded_by_this(conn, id)?;
+        if !replaced.is_empty() {
+            let this = get_node(conn, id)
+                .map(|n| crate::model::short_uid(n.kind, &n.uid))
+                .unwrap_or_else(|_| format!("node #{id}"));
+            let names = replaced.iter().map(describe).collect::<Vec<_>>().join(", ");
+            let (count, verb) = match replaced.len() {
+                1 => ("1 memory was".to_string(), "points"),
+                n => (format!("{n} memories were"), "point"),
+            };
+            return Err(Error::Invalid(format!(
+                "{this} cannot be removed permanently: {count} superseded by it and still \
+                 {verb} at it ({names}). Forget it without --hard instead, or remove \
+                 {} permanently first.",
+                if replaced.len() == 1 {
+                    "that one"
+                } else {
+                    "those"
+                },
+            )));
+        }
+        // Read the subject first — after the DELETE there is nothing left to ask.
+        let (kind, before) = audit_subject(conn, id);
+        let changed = conn.execute("DELETE FROM node WHERE id = ?1", [id])?;
+        if changed > 0 {
+            crate::revision::purge(conn, id)?;
+            // `review` has no foreign key on the node, so a finding about a
+            // row that no longer exists would otherwise wait on a person
+            // forever with nothing left to decide.
+            conn.execute(
+                "DELETE FROM review WHERE node_id = ?1 OR other_id = ?1",
+                [id],
+            )?;
+            crate::audit::try_record_for_kind(
+                conn,
+                kind,
+                id,
+                MutationOp::HardDelete,
+                actor,
+                reason,
+                before.as_deref(),
+                None,
+            )?;
+        }
+        Ok(())
+    })
 }
 
-/// Mark `id` as superseded by `by`: it stops surfacing in recall (kept as
-/// history). Bumps updated_at so the change replicates to a sync hub.
+/// Forget what `reference` names — the one implementation behind
+/// `mimir forget` and the MCP `forget` tool, so the two cannot disagree
+/// about what can be forgotten. Returns the node as it stood, for the
+/// caller to name in its reply.
+///
+/// A stored node resolves first, exactly as [`resolve_ref`] would. Only when
+/// nothing stored matches does a tombstone resolve, because two states are
+/// reachable no other way: an archived memory that should become a
+/// deliberate forget, and any tombstone that `hard` should remove.
+///
+/// Refused: a project (it is not a memory — it is what memories are filed
+/// under, and tombstoning it removes none of them), and a soft forget of
+/// what is already forgotten, which would report a deletion that did not
+/// happen.
+pub fn forget(
+    conn: &Connection,
+    reference: &str,
+    hard: bool,
+    actor: Actor,
+    reason: Option<&str>,
+) -> Result<Node> {
+    let node = match resolve_ref(conn, reference) {
+        Err(Error::NotFound(_)) => resolve_ref_including_deleted(conn, reference)?,
+        other => other?,
+    };
+    if node.kind == Kind::Project {
+        return Err(Error::Invalid(format!(
+            "{} is a project, not a memory; `forget` removes memories, and forgetting a \
+             project would remove none of the memories filed under it",
+            describe(&node)
+        )));
+    }
+    if hard {
+        hard_delete(conn, node.id, actor, reason)?;
+        return Ok(node);
+    }
+    if node.lifecycle(now_unix()) == crate::lifecycle::Lifecycle::Forgotten {
+        return Err(Error::Invalid(format!(
+            "{} was already forgotten on {}; `mimir forget --hard` removes it permanently",
+            describe(&node),
+            crate::format::full_date(node.deleted_at.unwrap_or(node.updated_at))
+        )));
+    }
+    soft_delete(conn, node.id, actor, reason)?;
+    Ok(node)
+}
+
+/// Every node whose `superseded_by` is `id`, tombstones included: the
+/// foreign key holds for those too.
+fn superseded_by_this(conn: &Connection, id: i64) -> Result<Vec<Node>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} FROM node WHERE superseded_by = ?1 ORDER BY id"
+    ))?;
+    let nodes = stmt
+        .query_map([id], row_to_node)?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(nodes)
+}
+
+/// Retire the memory `old_id` in favour of `by_id` — the one supersede
+/// operation, behind `mimir supersede`, the MCP tool, a review decision and
+/// consolidation's merge.
+///
+/// A supersession is three records that only mean something together: the
+/// `superseded_by` column (what hides the old memory from every surface that
+/// means "current"), the `supersedes` edge (what `get` draws), and the
+/// ledger row (the only date the retirement has — see
+/// [`crate::audit::superseded_at`]). They are written in one
+/// [`crate::db::atomic`] step, so none of the three can exist without the
+/// others.
+///
+/// There is no way back from superseded, so what would strand a memory is
+/// refused up front:
+///
+/// - either node not being a memory;
+/// - a memory superseding itself;
+/// - a pinned `old` (pinned means never decayed, never superseded — the
+///   invariant consolidation honours);
+/// - a `by` that is archived or forgotten: the old memory would be hidden
+///   behind something that is itself gone;
+/// - a `by` whose own `superseded_by` chain leads back to `old`: a cycle
+///   has no live end, so both would vanish.
+///
+/// Superseding a memory by the replacement it already has changes nothing
+/// and records nothing. Re-pointing it at a different replacement is
+/// allowed and recorded; the retirement keeps its first date.
+pub fn supersede(
+    conn: &Connection,
+    old_id: i64,
+    by_id: i64,
+    actor: Actor,
+    reason: Option<&str>,
+) -> Result<()> {
+    crate::db::atomic(conn, || {
+        if old_id == by_id {
+            return Err(Error::Invalid("a node cannot supersede itself".into()));
+        }
+        let old = get_node(conn, old_id)?;
+        let by = get_node(conn, by_id)?;
+        for node in [&old, &by] {
+            if node.kind != Kind::Memory {
+                return Err(Error::Invalid(format!(
+                    "{} is a {}, not a memory; only a memory can supersede or be superseded",
+                    describe(node),
+                    node.kind
+                )));
+            }
+        }
+        if old.superseded_by == Some(by.id) {
+            // Already so. The edge is re-asserted because it is idempotent
+            // and an older build could set the column without it; the ledger
+            // keeps its one row.
+            return link(conn, by.id, old.id, Rel::Supersedes, 1.0);
+        }
+        if old.pinned {
+            return Err(Error::Invalid(format!(
+                "{} is pinned; pinned memories never get superseded (unpin it first)",
+                describe(&old)
+            )));
+        }
+        let state = by.lifecycle(now_unix());
+        if state.is_tombstoned() {
+            return Err(Error::Invalid(format!(
+                "{} is {state}; a deleted memory cannot replace another",
+                describe(&by)
+            )));
+        }
+        // An expired replacement hides both: the old one is superseded, the
+        // new one is past its date, and recall shows neither.
+        if state == crate::lifecycle::Lifecycle::Expired {
+            return Err(Error::Invalid(format!(
+                "{} is expired; a memory that recall no longer shows cannot replace another",
+                describe(&by)
+            )));
+        }
+        if supersession_reaches(conn, &by, old.id)? {
+            return Err(Error::Invalid(format!(
+                "{} has itself been superseded, and that chain leads to {}; superseding \
+                 in both directions would close a loop with no current memory in it",
+                describe(&by),
+                describe(&old)
+            )));
+        }
+        crate::text_clock::keep(conn, old.id)?;
+        conn.execute(
+            "UPDATE node SET superseded_by = ?2, updated_at = ?3 WHERE id = ?1",
+            params![old.id, by.id, now_unix()],
+        )?;
+        link(conn, by.id, old.id, Rel::Supersedes, 1.0)?;
+        crate::audit::try_record_for_kind(
+            conn,
+            old.kind,
+            old.id,
+            MutationOp::Supersede,
+            actor,
+            reason,
+            old.content_hash.as_deref(),
+            by.content_hash.as_deref(),
+        )
+    })
+}
+
+/// Whether following `from`'s `superseded_by` links arrives at `target`.
+/// Bounded by the set of nodes already visited: an older build could write
+/// a cycle, and `set_superseded` still can, so one may be on disk.
+fn supersession_reaches(conn: &Connection, from: &Node, target: i64) -> Result<bool> {
+    let mut seen = std::collections::HashSet::from([from.id]);
+    let mut next = from.superseded_by;
+    while let Some(id) = next {
+        if id == target {
+            return Ok(true);
+        }
+        if !seen.insert(id) {
+            break;
+        }
+        next = conn
+            .query_row("SELECT superseded_by FROM node WHERE id = ?1", [id], |r| {
+                r.get::<_, Option<i64>>(0)
+            })
+            .optional()?
+            .flatten();
+    }
+    Ok(false)
+}
+
+/// The bare column write under [`supersede`]: sets `superseded_by` and the
+/// ledger row that dates it, and nothing else — no `supersedes` edge, no
+/// check on what `by` is. Callers that mean "retire this memory" want
+/// [`supersede`].
+///
+/// Bumps `updated_at`, which re-sends the row over sync. That does not carry
+/// the retirement to a peer: the sync record (`replicate::SyncRecord`) has
+/// no `superseded_by` field, so what a peer receives of a supersession is
+/// the `supersedes` edge.
+///
 /// Refuses self-supersession (there is no un-supersede path, so a
 /// self-reference would hide the node unrecoverably) and pinned nodes
 /// (pinned means never decayed, never superseded — same invariant
@@ -340,6 +602,7 @@ pub fn set_superseded(
     }
     let (kind, before) = audit_subject(conn, id);
     let (_, after) = audit_subject(conn, by);
+    crate::text_clock::keep(conn, id)?;
     conn.execute(
         "UPDATE node SET superseded_by = ?2, updated_at = ?3 WHERE id = ?1",
         params![id, by, now_unix()],
@@ -404,21 +667,39 @@ pub fn edges_of(conn: &Connection, node_id: i64) -> Result<Vec<Edge>> {
 
 /// Find or create the project node for a filesystem root.
 /// Project identity is its canonical root path (stored in `path`).
+///
+/// One row per path, also when several processes make first contact with a
+/// directory at once, which is the ordinary case: a session start runs three
+/// hooks side by side. Looking and then inserting let each of them find
+/// nothing and insert its own row; stores written that way hold two or
+/// three rows for one directory, of which every later lookup used one and
+/// the others stayed empty. So the insert looks again under the write lock,
+/// and a lookup that finds several rows takes the oldest, every time.
 pub fn ensure_project(conn: &Connection, root: &str, name: &str) -> Result<Node> {
-    let existing = conn
-        .query_row(
-            &format!("SELECT {NODE_COLS} FROM node WHERE kind = 'project' AND path = ?1"),
-            [root],
-            row_to_node,
-        )
-        .optional()?;
-    if let Some(node) = existing {
+    let find = || -> Result<Option<Node>> {
+        Ok(conn
+            .query_row(
+                &format!(
+                    "SELECT {NODE_COLS} FROM node WHERE kind = 'project' AND path = ?1
+                     ORDER BY id LIMIT 1"
+                ),
+                [root],
+                row_to_node,
+            )
+            .optional()?)
+    };
+    if let Some(node) = find()? {
         return Ok(node);
     }
-    let mut new = NewNode::new(Kind::Project);
-    new.title = Some(name.to_string());
-    new.path = Some(root.to_string());
-    insert_node(conn, new)
+    crate::db::atomic(conn, || {
+        if let Some(node) = find()? {
+            return Ok(node);
+        }
+        let mut new = NewNode::new(Kind::Project);
+        new.title = Some(name.to_string());
+        new.path = Some(root.to_string());
+        insert_node(conn, new)
+    })
 }
 
 /// Find a project node by its portable sync key (`meta.portable_key`).
@@ -469,11 +750,16 @@ pub fn set_project_identity(
 /// floor. Overwrites any previous list; `phrases` is expected pre-sanitized
 /// (see `memory::sanitize_fires_when`) — this is a raw setter, same
 /// division of labor as `sanitize_tags` vs. `insert_node`.
+///
+/// Bumps `updated_at`, like every setter of a field that syncs: `meta` is on
+/// the wire, and replication selects rows by `updated_at`.
 pub fn set_fires_when(conn: &Connection, id: i64, phrases: &[String]) -> Result<()> {
     let json = serde_json::to_string(phrases).unwrap_or_else(|_| "[]".into());
+    crate::text_clock::keep(conn, id)?;
     conn.execute(
-        "UPDATE node SET meta = json_set(meta, '$.fires_when', json(?2)) WHERE id = ?1",
-        params![id, json],
+        "UPDATE node SET meta = json_set(meta, '$.fires_when', json(?2)), updated_at = ?3
+         WHERE id = ?1",
+        params![id, json, now_unix()],
     )?;
     Ok(())
 }
@@ -488,23 +774,28 @@ pub fn set_fires_when(conn: &Connection, id: i64, phrases: &[String]) -> Result<
 /// carries its own falsification condition instead.
 ///
 /// Stored in `meta` (same mechanism as `set_fires_when`) so it replicates —
-/// `replicate::SyncRecord` carries `meta` but not arbitrary new columns.
+/// `replicate::SyncRecord` carries `meta` but not arbitrary new columns —
+/// and bumps `updated_at` so that it actually does.
 pub fn set_expiry(
     conn: &Connection,
     id: i64,
     expires_at: Option<i64>,
     resolves_when: Option<&str>,
 ) -> Result<()> {
+    let now = now_unix();
+    crate::text_clock::keep(conn, id)?;
     if let Some(ts) = expires_at {
         conn.execute(
-            "UPDATE node SET meta = json_set(meta, '$.expires_at', ?2) WHERE id = ?1",
-            params![id, ts],
+            "UPDATE node SET meta = json_set(meta, '$.expires_at', ?2), updated_at = ?3
+             WHERE id = ?1",
+            params![id, ts, now],
         )?;
     }
     if let Some(cond) = resolves_when {
         conn.execute(
-            "UPDATE node SET meta = json_set(meta, '$.resolves_when', ?2) WHERE id = ?1",
-            params![id, cond],
+            "UPDATE node SET meta = json_set(meta, '$.resolves_when', ?2), updated_at = ?3
+             WHERE id = ?1",
+            params![id, cond, now],
         )?;
     }
     Ok(())
@@ -555,7 +846,8 @@ pub fn set_valid_interval(
 }
 
 /// Record the author's own certainty. Stored in `meta` for the same reason
-/// as `set_expiry`: it replicates without a schema bump.
+/// as `set_expiry`: it replicates without a schema bump (and, like it, bumps
+/// `updated_at` so the change is picked up).
 /// No gate and no score — see [`crate::model::MemoryConfidence`]. Writing
 /// this changes what a reader sees, never what recall returns.
 pub fn set_confidence(
@@ -563,9 +855,11 @@ pub fn set_confidence(
     id: i64,
     confidence: crate::model::MemoryConfidence,
 ) -> Result<()> {
+    crate::text_clock::keep(conn, id)?;
     conn.execute(
-        "UPDATE node SET meta = json_set(meta, '$.confidence', ?2) WHERE id = ?1",
-        params![id, confidence.as_str()],
+        "UPDATE node SET meta = json_set(meta, '$.confidence', ?2), updated_at = ?3
+         WHERE id = ?1",
+        params![id, confidence.as_str(), now_unix()],
     )?;
     Ok(())
 }
@@ -573,7 +867,25 @@ pub fn set_confidence(
 /// Bind an existing keyed (possibly synced-shadow) project to this machine's
 /// local path + display name, clearing the shadow marker. Used when a project
 /// that first arrived via sync is opened locally.
+///
+/// Writes only when something would change. Every resolution of a keyed
+/// project comes through here, every hook event among them, and an `UPDATE`
+/// takes the store's write lock whether or not it changes a row: a session
+/// in a keyed project was queueing for that lock on every prompt and every
+/// tool call, behind whatever else was writing.
 pub fn adopt_project(conn: &Connection, project_id: i64, path: &str, name: &str) -> Result<()> {
+    let bound: bool = conn
+        .query_row(
+            "SELECT path IS ?2 AND title IS ?3 AND json_extract(meta, '$.shadow') IS NULL
+             FROM node WHERE id = ?1 AND kind = 'project'",
+            params![project_id, path, name],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(false);
+    if bound {
+        return Ok(());
+    }
     conn.execute(
         "UPDATE node
          SET path = ?2, title = ?3, meta = json_remove(meta, '$.shadow')
@@ -636,6 +948,9 @@ pub fn find_project_by_title(conn: &Connection, title: &str) -> Result<Option<No
 /// across the hub and every machine. Refuses non-memory nodes — files, symbols,
 /// and doc/code chunks derive their project from their source, so moving one
 /// would only desync it from the graph it belongs to.
+///
+/// Moving a memory to the project it is already in changes nothing, so it
+/// records nothing and leaves `updated_at` alone.
 pub fn reproject(
     conn: &Connection,
     node: &Node,
@@ -650,21 +965,184 @@ pub fn reproject(
             node.kind.as_str()
         )));
     }
-    conn.execute(
-        "UPDATE node SET project_id = ?2, updated_at = ?3 WHERE id = ?1",
+    crate::text_clock::keep(conn, node.id)?;
+    // `IS NOT` rather than `!=`: global scope is a NULL project.
+    let changed = conn.execute(
+        "UPDATE node SET project_id = ?2, updated_at = ?3
+         WHERE id = ?1 AND project_id IS NOT ?2",
         params![node.id, project_id, now_unix()],
     )?;
-    crate::audit::record_for_kind(
-        conn,
-        node.kind,
-        node.id,
-        MutationOp::Reproject,
-        actor,
-        reason,
-        node.content_hash.as_deref(),
-        node.content_hash.as_deref(),
-    );
+    if changed > 0 {
+        crate::audit::record_for_kind(
+            conn,
+            node.kind,
+            node.id,
+            MutationOp::Reproject,
+            actor,
+            reason,
+            node.content_hash.as_deref(),
+            node.content_hash.as_deref(),
+        );
+    }
     Ok(())
+}
+
+/// Move every memory filed under project `from` to project `to`, as one
+/// unit: [`reproject_all_created_since`] with no lower bound. Returns how
+/// many moved.
+pub fn reproject_all(
+    conn: &Connection,
+    from: i64,
+    to: i64,
+    actor: Actor,
+    reason: Option<&str>,
+) -> Result<usize> {
+    Ok(reproject_all_created_since(conn, from, to, i64::MIN, actor, reason)?.len())
+}
+
+/// Move every memory filed under project `from` and created at or after
+/// `since` (unix seconds) to project `to`, as one unit. Each memory moves
+/// through [`reproject`], so each gets its ledger row and its `updated_at`
+/// bump, and either all of them move or none does. The bump is what
+/// carries the move over sync when `to` is a project that syncs; into one
+/// that does not, the memories leave sync with the move, as any
+/// `reproject` into a local project does. Returns the memories that moved,
+/// as they were before the move.
+///
+/// For a project whose memories turn out to belong to another one as a
+/// whole: a git linked worktree's, which belong to the repository's main
+/// checkout (`Mimir::projects_for_cwd_moving_memories_home`), from the time
+/// that worktree was made. Docs collections, code files and symbols stay
+/// where they are; they describe the directory, not the repository.
+///
+/// Whether there is anything to move is asked first, outside the
+/// transaction, of the memories that are not tombstones, through one index
+/// (`node_kind_scope`) and the rows it names; finding a project's
+/// tombstoned memories means reading every row the project owns, its whole
+/// code graph included. When there is something to move, everything in
+/// the bound moves, tombstones too. So nothing left means nothing happens
+/// and nothing is written; and a project holding *only* forgotten or
+/// archived memories keeps them, which no surface shows either way.
+pub fn reproject_all_created_since(
+    conn: &Connection,
+    from: i64,
+    to: i64,
+    since: i64,
+    actor: Actor,
+    reason: Option<&str>,
+) -> Result<Vec<Node>> {
+    if from == to {
+        return Ok(Vec::new());
+    }
+    let any_stored: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM node
+                        WHERE kind = 'memory' AND project_id = ?1 AND deleted_at IS NULL
+                          AND created_at >= ?2)",
+        params![from, since],
+        |r| r.get(0),
+    )?;
+    if !any_stored {
+        return Ok(Vec::new());
+    }
+    crate::db::atomic(conn, || {
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {NODE_COLS} FROM node
+             WHERE kind = 'memory' AND project_id = ?1 AND created_at >= ?2 ORDER BY id"
+        ))?;
+        let memories: Vec<Node> = stmt
+            .query_map(params![from, since], row_to_node)?
+            .collect::<rusqlite::Result<_>>()?;
+        for memory in &memories {
+            reproject(conn, memory, Some(to), actor, reason)?;
+        }
+        Ok(memories)
+    })
+}
+
+/// How many memories that are not tombstones are filed under `project`,
+/// split at `since` (unix seconds): `(created at or after it, created
+/// before it)`. With no `since`, every one of them counts as before. The
+/// question [`reproject_all_created_since`] asks first, with numbers, for
+/// a surface that reports what is left (`mimir status` in a linked
+/// worktree).
+pub fn memories_filed_under(
+    conn: &Connection,
+    project: i64,
+    since: Option<i64>,
+) -> Result<(usize, usize)> {
+    let (after, before): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(?2 IS NOT NULL AND created_at >= ?2), 0),
+                COALESCE(SUM(?2 IS NULL OR created_at < ?2), 0)
+         FROM node WHERE kind = 'memory' AND project_id = ?1 AND deleted_at IS NULL",
+        params![project, since],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((
+        usize::try_from(after).unwrap_or(0),
+        usize::try_from(before).unwrap_or(0),
+    ))
+}
+
+/// `meta` key on a project row naming the project its memories are filed
+/// under, when that is another one: a git linked worktree's row holds the
+/// `uid` of its main checkout's row. Absent on every other project row.
+pub const WORKTREE_OF: &str = "worktree_of";
+
+/// Record (`Some`) or remove (`None`) the home of a linked worktree's
+/// project row ([`WORKTREE_OF`]). Reads first and writes only when the
+/// stored value differs, since it runs on every resolution, hooks
+/// included. A project row's `meta` does not ride sync, so nothing else is
+/// bumped.
+pub fn set_worktree_home(
+    conn: &Connection,
+    worktree_project_id: i64,
+    home: Option<&Node>,
+) -> Result<()> {
+    let stored: Option<String> = conn
+        .query_row(
+            "SELECT json_extract(meta, '$.worktree_of') FROM node
+             WHERE id = ?1 AND kind = 'project'",
+            [worktree_project_id],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    let wanted = home.map(|h| h.uid.as_str());
+    if stored.as_deref() == wanted {
+        return Ok(());
+    }
+    match wanted {
+        Some(uid) => conn.execute(
+            "UPDATE node SET meta = json_set(meta, '$.worktree_of', ?2)
+             WHERE id = ?1 AND kind = 'project'",
+            params![worktree_project_id, uid],
+        )?,
+        None => conn.execute(
+            "UPDATE node SET meta = json_remove(meta, '$.worktree_of')
+             WHERE id = ?1 AND kind = 'project'",
+            [worktree_project_id],
+        )?,
+    };
+    Ok(())
+}
+
+/// The project a linked worktree's row says its memories are filed under
+/// ([`WORKTREE_OF`]): the live project row with that `uid`. `None` when the
+/// row records no home, or the home it records is gone or not a project.
+pub fn worktree_home(conn: &Connection, project: &Node) -> Result<Option<Node>> {
+    let Some(uid) = project.meta.get(WORKTREE_OF).and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    Ok(conn
+        .query_row(
+            &format!(
+                "SELECT {NODE_COLS} FROM node
+                 WHERE uid = ?1 AND kind = 'project' AND deleted_at IS NULL"
+            ),
+            [uid],
+            row_to_node,
+        )
+        .optional()?)
 }
 
 /// Live file nodes whose relative path ends with `suffix` (max 3).
@@ -734,9 +1212,12 @@ pub fn record_injection(conn: &Connection, session_id: &str, node_id: i64) -> Re
 /// (unix seconds) — both v8 tables are ephemeral per-session working state,
 /// not knowledge, so they're pruned on the same idle cadence as
 /// `recall_event` (see `prune_old_events`). Returns the total row count
-/// removed across both tables. Exported for the ops-owned prune cadence
-/// (`db::spawn_checkpoint_timer` or its cron equivalent) to wire in; not
-/// called from anywhere in this module.
+/// removed across both tables.
+///
+/// Row by row in both tables, whatever session a row belongs to. The
+/// store's own timer (`db::spawn_checkpoint_timer`) uses [`prune_sessions`]
+/// instead, which does not take state away from a session that is still
+/// running.
 pub fn prune_session_state(conn: &Connection, cutoff: i64) -> Result<usize> {
     let a = conn.execute("DELETE FROM injection_log WHERE at < ?1", params![cutoff])?;
     let b = conn.execute(
@@ -744,6 +1225,46 @@ pub fn prune_session_state(conn: &Connection, cutoff: i64) -> Result<usize> {
         params![cutoff],
     )?;
     Ok(a + b)
+}
+
+/// Sessions whose newest row, in either per-session table, is older than
+/// the bound parameter `?1`: nothing has been written for them since.
+const ENDED_SESSIONS_SQL: &str = "SELECT session_id FROM (
+         SELECT session_id, updated_at AS at FROM session_state
+         UNION ALL
+         SELECT session_id, at FROM injection_log)
+     GROUP BY session_id HAVING max(at) < ?1";
+
+/// One prune pass over the per-session tables that does not take state away
+/// from a session that is still running. Returns the row count removed.
+///
+/// `session_state` is pruned by session, not by row: a session's rows go
+/// only once the session has ended — its newest row, in either table, is
+/// older than `cutoff` (unix seconds). [`prune_session_state`] ages each row
+/// on its own, which cuts a session that outlives the window out from under
+/// itself: its transcript marker and its brief fire count are written once
+/// near the start and read for as long as it runs, so after seven days the
+/// context guard estimates from the whole transcript again and the brief
+/// forgets it already fired. An injection counts as a sign of life too, so
+/// a long session that is still being fed memories keeps its state.
+///
+/// `injection_log` is pruned by row: a mark older than the window is
+/// dropped even for a running session, so a memory that session was shown
+/// more than a week ago can be shown to it again.
+pub fn prune_sessions(conn: &Connection, cutoff: i64) -> Result<usize> {
+    crate::db::atomic(conn, || {
+        // State first, while `injection_log` still holds every row that can
+        // show a session alive. (The other order gives the same answer — a
+        // row older than the cutoff proves nothing either way — but this one
+        // does not need the argument.)
+        let state = conn.execute(
+            &format!("DELETE FROM session_state WHERE session_id IN ({ENDED_SESSIONS_SQL})"),
+            params![cutoff],
+        )?;
+        let injections =
+            conn.execute("DELETE FROM injection_log WHERE at < ?1", params![cutoff])?;
+        Ok(state + injections)
+    })
 }
 
 /// Per-session KV working state (v8 `session_state` table). Shared by the
@@ -825,6 +1346,17 @@ pub fn record_shown(
 }
 
 /// Pin/unpin: pinned nodes never decay and never get superseded.
+///
+/// A pin is a promise about a memory that is current, so pinning one that is
+/// superseded, archived or forgotten is refused: nothing would surface it,
+/// and the pin would sit on the row contradicting its own state. Unpinning
+/// is always allowed, so a pin that predates the retirement or arrived over
+/// sync can be taken off.
+///
+/// Setting the value a node already has changes nothing and records nothing,
+/// and an id that names no node is not an error — the same no-op rule as
+/// `soft_delete`. A real change bumps `updated_at`: `pinned` is on the sync
+/// wire.
 pub fn set_pinned(
     conn: &Connection,
     id: i64,
@@ -832,26 +1364,56 @@ pub fn set_pinned(
     actor: Actor,
     reason: Option<&str>,
 ) -> Result<()> {
-    let (kind, hash) = audit_subject(conn, id);
-    conn.execute(
-        "UPDATE node SET pinned = ?2 WHERE id = ?1",
-        params![id, pinned],
-    )?;
-    crate::audit::record_for_kind(
-        conn,
-        kind,
-        id,
+    crate::db::atomic(conn, || {
+        let node = match get_node(conn, id) {
+            Ok(node) => node,
+            Err(Error::NotFound(_)) => return Ok(()),
+            Err(err) => return Err(err),
+        };
+        if node.pinned == pinned {
+            return Ok(());
+        }
         if pinned {
-            MutationOp::Pin
-        } else {
-            MutationOp::Unpin
-        },
-        actor,
-        reason,
-        hash.as_deref(),
-        hash.as_deref(),
-    );
-    Ok(())
+            let state = node.lifecycle(now_unix());
+            if state == crate::lifecycle::Lifecycle::Superseded {
+                let by = node
+                    .superseded_by
+                    .and_then(|by| get_node(conn, by).ok())
+                    .map(|by| describe(&by))
+                    .unwrap_or_else(|| "a memory that no longer exists".into());
+                return Err(Error::Invalid(format!(
+                    "{} is superseded by {by}; a superseded memory is never shown as \
+                     current, so a pin on it would hold nothing — pin the replacement instead",
+                    describe(&node)
+                )));
+            }
+            if state.is_tombstoned() {
+                return Err(Error::Invalid(format!(
+                    "{} is {state}; a deleted memory cannot be pinned",
+                    describe(&node)
+                )));
+            }
+        }
+        crate::text_clock::keep(conn, id)?;
+        conn.execute(
+            "UPDATE node SET pinned = ?2, updated_at = ?3 WHERE id = ?1",
+            params![id, pinned, now_unix()],
+        )?;
+        crate::audit::try_record_for_kind(
+            conn,
+            node.kind,
+            id,
+            if pinned {
+                MutationOp::Pin
+            } else {
+                MutationOp::Unpin
+            },
+            actor,
+            reason,
+            node.content_hash.as_deref(),
+            node.content_hash.as_deref(),
+        )
+    })
 }
 
 /// Bump access stats; called when a node's full body is opened.
@@ -952,6 +1514,220 @@ mod tests {
         // A project node is not a memory.
         let err = reproject(&c, &dst, None, crate::model::Actor::Human, None).unwrap_err();
         assert!(matches!(err, Error::Invalid(_)), "got {err:?}");
+    }
+
+    fn memory_in(conn: &Connection, project: i64, title: &str) -> Node {
+        let mut new = NewNode::new(Kind::Memory);
+        new.title = Some(title.into());
+        new.project_id = Some(project);
+        insert_node(conn, new).unwrap()
+    }
+
+    fn ledger_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT count(*) FROM mutation", [], |r| r.get(0))
+            .unwrap()
+    }
+
+    /// Every memory row of the project moves, whatever its lifecycle, each
+    /// with a ledger row; what is not a memory, and what belongs to another
+    /// project, stays.
+    #[test]
+    fn reproject_all_moves_every_memory_of_one_project_and_nothing_else() {
+        let c = conn();
+        let src = ensure_project(&c, "/abs/src", "src").unwrap();
+        let dst = ensure_project(&c, "/abs/dst", "dst").unwrap();
+        let other = ensure_project(&c, "/abs/other", "other").unwrap();
+        let live = memory_in(&c, src.id, "live");
+        let replaced = memory_in(&c, src.id, "replaced");
+        supersede(&c, replaced.id, live.id, Actor::Human, None).unwrap();
+        let forgotten = memory_in(&c, src.id, "forgotten");
+        soft_delete(&c, forgotten.id, Actor::Human, None).unwrap();
+        let elsewhere = memory_in(&c, other.id, "elsewhere");
+        let mut symbol = NewNode::new(Kind::Symbol);
+        symbol.title = Some("a_symbol".into());
+        symbol.project_id = Some(src.id);
+        let symbol = insert_node(&c, symbol).unwrap();
+        c.execute("UPDATE node SET updated_at = 1000", []).unwrap();
+        let before = ledger_rows(&c);
+
+        let moved = reproject_all(&c, src.id, dst.id, Actor::System, Some("because")).unwrap();
+        assert_eq!(moved, 3);
+        for m in [&live, &replaced, &forgotten] {
+            let now = get_node(&c, m.id).unwrap();
+            assert_eq!(now.project_id, Some(dst.id), "{:?}", m.title);
+            assert!(
+                now.updated_at > 1000,
+                "the bump is what carries it over sync"
+            );
+            let last = crate::audit::history(&c, m.id).unwrap().pop().unwrap();
+            assert_eq!(last.op, MutationOp::Reproject);
+            assert_eq!(last.actor, Actor::System);
+            assert_eq!(last.reason.as_deref(), Some("because"));
+        }
+        assert_eq!(ledger_rows(&c), before + 3, "one ledger row per memory");
+        let symbol = get_node(&c, symbol.id).unwrap();
+        assert_eq!(symbol.project_id, Some(src.id), "the graph does not move");
+        assert_eq!(symbol.updated_at, 1000);
+        let elsewhere = get_node(&c, elsewhere.id).unwrap();
+        assert_eq!(elsewhere.project_id, Some(other.id));
+        assert_eq!(elsewhere.updated_at, 1000);
+    }
+
+    /// With nothing to move, nothing is written: not a row, not a ledger
+    /// line. A project left holding only tombstones counts as nothing to
+    /// move (see the function's doc for why the question stops there).
+    #[test]
+    fn reproject_all_writes_nothing_when_nothing_is_left() {
+        let c = conn();
+        let src = ensure_project(&c, "/abs/src", "src").unwrap();
+        let dst = ensure_project(&c, "/abs/dst", "dst").unwrap();
+        let moved = memory_in(&c, src.id, "moved");
+        assert_eq!(
+            reproject_all(&c, src.id, dst.id, Actor::System, None).unwrap(),
+            1
+        );
+        c.execute("UPDATE node SET updated_at = 1000", []).unwrap();
+        let (rows, changes) = (ledger_rows(&c), c.total_changes());
+
+        assert_eq!(
+            reproject_all(&c, src.id, dst.id, Actor::System, None).unwrap(),
+            0
+        );
+        assert_eq!(get_node(&c, moved.id).unwrap().updated_at, 1000);
+        assert_eq!(ledger_rows(&c), rows);
+        assert_eq!(c.total_changes(), changes, "not one row was written");
+
+        // A project is not moved onto itself.
+        assert_eq!(
+            reproject_all(&c, dst.id, dst.id, Actor::System, None).unwrap(),
+            0
+        );
+        assert_eq!(c.total_changes(), changes);
+
+        // Only a tombstone left behind: left alone.
+        let gone = memory_in(&c, src.id, "gone");
+        soft_delete(&c, gone.id, Actor::Human, None).unwrap();
+        let changes = c.total_changes();
+        assert_eq!(
+            reproject_all(&c, src.id, dst.id, Actor::System, None).unwrap(),
+            0
+        );
+        assert_eq!(get_node(&c, gone.id).unwrap().project_id, Some(src.id));
+        assert_eq!(c.total_changes(), changes);
+    }
+
+    /// The bound is on `created_at`, inclusive, and it holds for the probe
+    /// as for the move: memories older than it stay, and a project holding
+    /// only those has nothing to move and writes nothing.
+    #[test]
+    fn reproject_all_created_since_moves_only_what_is_new_enough() {
+        let c = conn();
+        let src = ensure_project(&c, "/abs/src", "src").unwrap();
+        let dst = ensure_project(&c, "/abs/dst", "dst").unwrap();
+        let at = |title: &str, created: i64| {
+            let node = memory_in(&c, src.id, title);
+            c.execute(
+                "UPDATE node SET created_at = ?2 WHERE id = ?1",
+                params![node.id, created],
+            )
+            .unwrap();
+            node
+        };
+        let old = at("older", 99);
+        let edge = at("at the bound", 100);
+        let new = at("newer", 101);
+        assert_eq!(memories_filed_under(&c, src.id, Some(100)).unwrap(), (2, 1));
+        assert_eq!(memories_filed_under(&c, src.id, None).unwrap(), (0, 3));
+        assert_eq!(memories_filed_under(&c, dst.id, Some(100)).unwrap(), (0, 0));
+
+        let moved = reproject_all_created_since(&c, src.id, dst.id, 100, Actor::System, None)
+            .unwrap()
+            .iter()
+            .map(|n| n.id)
+            .collect::<Vec<_>>();
+        assert_eq!(moved, [edge.id, new.id]);
+        assert_eq!(get_node(&c, old.id).unwrap().project_id, Some(src.id));
+        assert_eq!(get_node(&c, edge.id).unwrap().project_id, Some(dst.id));
+        assert_eq!(memories_filed_under(&c, src.id, Some(100)).unwrap(), (0, 1));
+
+        let changes = c.total_changes();
+        assert!(
+            reproject_all_created_since(&c, src.id, dst.id, 100, Actor::System, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(c.total_changes(), changes, "only an older one is left");
+    }
+
+    /// A worktree row's home is recorded by `uid`, removed on request, and
+    /// read back only while it names a live project; a value that is already
+    /// stored is not written again.
+    #[test]
+    fn a_worktree_rows_home_is_recorded_and_read_back() {
+        let c = conn();
+        let home = ensure_project(&c, "/abs/main", "main").unwrap();
+        let wt = ensure_project(&c, "/abs/wt", "wt").unwrap();
+        assert!(worktree_home(&c, &wt).unwrap().is_none());
+
+        set_worktree_home(&c, wt.id, Some(&home)).unwrap();
+        let row = get_node(&c, wt.id).unwrap();
+        assert_eq!(
+            row.meta.get(WORKTREE_OF).and_then(|v| v.as_str()),
+            Some(home.uid.as_str())
+        );
+        assert_eq!(
+            worktree_home(&c, &row).unwrap().map(|p| p.id),
+            Some(home.id)
+        );
+        let changes = c.total_changes();
+        set_worktree_home(&c, wt.id, Some(&home)).unwrap();
+        assert_eq!(c.total_changes(), changes, "read first, nothing to write");
+
+        // A home that is gone, or a uid that is not a project's.
+        let memory = memory_in(&c, home.id, "a memory");
+        c.execute(
+            "UPDATE node SET meta = json_set(meta, '$.worktree_of', ?2) WHERE id = ?1",
+            params![wt.id, memory.uid],
+        )
+        .unwrap();
+        assert!(worktree_home(&c, &get_node(&c, wt.id).unwrap())
+            .unwrap()
+            .is_none());
+        c.execute(
+            "UPDATE node SET meta = json_set(meta, '$.worktree_of', 'NO-SUCH-UID') WHERE id = ?1",
+            [wt.id],
+        )
+        .unwrap();
+        assert!(worktree_home(&c, &get_node(&c, wt.id).unwrap())
+            .unwrap()
+            .is_none());
+
+        set_worktree_home(&c, wt.id, None).unwrap();
+        assert_eq!(get_node(&c, wt.id).unwrap().meta.get(WORKTREE_OF), None);
+        let changes = c.total_changes();
+        set_worktree_home(&c, wt.id, None).unwrap();
+        assert_eq!(c.total_changes(), changes);
+    }
+
+    /// All of them or none: a failure on the second memory undoes the first.
+    #[test]
+    fn reproject_all_moves_all_or_nothing() {
+        let c = conn();
+        let src = ensure_project(&c, "/abs/src", "src").unwrap();
+        let dst = ensure_project(&c, "/abs/dst", "dst").unwrap();
+        let first = memory_in(&c, src.id, "first");
+        let second = memory_in(&c, src.id, "second");
+        c.execute_batch(&format!(
+            "CREATE TRIGGER refuse_second BEFORE UPDATE OF project_id ON node
+             WHEN old.id = {} BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+            second.id
+        ))
+        .unwrap();
+        let before = ledger_rows(&c);
+        assert!(reproject_all(&c, src.id, dst.id, Actor::System, None).is_err());
+        assert_eq!(get_node(&c, first.id).unwrap().project_id, Some(src.id));
+        assert_eq!(get_node(&c, second.id).unwrap().project_id, Some(src.id));
+        assert_eq!(ledger_rows(&c), before);
     }
 
     #[test]
@@ -1214,6 +1990,659 @@ mod tests {
         set_pinned(&conn, old.id, false, crate::model::Actor::System, None).unwrap();
         set_superseded(&conn, old.id, new.id, crate::model::Actor::System, None).unwrap();
         assert_eq!(get_node(&conn, old.id).unwrap().superseded_by, Some(new.id));
+    }
+
+    fn ledger(conn: &Connection, id: i64) -> Vec<MutationOp> {
+        crate::audit::history(conn, id)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.op)
+            .collect()
+    }
+
+    /// A memory as `remember` stores it: with the content hash the ledger
+    /// and the duplicate check read.
+    fn remembered(conn: &Connection, body: &str) -> Node {
+        let mut new = NewNode::new(Kind::Memory);
+        new.subkind = Some("note".into());
+        new.title = Some(body.into());
+        new.body = Some(body.into());
+        new.content_hash = Some(crate::memory::content_hash(body));
+        insert_node(conn, new).unwrap()
+    }
+
+    fn backdate(conn: &Connection, id: i64, secs: i64) -> i64 {
+        conn.execute(
+            "UPDATE node SET created_at = created_at - ?2, updated_at = updated_at - ?2
+             WHERE id = ?1",
+            params![id, secs],
+        )
+        .unwrap();
+        get_node(conn, id).unwrap().updated_at
+    }
+
+    /// The statement `consolidate`'s decay pass runs.
+    fn archive(conn: &Connection, id: i64, at: i64) {
+        conn.execute(
+            "UPDATE node SET deleted_at = ?2, meta = json_set(meta, '$.archived', 1)
+             WHERE id = ?1",
+            params![id, at],
+        )
+        .unwrap();
+    }
+
+    /// Make every insert into `table` fail, to stand in for the ledger or
+    /// the edge write breaking halfway through an operation.
+    fn break_inserts(conn: &Connection, table: &str) {
+        conn.execute_batch(&format!(
+            "CREATE TEMP TRIGGER break_{table} BEFORE INSERT ON main.{table}
+             BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn a_pin_that_changes_nothing_records_nothing() {
+        let conn = conn();
+        let node = remembered(&conn, "pin me once");
+        set_pinned(&conn, node.id, true, Actor::Human, None).unwrap();
+        set_pinned(&conn, node.id, true, Actor::Human, None).unwrap();
+        assert_eq!(ledger(&conn, node.id), vec![MutationOp::Pin]);
+        set_pinned(&conn, node.id, false, Actor::Human, None).unwrap();
+        set_pinned(&conn, node.id, false, Actor::Human, None).unwrap();
+        assert_eq!(
+            ledger(&conn, node.id),
+            vec![MutationOp::Pin, MutationOp::Unpin]
+        );
+
+        // An id that names nothing has no history to add to.
+        set_pinned(&conn, 999_999, true, Actor::Human, None).unwrap();
+        assert!(ledger(&conn, 999_999).is_empty());
+    }
+
+    /// `pinned` and `meta` are on the sync wire, and replication selects on
+    /// `updated_at`: a setter that leaves it alone changes a field no peer
+    /// will ever hear about.
+    #[test]
+    fn setting_a_synced_field_marks_the_row_changed() {
+        type Setter = fn(&Connection, i64);
+        let setters: [(&str, Setter); 5] = [
+            ("set_pinned", |c, id| {
+                set_pinned(c, id, true, Actor::Human, None).unwrap()
+            }),
+            ("set_expiry", |c, id| {
+                set_expiry(c, id, Some(now_unix() + 86_400), Some("when it ships")).unwrap()
+            }),
+            ("set_fires_when", |c, id| {
+                set_fires_when(c, id, &["release checklist".into()]).unwrap()
+            }),
+            ("set_confidence", |c, id| {
+                set_confidence(c, id, crate::model::MemoryConfidence::Unsure).unwrap()
+            }),
+            ("set_anchors", |c, id| {
+                crate::anchors::set_anchors(c, id, &["store.rs".into()]).unwrap()
+            }),
+        ];
+        for (name, set) in setters {
+            let conn = conn();
+            let node = remembered(&conn, "an old global memory");
+            let before = backdate(&conn, node.id, 30 * 86_400);
+            // Where a peer's cursor stands: everything up to now is synced.
+            let cursor = now_unix() - 1;
+            assert!(crate::replicate::changes_since(&conn, cursor)
+                .unwrap()
+                .nodes
+                .is_empty());
+
+            set(&conn, node.id);
+
+            assert!(
+                get_node(&conn, node.id).unwrap().updated_at > before,
+                "{name} must bump updated_at"
+            );
+            let sent: Vec<String> = crate::replicate::changes_since(&conn, cursor)
+                .unwrap()
+                .nodes
+                .into_iter()
+                .map(|n| n.uid)
+                .collect();
+            assert_eq!(sent, vec![node.uid.clone()], "{name} must replicate");
+        }
+    }
+
+    #[test]
+    fn pinning_respects_the_lifecycle() {
+        let conn = conn();
+        let old = remembered(&conn, "deploys go to eu-west-1");
+        let new = remembered(&conn, "deploys go to eu-north-1");
+        set_superseded(&conn, old.id, new.id, Actor::Human, None).unwrap();
+        let err = set_pinned(&conn, old.id, true, Actor::Human, None).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+        assert!(text.contains("superseded"), "{text}");
+        assert!(
+            text.contains(&crate::model::short_uid(Kind::Memory, &new.uid)),
+            "must name the replacement: {text}"
+        );
+        assert!(!get_node(&conn, old.id).unwrap().pinned);
+
+        let gone = remembered(&conn, "a fact someone deleted");
+        soft_delete(&conn, gone.id, Actor::Human, None).unwrap();
+        let text = set_pinned(&conn, gone.id, true, Actor::Human, None)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("forgotten"), "{text}");
+
+        let decayed = remembered(&conn, "a fact that decayed");
+        archive(&conn, decayed.id, now_unix());
+        let text = set_pinned(&conn, decayed.id, true, Actor::Human, None)
+            .unwrap_err()
+            .to_string();
+        assert!(text.contains("archived"), "{text}");
+
+        // Unpinning is always allowed: a pin that predates the retirement
+        // (or arrived over sync) must be removable.
+        conn.execute("UPDATE node SET pinned = 1 WHERE id = ?1", [old.id])
+            .unwrap();
+        set_pinned(&conn, old.id, false, Actor::Human, None).unwrap();
+        assert!(!get_node(&conn, old.id).unwrap().pinned);
+
+        // Expired is not retired by anyone's decision; pinning it is allowed.
+        let lapsed = remembered(&conn, "the cert is valid until spring");
+        set_expiry(&conn, lapsed.id, Some(now_unix() - 60), None).unwrap();
+        set_pinned(&conn, lapsed.id, true, Actor::Human, None).unwrap();
+        assert!(get_node(&conn, lapsed.id).unwrap().pinned);
+    }
+
+    /// Several processes meeting a directory for the first time at the same
+    /// moment register it once. (Each of these threads has a connection of
+    /// its own to one store file, as each hook process does.)
+    #[test]
+    fn first_contact_from_several_processes_makes_one_project_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mimir.db");
+        drop(db::open(&path).unwrap());
+        for round in 0..25 {
+            let root = format!("/home/u/project-{round}");
+            let start = std::sync::Arc::new(std::sync::Barrier::new(6));
+            let ids: Vec<i64> = (0..6)
+                .map(|_| {
+                    let (path, root, start) = (path.clone(), root.clone(), start.clone());
+                    std::thread::spawn(move || {
+                        let conn = db::open(&path).unwrap();
+                        start.wait();
+                        ensure_project(&conn, &root, "project").unwrap().id
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|thread| thread.join().unwrap())
+                .collect();
+            let conn = db::open(&path).unwrap();
+            let rows: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM node WHERE kind = 'project' AND path = ?1",
+                    [&root],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(rows, 1, "round {round}: {rows} rows for one directory");
+            assert!(
+                ids.iter().all(|id| *id == ids[0]),
+                "round {round}: callers were handed different rows: {ids:?}"
+            );
+        }
+    }
+
+    /// A store that already holds several rows for one directory (written
+    /// before the insert was guarded) resolves to the oldest of them, always
+    /// the same one.
+    #[test]
+    fn a_directory_with_several_rows_resolves_to_the_oldest() {
+        let c = db::open_in_memory().unwrap();
+        let first = ensure_project(&c, "/home/u/twice", "twice").unwrap();
+        let mut duplicate = NewNode::new(Kind::Project);
+        duplicate.title = Some("twice".into());
+        duplicate.path = Some("/home/u/twice".into());
+        let second = insert_node(&c, duplicate).unwrap();
+        assert!(second.id > first.id);
+        for _ in 0..3 {
+            assert_eq!(
+                ensure_project(&c, "/home/u/twice", "twice").unwrap().id,
+                first.id
+            );
+        }
+    }
+
+    /// Resolving a keyed project adopts it, on every command and every hook
+    /// event. When the row is already bound to this path under this name
+    /// that is a read: an `UPDATE` would take the write lock for nothing,
+    /// and a hook would queue for it behind whatever else was writing.
+    #[test]
+    fn adopting_a_project_already_bound_writes_nothing() {
+        let c = db::open_in_memory().unwrap();
+        let shadow = resolve_or_shadow_project(&c, "git:github.com/o/r").unwrap();
+
+        adopt_project(&c, shadow, "/home/u/r", "r").unwrap();
+        let bound = get_node(&c, shadow).unwrap();
+        assert_eq!(bound.path.as_deref(), Some("/home/u/r"));
+        assert!(bound.meta.get("shadow").is_none());
+
+        let before = c.total_changes();
+        adopt_project(&c, shadow, "/home/u/r", "r").unwrap();
+        assert_eq!(
+            c.total_changes(),
+            before,
+            "nothing to change, nothing written"
+        );
+
+        // A move or a rename is still written.
+        adopt_project(&c, shadow, "/home/u/elsewhere", "r").unwrap();
+        assert_eq!(
+            get_node(&c, shadow).unwrap().path.as_deref(),
+            Some("/home/u/elsewhere")
+        );
+        adopt_project(&c, shadow, "/home/u/elsewhere", "renamed").unwrap();
+        assert_eq!(
+            get_node(&c, shadow).unwrap().title.as_deref(),
+            Some("renamed")
+        );
+        // And a row that is not a project is left alone, as before.
+        adopt_project(&c, i64::MAX, "/nowhere", "nothing").unwrap();
+    }
+
+    #[test]
+    fn reprojecting_to_where_it_already_is_records_nothing() {
+        let c = conn();
+        let proj = ensure_project(&c, "/abs/here", "here").unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.title = Some("m".into());
+        new.project_id = Some(proj.id);
+        let m = insert_node(&c, new).unwrap();
+        let before = backdate(&c, m.id, 3600);
+        let m = get_node(&c, m.id).unwrap();
+
+        reproject(&c, &m, Some(proj.id), Actor::Human, None).unwrap();
+        assert!(ledger(&c, m.id).is_empty());
+        assert_eq!(get_node(&c, m.id).unwrap().updated_at, before);
+
+        // Global to global is the same no-op.
+        reproject(&c, &m, None, Actor::Human, None).unwrap();
+        let global = get_node(&c, m.id).unwrap();
+        reproject(&c, &global, None, Actor::Human, None).unwrap();
+        assert_eq!(ledger(&c, m.id), vec![MutationOp::Reproject]);
+    }
+
+    /// Archival is the one tombstone nobody decided, so `remember` lets the
+    /// fact back in. Forgetting it afterwards has to take that away again.
+    #[test]
+    fn forgetting_an_archived_memory_makes_it_forgotten() {
+        let conn = conn();
+        let node = remembered(&conn, "cargo nextest needs a separate install");
+        crate::revision::snapshot(&conn, &node);
+        let archived_at = now_unix() - 5 * 86_400;
+        archive(&conn, node.id, archived_at);
+        backdate(&conn, node.id, 5 * 86_400);
+        let now = now_unix();
+        assert_eq!(
+            get_node(&conn, node.id).unwrap().lifecycle(now),
+            crate::lifecycle::Lifecycle::Archived
+        );
+
+        soft_delete(&conn, node.id, Actor::Human, Some("was never true")).unwrap();
+
+        let gone = get_node(&conn, node.id).unwrap();
+        assert_eq!(gone.lifecycle(now), crate::lifecycle::Lifecycle::Forgotten);
+        assert!(gone.meta.get("archived").is_none());
+        assert_eq!(
+            gone.deleted_at,
+            Some(archived_at),
+            "it left the store when it was archived; `--as-of` reads that date"
+        );
+        assert!(gone.updated_at >= now, "the change must replicate");
+        assert!(crate::revision::history(&conn, node.id).unwrap().is_empty());
+        let h = crate::audit::history(&conn, node.id).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].op, MutationOp::Forget);
+        assert_eq!(h[0].reason.as_deref(), Some("was never true"));
+
+        // Forgetting what is already forgotten is still a no-op.
+        soft_delete(&conn, node.id, Actor::Human, None).unwrap();
+        assert_eq!(crate::audit::history(&conn, node.id).unwrap().len(), 1);
+    }
+
+    /// A forget that keeps the prior wordings, or leaves no ledger row, has
+    /// not done what it reports.
+    #[test]
+    fn a_forget_lands_whole_or_not_at_all() {
+        let conn = conn();
+        let node = remembered(&conn, "staging rotates credentials on Sundays");
+        break_inserts(&conn, "mutation");
+
+        assert!(soft_delete(&conn, node.id, Actor::Human, None).is_err());
+        assert!(
+            get_node(&conn, node.id).unwrap().deleted_at.is_none(),
+            "the tombstone must roll back with the ledger row"
+        );
+    }
+
+    #[test]
+    fn hard_delete_refuses_a_node_others_were_superseded_by() {
+        let conn = conn();
+        let old = remembered(&conn, "the retry budget is 3");
+        let new = remembered(&conn, "the retry budget is 5");
+        set_superseded(&conn, old.id, new.id, Actor::Human, None).unwrap();
+
+        let err = hard_delete(&conn, new.id, Actor::Human, None).unwrap_err();
+        let text = err.to_string();
+        assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+        assert!(
+            text.contains(&crate::model::short_uid(Kind::Memory, &old.uid)),
+            "must name what was superseded by it: {text}"
+        );
+        assert!(get_node(&conn, new.id).is_ok(), "nothing was deleted");
+        assert!(ledger(&conn, new.id).is_empty());
+
+        // Once nothing points at it, it goes.
+        hard_delete(&conn, old.id, Actor::Human, None).unwrap();
+        hard_delete(&conn, new.id, Actor::Human, None).unwrap();
+        assert!(matches!(get_node(&conn, new.id), Err(Error::NotFound(_))));
+    }
+
+    #[test]
+    fn hard_delete_takes_the_review_rows_with_it() {
+        let conn = conn();
+        let a = remembered(&conn, "the cron runs at 03:00");
+        let b = remembered(&conn, "the cron runs at 04:00");
+        let c = remembered(&conn, "an unrelated memory");
+        use crate::review::{enqueue, Finding};
+        enqueue(&conn, Finding::Contradiction, a.id, Some(b.id), None).unwrap();
+        enqueue(&conn, Finding::Contradiction, c.id, Some(a.id), None).unwrap();
+        enqueue(&conn, Finding::Unresolved, c.id, None, None).unwrap();
+
+        hard_delete(&conn, a.id, Actor::Human, None).unwrap();
+
+        let left: Vec<i64> = conn
+            .prepare("SELECT node_id FROM review")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(left, vec![c.id], "only the finding that never named it");
+    }
+
+    #[test]
+    fn supersede_writes_the_column_the_edge_and_the_dated_row_together() {
+        let conn = conn();
+        let old = remembered(&conn, "deploys go to eu-west-1");
+        let new = remembered(&conn, "deploys go to eu-north-1");
+
+        supersede(&conn, old.id, new.id, Actor::Human, Some("region move")).unwrap();
+
+        assert_eq!(get_node(&conn, old.id).unwrap().superseded_by, Some(new.id));
+        let edges = edges_of(&conn, old.id).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            (edges[0].src, edges[0].dst, edges[0].rel),
+            (new.id, old.id, Rel::Supersedes)
+        );
+        let h = crate::audit::history(&conn, old.id).unwrap();
+        assert_eq!(h.len(), 1);
+        assert_eq!(h[0].op, MutationOp::Supersede);
+        assert_eq!(h[0].reason.as_deref(), Some("region move"));
+        assert_eq!(h[0].before_hash, old.content_hash);
+        assert_eq!(h[0].after_hash, new.content_hash);
+        assert!(crate::audit::superseded_at(&conn, old.id)
+            .unwrap()
+            .is_some());
+
+        // Saying it again changes nothing and records nothing.
+        supersede(&conn, old.id, new.id, Actor::Agent, None).unwrap();
+        assert_eq!(crate::audit::history(&conn, old.id).unwrap().len(), 1);
+        assert_eq!(edges_of(&conn, old.id).unwrap().len(), 1);
+    }
+
+    /// The failure four call sites shared: column first, edge second, no
+    /// transaction. An error between the two left a memory retired with no
+    /// edge to say by what.
+    #[test]
+    fn a_supersede_that_fails_halfway_leaves_nothing_behind() {
+        for broken in ["edge", "mutation"] {
+            let conn = conn();
+            let old = remembered(&conn, "the retry budget is 3");
+            let new = remembered(&conn, "the retry budget is 5");
+            break_inserts(&conn, broken);
+
+            assert!(supersede(&conn, old.id, new.id, Actor::Human, None).is_err());
+            assert!(
+                get_node(&conn, old.id).unwrap().superseded_by.is_none(),
+                "a failed {broken} write must take the column back with it"
+            );
+            assert!(edges_of(&conn, old.id).unwrap().is_empty());
+        }
+    }
+
+    /// Inside a caller's transaction (consolidation, a review decision) a
+    /// failed supersede undoes itself and leaves the caller's work standing.
+    #[test]
+    fn supersede_nests_inside_a_callers_transaction() {
+        let conn = conn();
+        let old = remembered(&conn, "the retry budget is 3");
+        let new = remembered(&conn, "the retry budget is 5");
+        let tx =
+            rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+        let earlier = remembered(&tx, "written earlier in the same transaction");
+        set_pinned(&tx, old.id, true, Actor::Human, None).unwrap();
+        assert!(supersede(&tx, old.id, new.id, Actor::Human, None).is_err());
+        set_pinned(&tx, old.id, false, Actor::Human, None).unwrap();
+        supersede(&tx, old.id, new.id, Actor::Human, None).unwrap();
+        tx.commit().unwrap();
+
+        assert!(get_node(&conn, earlier.id).is_ok());
+        assert_eq!(get_node(&conn, old.id).unwrap().superseded_by, Some(new.id));
+    }
+
+    /// An expired replacement strands the pair as surely as a deleted one:
+    /// the old memory is superseded, the new one is past its date, and
+    /// recall shows neither.
+    #[test]
+    fn supersede_refuses_an_expired_replacement() {
+        let conn = db::open_in_memory().unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.body = Some("the freeze is on until friday".into());
+        let old = insert_node(&conn, new).unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.body = Some("the freeze was extended one day".into());
+        let by = insert_node(&conn, new).unwrap();
+        set_expiry(&conn, by.id, Some(now_unix() - 60), None).unwrap();
+
+        let err = supersede(&conn, old.id, by.id, Actor::Human, None)
+            .expect_err("an expired replacement must be refused")
+            .to_string();
+
+        assert!(err.contains("is expired"), "{err}");
+        assert_eq!(get_node(&conn, old.id).unwrap().superseded_by, None);
+    }
+
+    #[test]
+    fn supersede_refuses_what_would_strand_a_memory() {
+        let conn = conn();
+        let a = remembered(&conn, "first wording of the rule");
+        let b = remembered(&conn, "second wording of the rule");
+        let c = remembered(&conn, "third wording of the rule");
+        let refused = |old: i64, by: i64| -> String {
+            let err = supersede(&conn, old, by, Actor::Human, None).unwrap_err();
+            assert!(matches!(err, Error::Invalid(_)), "{err:?}");
+            err.to_string()
+        };
+
+        assert!(refused(a.id, a.id).contains("itself"));
+
+        // Only memories.
+        let project = ensure_project(&conn, "/abs/p", "p").unwrap();
+        assert!(refused(project.id, a.id).contains("not a memory"));
+        assert!(refused(a.id, project.id).contains("not a memory"));
+
+        // A pinned memory is never superseded.
+        set_pinned(&conn, a.id, true, Actor::Human, None).unwrap();
+        assert!(refused(a.id, b.id).contains("pinned"));
+        set_pinned(&conn, a.id, false, Actor::Human, None).unwrap();
+
+        // A replacement that is itself gone would hide `a` behind nothing.
+        let gone = remembered(&conn, "a wording someone deleted");
+        soft_delete(&conn, gone.id, Actor::Human, None).unwrap();
+        assert!(refused(a.id, gone.id).contains("forgotten"));
+        let decayed = remembered(&conn, "a wording that decayed");
+        archive(&conn, decayed.id, now_unix());
+        assert!(refused(a.id, decayed.id).contains("archived"));
+
+        // a → b → c is a chain; closing it into a loop is refused at any
+        // distance, and names both ends.
+        supersede(&conn, a.id, b.id, Actor::Human, None).unwrap();
+        supersede(&conn, b.id, c.id, Actor::Human, None).unwrap();
+        let text = refused(b.id, a.id);
+        assert!(text.contains("loop"), "{text}");
+        let text = refused(c.id, a.id);
+        assert!(
+            text.contains(&crate::model::short_uid(Kind::Memory, &a.uid))
+                && text.contains(&crate::model::short_uid(Kind::Memory, &c.uid)),
+            "{text}"
+        );
+        assert!(get_node(&conn, c.id).unwrap().superseded_by.is_none());
+
+        // A cycle written before the guard existed must end the walk, not
+        // spin it.
+        let x = remembered(&conn, "ping");
+        let y = remembered(&conn, "pong");
+        set_superseded(&conn, x.id, y.id, Actor::System, None).unwrap();
+        set_superseded(&conn, y.id, x.id, Actor::System, None).unwrap();
+        let z = remembered(&conn, "pang");
+        supersede(&conn, z.id, x.id, Actor::Human, None).unwrap();
+    }
+
+    #[test]
+    fn forget_reaches_every_state_it_should() {
+        let conn = conn();
+        let short = |n: &Node| crate::model::short_uid(n.kind, &n.uid);
+        let now = now_unix();
+
+        let node = remembered(&conn, "a fact to remove entirely");
+        let decayed = remembered(&conn, "a fact that decayed while idle");
+
+        // A tombstone can be removed for good.
+        forget(&conn, &short(&node), false, Actor::Human, None).unwrap();
+        assert!(resolve_ref(&conn, &short(&node)).is_err());
+        forget(&conn, &short(&node), true, Actor::Human, None).unwrap();
+        assert!(matches!(get_node(&conn, node.id), Err(Error::NotFound(_))));
+
+        // An archived memory becomes a deliberate forget.
+        archive(&conn, decayed.id, now - 86_400);
+        let was = forget(&conn, &short(&decayed), false, Actor::Human, None).unwrap();
+        assert_eq!(was.lifecycle(now), crate::lifecycle::Lifecycle::Archived);
+        assert_eq!(
+            get_node(&conn, decayed.id).unwrap().lifecycle(now),
+            crate::lifecycle::Lifecycle::Forgotten
+        );
+
+        // Forgetting it again would report a deletion that did not happen.
+        let err = forget(&conn, &short(&decayed), false, Actor::Human, None).unwrap_err();
+        assert!(err.to_string().contains("already forgotten"), "{err}");
+        assert_eq!(ledger(&conn, decayed.id), vec![MutationOp::Forget]);
+
+        // A project is not a memory.
+        let project = ensure_project(&conn, "/abs/p", "p").unwrap();
+        for hard in [false, true] {
+            let err = forget(&conn, &short(&project), hard, Actor::Human, None).unwrap_err();
+            assert!(err.to_string().contains("not a memory"), "{err}");
+        }
+        assert!(get_node(&conn, project.id).unwrap().deleted_at.is_none());
+
+        // Nothing at all still reads as not found.
+        assert!(matches!(
+            forget(&conn, "ZZZZZZ", false, Actor::Human, None),
+            Err(Error::NotFound(_))
+        ));
+    }
+
+    /// A stored node and a tombstone can share a short id. `forget` must
+    /// keep resolving to the stored one, as it did before tombstones could
+    /// resolve at all.
+    #[test]
+    fn forget_prefers_a_stored_node_over_a_tombstone_with_the_same_tail() {
+        let conn = conn();
+        let now = now_unix();
+        for (prefix, deleted) in [
+            ("01AAAAAAAAAAAAAAAAAA", Some(now)),
+            ("01BBBBBBBBBBBBBBBBBB", None),
+        ] {
+            conn.execute(
+                "INSERT INTO node (uid, kind, created_at, updated_at, deleted_at)
+                 VALUES (?1, 'memory', ?2, ?2, ?3)",
+                params![format!("{prefix}XYXYXY"), now, deleted],
+            )
+            .unwrap();
+        }
+        let was = forget(&conn, "m:XYXYXY", false, Actor::Human, None).unwrap();
+        assert!(was.uid.starts_with("01BBB"));
+    }
+
+    #[test]
+    fn a_session_keeps_its_state_for_as_long_as_it_is_running() {
+        let conn = conn();
+        let n = memory(&conn, "gamma", "z");
+        let now = now_unix();
+        let old = now - 10 * 86_400;
+        let state = |session: &str, key: &str, at: i64| {
+            conn.execute(
+                "INSERT INTO session_state (session_id, key, value, updated_at)
+                 VALUES (?1, ?2, 'v', ?3)",
+                params![session, key, at],
+            )
+            .unwrap();
+        };
+        let injected = |session: &str, at: i64| {
+            conn.execute(
+                "INSERT INTO injection_log (session_id, node_id, at) VALUES (?1, ?2, ?3)",
+                params![session, n.id, at],
+            )
+            .unwrap();
+        };
+        // A long session: marker written ten days ago, still firing briefs.
+        state("long", "transcript_marker", old);
+        state("long", "brief_fire_count", now);
+        injected("long", old);
+        // A long session whose only recent sign of life is an injection.
+        state("injecting", "transcript_marker", old);
+        injected("injecting", now);
+        // A session that ended ten days ago.
+        state("ended", "transcript_marker", old);
+        state("ended", "brief_fire_count", old);
+        injected("ended", old);
+
+        let removed = prune_sessions(&conn, now - 7 * 86_400).unwrap();
+
+        assert_eq!(
+            removed, 4,
+            "the ended session's three rows, and the long session's old injection"
+        );
+        for session in ["long", "injecting"] {
+            assert!(
+                get_session_state(&conn, session, "transcript_marker")
+                    .unwrap()
+                    .is_some(),
+                "{session} lost its transcript marker while still running"
+            );
+        }
+        assert!(get_session_state(&conn, "ended", "transcript_marker")
+            .unwrap()
+            .is_none());
+        // An injection mark lapses with the window whatever the session is
+        // doing, so the memory can be shown to a long session again.
+        assert!(!injection_seen(&conn, "long", n.id).unwrap());
+        assert!(injection_seen(&conn, "injecting", n.id).unwrap());
+        assert!(!injection_seen(&conn, "ended", n.id).unwrap());
     }
 
     #[test]

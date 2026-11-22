@@ -38,8 +38,422 @@ the `mimir-mem` crate, and the on-disk schema move together.
   one opened in the last 30 minutes. The report says plainly that the
   comparison favours live. `[learn] shadow_ranking = false` to disable.
 
+- **A memory's state has a name, and the surfaces that show one print it.**
+  A memory is always one of live, superseded, expired, archived or forgotten,
+  but that was spread over four columns and worked out separately by each
+  reader. It is now one type (`lifecycle::Lifecycle`) with one derivation. A
+  memory that is not live says so in one word on the compact line (`[gotcha
+  11-18 superseded]`, CLI and MCP) and as `"lifecycle"` in `--json`; `get`
+  leads with why (`! superseded by m:… — kept as history`), and shows a
+  pending `expires:` date and the `resolves when:` condition, which was
+  echoed at capture and never shown again. In link lists (`get`, `graph
+  node`) a retired memory is marked `[superseded]` or `[expired]`. A live
+  memory's line is unchanged.
+- **`mimir project prune` — projects whose directory is gone.** A project is
+  registered the first time anything runs in a directory and its code graph
+  is built on first use; nothing ever removed one, so a deleted worktree or a
+  scratch clone kept its whole graph for good. `mimir project prune` lists
+  such projects with what they still hold and changes nothing; `--apply`
+  removes their symbols, code-file rows and edges. Memories are never
+  removed, and a symbol or a code file a memory is linked to is kept as a
+  tombstone so the memory reads `stale` instead of losing its link. Only a
+  directory the filesystem says is absent counts: one that cannot be checked
+  (no permission to look, a relative path) is never listed. Rows are removed
+  in transactions of a quarter of a second with a pause after each, so other
+  writers to the store are not held up, and a prune that is interrupted is
+  finished by running it again. It ends by saying how much of the store
+  file is free and the command that shrinks the file. Rehearsed on a store
+  of 3.7 million rows: 1.13 million symbols of 127 dead projects removed in
+  4 to 11 minutes while a second process wrote throughout (953 writes, none
+  failed, the slowest 1.2 s); a `VACUUM` afterwards took 39 s and took the
+  file from 8.1 GB to 3.9 GB.
+  `mimir doctor` says when there is something to prune, and stops saying so
+  once it has been done.
+- **`mimir sync push --full` and `mimir sync pull --full`.** Send or ask for
+  everything instead of what changed since the last round. Both are safe to
+  repeat (the merge keeps the winning version of each memory). They exist for the one-time
+  repair after a hub upgrade: see "Sync" under Fixed.
+- **`mimir graph build --full`** re-extracts every file and rebuilds every
+  edge, for when an answer looks wrong.
+- **Graph answers say how far to trust them.** `callers`, `calls`, `impact`,
+  `path` and `node` add `note: the code graph is N file(s) behind the working
+  tree` when it is (CLI: stderr; MCP: last line; checked for projects of up
+  to 5,000 code files), `peek` says when its one file changed since the
+  build, and a result reached only through an ambiguous call edge is marked
+  `(unconfirmed call)`.
+- **`mimir doctor` reports more of what can be wrong:** a config value no
+  mode recognises (with what the setting behaves as meanwhile), installed
+  hook scripts older than this binary, a daemon that wants a bearer token the
+  environment does not have, lookup indexes not built yet, and projects left
+  behind by a deleted directory.
+- **`mimir project init --no-sync`** turns project sync off again; `--sync`
+  could only ever turn it on.
+- **`recall --json`** keeps `strength` as the match label and adds the learned
+  number as `node_strength`. **`remember --json`** prints one JSON object
+  carrying what was attached (expiry, confidence, link), where it used to
+  print a JSON line followed by prose.
+
+### Fixed
+
+Projects and worktrees:
+
+- **A git worktree shares its repository's memories.** Project identity was
+  the checkout's path, so a `git worktree add` checkout was a project of its
+  own: it saw none of the main checkout's project memories, and what was
+  remembered in it stayed behind under a dead project when the worktree was
+  deleted. With a committed `.mimir` id it was the other way round: every
+  checkout shared one project row, whose path, and with it the code graph,
+  followed whichever checkout ran last. One id was answering two questions.
+  Now memories belong to the repository and the code graph to the checkout.
+  A linked worktree keeps a project of its own for `graph`, `peek`,
+  `outline`, docs collections and `project prune`, and files and reads
+  memories under the main checkout's project: `remember`, `list`, the brief,
+  per-prompt injection, guard anchors, the rules pack, `misses`. `recall`
+  reads both in one ranked list: the repository's memories and the
+  worktree's own code and docs. A worktree is recognised from its `.git`
+  file, with no git subprocess. Memories already filed under a worktree's
+  own project move to the main checkout's with the first memory command run
+  there (`remember`, `recall`, `list` and the like, or an MCP server
+  starting), which says so on one line, including when they will now be
+  sent at the next sync; one ledger row each (`mimir audit`). Hooks,
+  `status` and `doctor` never move anything. Only memories written since the
+  worktree was created move: one left at that path by an earlier,
+  unrelated checkout stays where it is. `mimir status` and the MCP `status`
+  tool add `linked worktree of <path>; memories are filed under project
+  <name>`; `status --json` gains `checkout`, `worktree_of`, `memory_project`,
+  `memory_project_path`, `memory_filing` and `worktree_memories`.
+  Stays a project of its own, as before: a submodule; a worktree of a bare
+  repository; and a worktree whose committed `.mimir` id is not the one the
+  main checkout carries (the marker not merged to main yet, or unreadable
+  there), so a sync identity is never taken from a project. A main checkout
+  made with `git init --separate-git-dir` is not found from its worktrees
+  (that layout records no path back to it); they share a project under the
+  directory that holds the repository. A worktree of a submodule shares the
+  submodule checkout's memories. A directory counts as a worktree only when
+  the repository names it back (`<gitdir>/gitdir`, which git writes), so a
+  hand-written `.git` file cannot make a directory read another
+  repository's memories.
+- **A session handoff stays with the checkout it was written in.** Worktrees
+  of one repository now share a memory project, and a handoff belonged to a
+  project: the first session to clear would have been handed whichever
+  snapshot was written last, by any of them. A handoff records its checkout
+  (`meta.handoff_checkout`) and is restored, re-armed, listed, recalled and
+  injected only there (`--all` and `get <id>` still show it). A handoff an
+  older build wrote in a worktree is given that worktree's checkout when it
+  moves home. One written outside any worktree before this records none and
+  behaves as before.
+- **Upgrading a store that already has worktrees.** What you may notice:
+  memories that were filed under a worktree now carry the main checkout's
+  project label, and if that project syncs, they sync from now on. If a
+  worktree and the main checkout each had a rules pack, the one whose text
+  is newer is in force, and `mimir rules show` names the other. In a
+  repository with a committed `.mimir` id, a docs collection that was added
+  from a worktree is filed under the main checkout: run `mimir docs remove
+  <name>`, then `docs add` and `mimir index` in the worktree, to make
+  `recall` there find it again; and the main checkout's code graph may have
+  been built from a worktree's files (`mimir graph build` there repairs it).
+  Restart long-running `mimir mcp` servers and the daemon after upgrading: a
+  server on the old build still files and reads by the old rule.
+- **`mimir project prune --apply` and worktrees.** A memory linked to a
+  symbol or file of a pruned worktree is re-linked to the same code in the
+  main checkout, so it stays grounded instead of reading `stale`. A main
+  checkout's project is kept while a live worktree still files memories
+  under it.
+- **Several processes opening a new directory at once registered it
+  several times.** A session start runs three hooks side by side; each could
+  insert its own project row, and later lookups used only one of them.
+  Registration now looks again under the write lock, and a directory that
+  already has several rows resolves to the oldest. Existing duplicates are
+  left as they are (on the store this was tested on, 9 directories, all
+  extra rows empty).
+- **Every hook event in a project with a sync identity took the store's
+  write lock.** Resolving such a project re-bound it to its path with an
+  `UPDATE` whether or not anything had changed. It reads first now.
+
+Capture, edit, forget:
+
+- **A rejected capture was stored anyway.** The MCP `remember` tool parsed
+  `expires_in` and `confidence` after the insert: the memory went in without
+  its deadline, the caller got `invalid …`, and the corrected retry was
+  refused as a near-duplicate. `mimir remember --link <unknown>` did the same.
+  Both surfaces now run one pipeline (`capture.rs`): every argument is
+  validated first, and the memory and everything attached to it are written
+  in one transaction, so a capture is stored as asked or not at all. An
+  invalid argument is therefore reported ahead of a duplicate refusal.
+- **The secret guard had gaps.** It scanned the body, the tags and the
+  trigger phrases of a new memory. An `--anchor`, a `--resolves-when`
+  condition, `edit --title`, `rules set` and `docs note` all stored free text
+  unscanned, and so did `mimir anchor`. They go through the same guard now.
+- **Retired memories were still handed to agents as current.** A guard anchor
+  kept injecting a superseded memory's text, ahead of the memory that
+  replaced it; the replacement now speaks for it. An expired guard no longer
+  fires. The session brief admitted expired gotchas and decisions. The
+  handoff restore brought back a handoff that had expired or been superseded.
+- **A forgotten memory still showed up through its links.** `get` and `graph
+  node` printed the title of a deliberately deleted memory to anyone who
+  opened something it had been linked to.
+- **Supersede was two writes that could come apart.** It is one atomic
+  operation everywhere (CLI, MCP, review, consolidation), and refuses what
+  would strand a memory: a non-memory on either side, a deleted or expired
+  replacement, and a loop. Repeating a supersede records nothing.
+- **`forget` could not reach everything it should.** `forget --hard` now
+  works on an existing tombstone; forgetting an archived memory makes it a
+  deliberate forget (its earlier wordings go, `remember` then refuses the
+  text); hard-deleting a memory others were superseded by names them instead
+  of failing with `FOREIGN KEY constraint failed`; a project cannot be
+  forgotten. The refusal for a forgotten memory names who forgot it (a
+  person, an agent, another machine) and the day it was forgotten.
+- **Changes that change nothing left history.** `edit --pin` alone wrote a
+  revision and an `edit` row; so did an edit with the same text, and a pin
+  that was already set. A tags-only edit no longer resets the title. A
+  superseded or deleted memory cannot be pinned.
+- **An exact copy of a superseded or expired memory was refused as a
+  duplicate** of a memory recall no longer shows. It can be remembered again.
+  (Imports are stricter on purpose: re-running one never re-creates what the
+  store retired.)
+- **Imported notes were archived by the next weekly pass, and never synced.**
+  The importer backdated both timestamps; it now keeps the date a note was
+  written and counts the import itself as the change. The decay pass leaves
+  alone anything that changed inside the idle window.
+- **Review queue.** A decision is atomic and refused if the finding was
+  decided meanwhile; `--supersede` on a finding the store has moved past is
+  refused with what to do; findings whose subject no longer stands leave the
+  list and are closed as `resolved` by the scan.
+- **Consolidation.** Expired memories take no part (an expired newer memory
+  could retire a live older one, hiding both); two near-duplicate summaries
+  no longer produce a new summary on every pass; a dry run reports what a
+  real run does; the weekly pass runs once across processes; a memory stored
+  without a type consolidates with the notes.
+- **The rules pack** is updated like any memory (previous text in `mimir
+  history`, an audit row, a fresh content hash) and is found by its exact tag
+  among current memories.
+- **A memory stored without a type** decayed as a note, was labelled
+  `memory`, and was not found by `list -t note`. It is a note everywhere.
+
+Sync (upgrade the hub first; then run `mimir sync push --full` and `mimir
+sync pull --full` once on each machine):
+
+- **A memory pushed long after it was written never reached the other
+  machines.** The hub answered a pull by each row's own timestamp, and a peer
+  that had pulled in the meantime had a cursor past it. The hub now relays by
+  when a row reached it. This is fixed on the hub; a hub on 0.17.1 still
+  loses such rows.
+- **Supersession did not replicate.** The wire carried the `supersedes` edge
+  but not the column that hides a memory, so one superseded on one machine
+  stayed live on every other. Records carry it now (an optional field an
+  older peer ignores). Two machines that retired a pair in opposite
+  directions each keep the one they kept, instead of hiding both everywhere.
+- **Decay archival deleted memories on machines that used them.** The weekly
+  pass archives by local usage, and the tombstone replicated. Archival stays
+  on the machine that decayed. Memories already removed everywhere by past
+  archival are not restored.
+- **A forget could lose to housekeeping.** A row archived locally by the
+  decay pass was shielded from a forget or an edit another machine had made
+  earlier, which was then never relayed, so the memory stayed live on every
+  third machine. Decay is not a write: an archived row is compared as the
+  live row it was.
+- **A pin could bring a forgotten memory back, and undo a rewrite.** Sync
+  ordered two versions of a memory by the row's last write of any kind, so a
+  pin, a tag or an anchor made on a machine that had not heard of a forget
+  outranked it and the memory came back everywhere; made on the old wording,
+  it replaced a rewrite made elsewhere. A memory now records when its *text*
+  was last decided (`meta.text_clock`, kept by every write that only
+  annotates), and versions are ordered by that first: the later decision
+  about what the memory says wins, and annotations only compete with each
+  other. A rewrite after a forget still wins, as it always did.
+- **Two machines changing one memory in the same second each kept their own
+  version for good.** One version wins now, the same one on every machine.
+- The whole ordering is one type (`replicate::Standing`), a total order, with
+  a test that runs two hundred random histories on three stores and requires
+  them to end in agreement. Stores on an older build order by the last write
+  alone; they agree with upgraded ones except where an annotation followed
+  an unseen forget or rewrite, so upgrade the hub and every machine.
+- **Pins, anchors and expiry replicate.** They mark the memory changed, like
+  a retag. A pin does not hold off a supersession made on another machine.
+- **A forget arriving over sync kept the memory's earlier wordings.** A local
+  `forget` purges them; the same deletion applied from a peer did not.
+- **`sync status` showed changes pending forever** after the first push; it
+  counts from what was pushed. File mode shows its directory and no cursors;
+  the token line says where the token comes from. An unknown `[sync] mode` is
+  one error from every sync command. The MCP server's background sync follows
+  `config.toml` without a restart and is quiet when sync is off. The hub
+  answers 400 to an unparseable `since` instead of sending everything; file
+  mode skips an unreadable peer file instead of stopping half-way.
+
+Recall, injection, embeddings:
+
+- **Per-prompt injection could inject the wrong memory.** With a session id,
+  which the hook always sends, a lower-ranked hit was injected when the top
+  hit failed the relevance floor: the case the floor exists to refuse, and
+  one the eval could not see because it scored the path without a session.
+  Both paths decide the same way now.
+- **A loaded model with no usable vectors silenced injection and made every
+  hit `weak`** (after a model switch, or before anything was embedded). An
+  empty vector leg is treated as not run, as with no model at all.
+- **Nodes stored without a content hash were re-embedded on every pass**
+  (docs notes, memories synced without one), which also kept the model
+  loading on every capture.
+- **A failed model load was final until restart.** It is retried, at first
+  after five minutes and at most once an hour while it keeps failing.
+- **`recall --as-of` showed today's wording.** A hit is shown as it read
+  then; it is still found by its current wording, and the banner says so.
+- **`recall --include-superseded` could close a miss** on the strength of a
+  retired memory. Views into the past or into retired memories no longer feed
+  the miss ledger.
+- **`recall --rerank` with no reranker** returned the fused order without a
+  word; CLI and MCP now say so.
+
+Hooks, init, daemon, MCP (re-run `mimir init --hooks` to get the new hook
+script):
+
+- **Warm auto-recall searched the wrong project.** The daemon scoped every
+  prompt to the directory it was started in; started by systemd, that is no
+  project, so it searched all of them. The hook script (v5) sends the
+  session's directory, and the bearer token when the daemon requires one.
+- **A hook command could fail a session start.** `brief show`, `rules show`
+  and the context-guard hooks exit 0 on any error and say why on stderr.
+  `rules show` follows the session's directory when run as a hook
+  (`--hook`, which the installer writes).
+- **A session handoff was restored on every later clear,** however old. It is
+  restored once; saving the same handoff again makes it pending again. The
+  pause-mode nudge tells you how to get a handoff back, since pause mode does
+  not restore one.
+- **A misspelled mode half-enabled a feature.** `[sync] mode = "sever"`
+  counted as enabled and then failed; a misspelled `[hooks] context_guard`
+  installed hooks and wrote state but never printed. Mode settings are parsed
+  in one place; an unknown value behaves as the documented safe value and
+  `doctor` names it.
+- **`mimir init --hooks`:** parses `settings.json` before writing anything;
+  backs it up only when it changes; treats an empty file as empty; exits
+  non-zero when the hook install it was asked for failed; upgrades its own
+  older entries in place and leaves alone any entry that also holds a hook of
+  yours; `--context-guard off` alone installs nothing; the SessionStart
+  commands do nothing when `mimir` is not on PATH; the line about the session
+  brief reflects the config.
+- **A server left running across an upgrade** kept answering from a store it
+  no longer understood. Every MCP tool now answers `error: this Mimir server
+  is older than its store … restart it`, and the daemon's `/inject` answers
+  503 so the hook falls back to the cold path, which runs the new binary.
+- **MCP tool failures were not all marked.** Every failure starts with
+  `error: `; `status` reports the project the tools actually use; `outline`
+  resolves a relative path against the server's project directory.
+- **The daemon** address is derived in one place (`MIMIR_INJECT_URL` now
+  moves the daemon, the delegation client and `doctor` as well as the hook);
+  `/inference` answers while the engine is busy; `doctor` probes the daemon
+  with the bearer the hook would send.
+
+Code graph:
+
+- **`graph impact` answered from other projects' files.** Paths were matched
+  across every project in the store, capped at three, and only then filtered
+  to the current one, so a checkout past the third was told `none of those
+  paths are in the code graph`; the MCP tool skipped the filter and answered
+  `no impact`. Both share one lookup and one outcome type now.
+- **`graph impact` missed files that depend on a change only by import.**
+  They are listed, marked `(reached by import only)`.
+- **An incremental build did not leave what a full build leaves.** Callers in
+  unchanged files kept a missing or stale edge when a symbol they call, or a
+  file they import, appeared or disappeared elsewhere, and `graph check`
+  still said current. Unchanged files are re-resolved when that happens.
+- **Imports resolve by language.** C and C++ includes, Java and Kotlin
+  imports and PHP requires fell into the Python rule and produced no edge;
+  the Rust rule matched `util.rs` against `db_util.rs` and never tried
+  `x/mod.rs`. An edge is written only when one file matches, and not at all
+  where the match would be a guess (a platform package, a bare header name,
+  a `<system>` include). A graph built before this was resolved by the old
+  rules: a project of up to 1,500 code files and 15,000 symbols is rebuilt
+  in full by its next ordinary build (`mimir graph build`, or the MCP
+  server's start-up build); a larger one says so on every answer until
+  `mimir graph build --full`.
+- **A symbol a memory is linked to** is kept as a tombstone when it leaves
+  its file, so the memory reads `stale` and the link survives the symbol's
+  return. A later ambiguous call no longer downgrades a resolved edge.
+- **A file that cannot be read or parsed** is skipped and reported instead of
+  aborting the build or erasing its symbols.
+- **MCP `graph` and `peek`** use the CLI's wording, and say when the project
+  has no graph yet instead of `no callers found`.
+- **Removing any row scanned the whole store, twice.** Two of the four
+  foreign keys into the node table had no index, so every deleted symbol,
+  chunk or memory cost time in proportion to the store (measured: 46 ms a row
+  at 500,000 rows, 0.04 ms with the indexes). The indexes are added without
+  a schema version; a large store gets them from `mimir init`.
+
+Proxy:
+
+- **A cache breakpoint could land where the API rejects one** (an empty text
+  block, a thinking block, a turn-scoped system message); it goes on the
+  nearest earlier block that can take one. A client that caches through a
+  tool definition, the top-level field or a nested block is recognised and
+  left alone; cache savings are claimed only where the proxy added a
+  breakpoint.
+- **Requests keep the client's bytes.** Every request used to be
+  re-serialised with its keys sorted. An unchanged request is forwarded as
+  sent, and a changed one keeps everything outside the changed values.
+- **Savings were booked for requests that were never accepted** (a 413 from
+  the size breaker, a failed send). They are recorded after upstream accepts.
+- **Cache-read measurement** no longer truncates a count split across chunks
+  and works on large non-streaming responses. De-duplication covers a
+  repeated plain-string message, and leaves alone a per-turn system reminder
+  (the API has already cleared the earlier copy, so eliding the new one hid
+  it from the model) and a tool result the client put a cache breakpoint
+  inside. `--prune` advances in steps so the request prefix, and with it the
+  prompt cache, survives between them. An oversized body gets 413
+  `request_too_large` instead of 502. A panicked ledger write no longer
+  switches recording off.
+- **Every request was tokenized for the size breaker, even with the breaker
+  off** (the default). It is counted only when a limit is set, which takes
+  about 38% off request preparation on a 4 MB conversation.
+
+CLI:
+
+- **Flags that were silently ignored are refused.** `mimir link A B
+  --dry-run` wrote the link it was asked to preview. Also: a review decision
+  without a finding, `misses --dismiss` with listing flags, and `--all`
+  together with `--global` on `recall` and `list`.
+- **`mimir link`** refuses relations Mimir derives for itself (`calls`,
+  `imports`, …): the next build would delete a hand-made one. Its help lists
+  what it accepts, built from the same list. `mimir report`'s "links created"
+  counted every call and import edge; it counts links somebody made.
+- **Docs commands with two collections under one name** acted on whichever
+  row came first. They prefer the docs collection, say which one they acted
+  on and which remain, and `mimir index <name>` indexes every match.
+- **The output-filter hook wrapped commands that never exit.** `mimir run`
+  prints when its child exits, so `kubectl logs -f`, `docker compose up` or
+  `npm run dev` showed an agent nothing, in the foreground until the timeout
+  and in the background for as long as the server lived. Followers, watchers
+  and dev servers are left unwrapped, also behind a global option
+  (`kubectl -n prod logs -f`, `pnpm --filter web dev`). The table is a list
+  of known commands: a server started some other way is still wrapped.
+- **`mimir run`** reports a child killed by a signal as 128 + the signal.
+  **`mimir project init`** refuses to overwrite a `.mimir` it cannot parse,
+  and leaves no marker behind when the store cannot be opened.
+
 ### Changed
 
+- **Things an existing script may notice.** `mimir doctor` exits 1 for an
+  invalid config value (the unattended `--check` only when the value has no
+  fallback). `mimir sync status` exits 1 on an unknown mode. `mimir forget`
+  on an already forgotten memory says so instead of `not found`. `mimir init
+  --hooks` exits non-zero when the install failed. A memory stored without a
+  type is labelled `note`, not `memory`. Pinning or anchoring a memory marks
+  it changed: it syncs and `get` shows `updated`. The session brief's age
+  tag follows the text, so it no longer restarts when a guard is anchored or
+  given a trigger (and does not when it is pinned). Memories that arrive
+  over sync get an audit row saying so. An
+  annotated memory carries `meta.text_clock` (when its text was last
+  decided), visible in `--json` and in exports. The dashboard's "superseded"
+  and "archived" tiles are the same counts `mimir status` prints; a memory
+  superseded and later forgotten used to be in both.
+- **For contributors: the one-definition rule is now a test.**
+  `crates/mimir-cli/tests/one_definition.rs` reads the workspace's
+  production source and fails when code outside a state's owners spells
+  that state by hand (a `meta` flag by its key, a lifecycle column written
+  directly, a mode compared as a string), naming the function to call
+  instead. A tripwire, not a proof; `docs/design/state-machines.md` is the
+  map it guards.
+- **None of the fixes above changes the schema.** They work on the v14
+  schema described next, and the two lookup indexes are not a schema
+  version, so a binary built before them still opens the store.
 - **Schema v13** adds the `recall_miss` table, **v14** the `shadow_rank`
   table. As with every schema bump, a
   store opened by this binary is refused by older ones (`SchemaTooNew`):

@@ -64,12 +64,14 @@ fn process(mimir: &mut Mimir, req: &mut tiny_http::Request, token: &str) -> Resu
     let path = url.split('?').next().unwrap_or("");
     match (req.method(), path) {
         (Method::Get, "/sync/pull") => {
-            let since = url
-                .split_once("since=")
-                .and_then(|(_, s)| s.split('&').next())
-                .and_then(|s| s.parse::<i64>().ok())
-                .unwrap_or(0);
-            let batch = replicate::changes_since(&mimir.conn, since)?;
+            let since = match pull_since(&url) {
+                Ok(since) => since,
+                Err(why) => return Ok((400, why)),
+            };
+            // By arrival, in this hub's clock — not `changes_since`, which
+            // cuts by the rows' own timestamps and so never hands a peer a
+            // row that reached the hub late.
+            let batch = replicate::relay_since(&mimir.conn, since)?;
             Ok((200, serde_json::to_string(&batch)?))
         }
         (Method::Post, "/sync/push") => {
@@ -88,20 +90,44 @@ fn process(mimir: &mut Mimir, req: &mut tiny_http::Request, token: &str) -> Resu
     }
 }
 
+/// The `since` cursor of a pull URL. A pull with no `since` is a first pull
+/// and gets everything. A `since` that is there but is not an integer is a
+/// client bug, and must not be read as 0: that answered a typo with a dump
+/// of the whole store. `Err` is the body of the 400.
+fn pull_since(url: &str) -> std::result::Result<i64, String> {
+    let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
+    match query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("since="))
+    {
+        None => Ok(0),
+        Some(raw) => raw
+            .parse::<i64>()
+            .map_err(|_| "bad request: `since` must be an integer (unix seconds)".to_string()),
+    }
+}
+
 /// Token resolution: env wins; else a stable token persisted in the hub's meta
-/// (generated + printed on first run) so restarts keep the same token.
+/// (generated + printed on first run) so restarts keep the same token. The
+/// first two steps are `TokenSource::find`, shared with `sync token` and
+/// `sync status`; only the hub goes on to generate one.
 fn resolve_token(mimir: &Mimir) -> Result<String> {
-    if let Some(t) = crate::sync::env_nonempty("MIMIR_SYNC_TOKEN") {
-        return Ok(t);
+    use crate::sync::TokenSource;
+    match TokenSource::find(|| crate::sync::stored_token(&mimir.conn))? {
+        TokenSource::Env(t) => Ok(t),
+        TokenSource::Stored(t) => {
+            eprintln!("using stored hub token (set MIMIR_SYNC_TOKEN to override)");
+            Ok(t)
+        }
+        TokenSource::Missing => {
+            let t = replicate::new_token();
+            replicate::set_str_meta(&mimir.conn, "server_token", &t)?;
+            eprintln!(
+                "generated a hub token (persisted; restarts reuse it):\n  MIMIR_SYNC_TOKEN={t}"
+            );
+            Ok(t)
+        }
     }
-    if let Some(t) = replicate::get_str_meta(&mimir.conn, "server_token")? {
-        eprintln!("using stored hub token (set MIMIR_SYNC_TOKEN to override)");
-        return Ok(t);
-    }
-    let t = replicate::new_token();
-    replicate::set_str_meta(&mimir.conn, "server_token", &t)?;
-    eprintln!("generated a hub token (persisted; restarts reuse it):\n  MIMIR_SYNC_TOKEN={t}");
-    Ok(t)
 }
 
 /// Constant-time byte-slice equality — no early return on the first differing
@@ -116,4 +142,33 @@ pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= x ^ y;
     }
     diff == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pull_since;
+
+    #[test]
+    fn a_pull_cursor_is_an_integer_or_a_400() {
+        assert_eq!(pull_since("/sync/pull?since=1700000000"), Ok(1_700_000_000));
+        assert_eq!(pull_since("/sync/pull?since=0"), Ok(0));
+        assert_eq!(pull_since("/sync/pull?since=-60"), Ok(-60));
+        assert_eq!(pull_since("/sync/pull?limit=5&since=42&x=1"), Ok(42));
+        // A first pull: no cursor yet.
+        assert_eq!(pull_since("/sync/pull"), Ok(0));
+        assert_eq!(pull_since("/sync/pull?"), Ok(0));
+        // Another parameter that merely ends in `since` is not the cursor.
+        assert_eq!(pull_since("/sync/pull?notsince=7"), Ok(0));
+
+        for bad in [
+            "/sync/pull?since=",
+            "/sync/pull?since=abc",
+            "/sync/pull?since=17e9",
+            "/sync/pull?since=1700000000.5",
+            "/sync/pull?since=99999999999999999999",
+            "/sync/pull?since=%31",
+        ] {
+            assert!(pull_since(bad).is_err(), "{bad} must not read as a cursor");
+        }
+    }
 }

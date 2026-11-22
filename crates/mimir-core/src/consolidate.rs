@@ -7,7 +7,14 @@
 //! 3. cluster distillation (cosine ≥ 0.80, clusters ≥ 5) → extractive
 //!    summary node with `summarizes` edges
 //! 4. decay archival (effective strength < 0.05, untouched > 90 days) →
-//!    soft-deleted with meta.archived = true (reversible)
+//!    soft-deleted with `meta.archived = 1`. No command brings an archived
+//!    memory back; what archival keeps open is the fact itself — a plain
+//!    `remember` of the same text is accepted again, where a deliberately
+//!    forgotten one would be refused
+//!
+//! Only *current* memories take part in passes 1 to 3 (see
+//! [`crate::lifecycle`]): a superseded or expired memory can neither win a
+//! merge nor be summarised.
 
 use std::collections::{HashMap, HashSet};
 
@@ -103,20 +110,19 @@ fn consolidate_inner(conn: &Connection, model: &str, dry_run: bool) -> Result<Re
                         continue;
                     }
                     if !dry_run {
-                        // Through the store function rather than raw SQL, so
-                        // the supersession is dated in the mutation ledger.
-                        // `superseded_by` alone carries no timestamp, and
-                        // `recall --as-of` reads that row. Pinned losers were
-                        // already skipped above, which is the one case
-                        // `set_superseded` refuses.
-                        store::set_superseded(
+                        // The one supersede operation, not raw SQL: column,
+                        // `supersedes` edge and the ledger row that dates it
+                        // (`recall --as-of` reads that row) land together.
+                        // Nothing it refuses can reach here — both are
+                        // current memories and pinned losers were skipped
+                        // above.
+                        store::supersede(
                             conn,
                             older.id,
                             newer.id,
                             crate::model::Actor::System,
                             Some("consolidate: near-duplicate, newer wins"),
                         )?;
-                        store::link(conn, newer.id, older.id, Rel::Supersedes, 1.0)?;
                     }
                     superseded.insert(older.id);
                     report.superseded += 1;
@@ -172,7 +178,7 @@ fn consolidate_inner(conn: &Connection, model: &str, dry_run: bool) -> Result<Re
         new.title = Some(title);
         new.body = Some(body.clone());
         new.project_id = members[0].project_id;
-        new.content_hash = Some(blake3::hash(body.as_bytes()).as_bytes().to_vec());
+        new.content_hash = Some(crate::memory::content_hash(&body));
         new.meta = Some(serde_json::json!({"distilled": true}));
         let summary = store::insert_node(conn, new)?;
         for id in ids {
@@ -186,7 +192,7 @@ fn consolidate_inner(conn: &Connection, model: &str, dry_run: bool) -> Result<Re
     let mut stmt = conn.prepare(&format!(
         "SELECT {NODE_COLS} FROM node
          WHERE kind = 'memory' AND deleted_at IS NULL AND superseded_by IS NULL
-           AND pinned = 0 AND created_at < ?1
+           AND pinned = 0 AND created_at < ?1 AND updated_at < ?1
            AND (last_accessed IS NULL OR last_accessed < ?1)"
     ))?;
     let candidates: Vec<crate::model::Node> = stmt
@@ -194,6 +200,12 @@ fn consolidate_inner(conn: &Connection, model: &str, dry_run: bool) -> Result<Re
         .collect::<rusqlite::Result<_>>()?;
     drop(stmt);
     for node in candidates {
+        // What pass 1 retired is not archived as well. A real run has
+        // already written `superseded_by`, so the query above left those
+        // out; a dry run has written nothing and needs telling.
+        if superseded.contains(&node.id) {
+            continue;
+        }
         if learn::effective_strength(&node, now) < ARCHIVE_EFFECTIVE {
             report.archived += 1;
             if !dry_run {
@@ -233,33 +245,45 @@ fn consolidate_inner(conn: &Connection, model: &str, dry_run: bool) -> Result<Re
     Ok(report)
 }
 
-/// Run consolidation if the configured cadence says it's due.
-/// Never errors out the caller's request path.
-pub fn maybe_auto(conn: &Connection, model: &str, cadence: &str) -> Option<Report> {
-    if cadence != "weekly" {
-        return None;
-    }
-    // "No row yet" means never consolidated (run now); a real query error
-    // must NOT — it would trigger an archival pass off a corrupt read.
-    let last: i64 = match conn
+/// How often the automatic pass runs.
+const AUTO_INTERVAL_SECS: i64 = 7 * 86_400;
+
+/// When the last real pass finished, or 0 if none ever has.
+///
+/// "No row yet" means never consolidated (run now); a real query error
+/// must NOT — it would trigger an archival pass off a corrupt read.
+fn last_consolidate(conn: &Connection) -> Result<i64> {
+    let row = conn
         .query_row(
             "SELECT value FROM meta WHERE key = 'last_consolidate'",
             [],
             |r| r.get::<_, String>(0),
         )
-        .optional()
-    {
-        Ok(row) => row.and_then(|v| v.parse().ok()).unwrap_or(0),
+        .optional()?;
+    Ok(row.and_then(|v| v.parse().ok()).unwrap_or(0))
+}
+
+/// Run consolidation if the configured cadence says it's due.
+/// Never errors out the caller's request path.
+pub fn maybe_auto(conn: &Connection, model: &str, cadence: &str) -> Option<Report> {
+    // `cadence` is the raw `[consolidate] auto` string; the config enum is
+    // the one place that says which spellings mean weekly, and an unknown
+    // one means off there too.
+    if crate::config::ConsolidateAuto::resolve(cadence) != crate::config::ConsolidateAuto::Weekly {
+        return None;
+    }
+    // A plain read first, so the common case — not due — takes no lock on
+    // the recall path.
+    match last_consolidate(conn) {
+        Ok(last) if now_unix() - last < AUTO_INTERVAL_SECS => return None,
+        Ok(_) => {}
         Err(err) => {
             tracing::warn!(%err, "cannot read last_consolidate; skipping auto-consolidation");
             return None;
         }
-    };
-    if now_unix() - last < 7 * 86_400 {
-        return None;
     }
-    match consolidate(conn, model, false) {
-        Ok(r) => Some(r),
+    match run_if_due(conn, model) {
+        Ok(report) => report,
         Err(err) => {
             tracing::warn!(%err, "auto-consolidation failed");
             None
@@ -267,28 +291,74 @@ pub fn maybe_auto(conn: &Connection, model: &str, cadence: &str) -> Option<Repor
     }
 }
 
+/// Run the pass if it is still due once this connection holds the write
+/// lock, and stamp `last_consolidate` in the same transaction.
+///
+/// The `last_consolidate` row is the claim. The CLI's recall path and the
+/// MCP server's startup thread both get here having read a stale stamp; the
+/// second one waits for the first one's transaction, reads the stamp that
+/// transaction wrote, and stands down. Deciding under the lock rather than
+/// stamping first means the row only ever records a pass that completed: a
+/// pass that fails rolls its claim back with everything else, and is tried
+/// again by the next caller.
+fn run_if_due(conn: &Connection, model: &str) -> Result<Option<Report>> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    if now_unix() - last_consolidate(&tx)? < AUTO_INTERVAL_SECS {
+        return Ok(None);
+    }
+    let report = consolidate_inner(&tx, model, false)?;
+    tx.commit()?;
+    Ok(Some(report))
+}
+
+/// Every current memory that has an embedding for `model`, in id order.
+///
+/// Current is decided by [`crate::lifecycle::Lifecycle`], not by the
+/// `WHERE` clause, which cannot see expiry. An expired memory left in here
+/// would still win "newer wins" in pass 1 and retire a live older one —
+/// after which recall shows neither.
+///
+/// The order is fixed because pass 2 queues a contradiction as the pair
+/// (first, second) and the review queue recognises a finding it already
+/// holds by that pair; the same two memories met in the other order would
+/// be queued a second time.
 fn load_memories(conn: &Connection, model: &str) -> Result<Vec<Mem>> {
-    let mut stmt = conn.prepare(
-        "SELECT n.id, n.uid, n.title, n.body, n.subkind, n.project_id, n.created_at,
-                n.pinned, e.vec
+    // `n.`-qualified because `embedding` has a `content_hash` of its own.
+    let node_cols = NODE_COLS
+        .split(',')
+        .map(|col| format!("n.{}", col.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {node_cols}, e.vec AS vec
          FROM node n JOIN embedding e ON e.node_id = n.id AND e.model = ?1
-         WHERE n.kind = 'memory' AND n.deleted_at IS NULL AND n.superseded_by IS NULL",
-    )?;
-    let mems = stmt
-        .query_map([model], |r| {
-            Ok(Mem {
-                id: r.get(0)?,
-                uid: r.get(1)?,
-                title: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                body: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                subkind: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
-                project_id: r.get(5)?,
-                created_at: r.get(6)?,
-                pinned: r.get::<_, i64>(7)? != 0,
-                vec: crate::embed::from_blob(&r.get::<_, Vec<u8>>(8)?),
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
+         WHERE n.kind = 'memory' AND n.deleted_at IS NULL AND n.superseded_by IS NULL
+         ORDER BY n.id"
+    ))?;
+    let now = now_unix();
+    let mut mems = Vec::new();
+    let rows = stmt.query_map([model], |r| {
+        Ok((row_to_node(r)?, r.get::<_, Vec<u8>>("vec")?))
+    })?;
+    for row in rows {
+        let (node, vec) = row?;
+        if !node.lifecycle(now).is_current() {
+            continue;
+        }
+        mems.push(Mem {
+            id: node.id,
+            uid: node.uid,
+            title: node.title.unwrap_or_default(),
+            body: node.body.unwrap_or_default(),
+            // A memory stored without a type is a note everywhere it is
+            // read, so it consolidates with the notes.
+            subkind: node.subkind.unwrap_or_else(|| "note".into()),
+            project_id: node.project_id,
+            created_at: node.created_at,
+            pinned: node.pinned,
+            vec: crate::embed::from_blob(&vec),
+        });
+    }
     Ok(mems)
 }
 
@@ -368,22 +438,53 @@ fn single_link(mems: &[Mem], indices: &[usize], threshold: f32) -> Vec<Vec<usize
 }
 
 /// Does a summary node already cover most of these members?
+///
+/// A summary that was deleted covers nothing, and neither does one that was
+/// superseded by something that is not a summary: it is not shown, so the
+/// cluster is as unsummarised as if it had never been written.
+///
+/// A summary superseded by another *summary* still covers its cluster. That
+/// is what the near-duplicate pass does to two summaries that say the same
+/// thing, and the survivor is the summary of both clusters. Without this,
+/// the pass that merged them left one cluster uncovered, the next pass
+/// distilled it again, the new summary was a near-duplicate of the survivor
+/// and was merged in turn: one new summary row per pass, forever.
 fn has_summary(conn: &Connection, member_ids: &[i64]) -> Result<bool> {
     let placeholders = member_ids
         .iter()
         .map(|id| id.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let covered: i64 = conn.query_row(
-        &format!(
-            "SELECT count(DISTINCT e.dst) FROM edge e
-             JOIN node s ON s.id = e.src AND s.deleted_at IS NULL
-             WHERE e.rel = 'summarizes' AND e.dst IN ({placeholders})"
-        ),
-        [],
-        |r| r.get(0),
-    )?;
-    Ok(covered as usize * 2 >= member_ids.len())
+    let mut stmt = conn.prepare(&format!(
+        "SELECT e.dst, e.src FROM edge e
+         JOIN node s ON s.id = e.src AND s.deleted_at IS NULL
+         WHERE e.rel = 'summarizes' AND e.dst IN ({placeholders})"
+    ))?;
+    let links: Vec<(i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    drop(stmt);
+
+    let now = now_unix();
+    let mut shown: HashMap<i64, bool> = HashMap::new();
+    let mut covered: HashSet<i64> = HashSet::new();
+    for (member, summary) in links {
+        let stands = match shown.get(&summary) {
+            Some(&known) => known,
+            None => {
+                let current = store::get_node(conn, summary)
+                    .ok()
+                    .and_then(|node| crate::lifecycle::resolve_current(conn, node, now));
+                let stands = current.is_some_and(|node| node.subkind.as_deref() == Some("summary"));
+                shown.insert(summary, stands);
+                stands
+            }
+        };
+        if stands {
+            covered.insert(member);
+        }
+    }
+    Ok(covered.len() * 2 >= member_ids.len())
 }
 
 /// Most frequent meaningful tokens across member titles.
@@ -425,8 +526,10 @@ mod tests {
         new.title = Some(title.into());
         new.body = Some(title.into());
         let node = store::insert_node(conn, new).unwrap();
+        // A memory written at `created_at` and not touched since: both
+        // stamps are old, which is what the decay pass asks for.
         conn.execute(
-            "UPDATE node SET created_at = ?2 WHERE id = ?1",
+            "UPDATE node SET created_at = ?2, updated_at = ?2 WHERE id = ?1",
             rusqlite::params![node.id, created_at],
         )
         .unwrap();
@@ -533,6 +636,41 @@ mod tests {
         assert_eq!(again.distilled, 0);
     }
 
+    /// The decay pass takes a memory nobody has opened or changed for the
+    /// idle window. One that changed recently is left alone however old the
+    /// date it carries: an import keeps the day a note was written, and an
+    /// edit or a new anchor is someone still using it.
+    #[test]
+    fn a_memory_that_changed_recently_is_not_archived() {
+        let conn = db::open_in_memory().unwrap();
+        let old_time = now_unix() - 500 * 86_400;
+        let untouched = add(&conn, "idea", "stale idea", &[0.0, 1.0], old_time);
+        let touched = add(
+            &conn,
+            "idea",
+            "old idea, newly edited",
+            &[1.0, 0.0],
+            old_time,
+        );
+        conn.execute(
+            "UPDATE node SET updated_at = ?2 WHERE id = ?1",
+            rusqlite::params![touched.id, now_unix()],
+        )
+        .unwrap();
+
+        let report = consolidate(&conn, MODEL, false).unwrap();
+
+        assert_eq!(report.archived, 1, "{report:?}");
+        assert!(store::get_node(&conn, untouched.id)
+            .unwrap()
+            .deleted_at
+            .is_some());
+        assert!(store::get_node(&conn, touched.id)
+            .unwrap()
+            .deleted_at
+            .is_none());
+    }
+
     #[test]
     fn decayed_idle_memories_archived_reversibly() {
         let conn = db::open_in_memory().unwrap();
@@ -551,6 +689,245 @@ mod tests {
             .unwrap()
             .deleted_at
             .is_none());
+    }
+
+    /// "Newer wins" never looked at what the winner was. An expired newer
+    /// memory would retire a live older one, and recall then shows neither:
+    /// one is superseded, the other past its expiry.
+    #[test]
+    fn an_expired_memory_takes_no_part_in_consolidation() {
+        let conn = db::open_in_memory().unwrap();
+        let recent = now_unix() - 3600;
+        let old = add(&conn, "note", "the freeze is on", &[1.0, 0.0, 0.01], recent);
+        let new = add(
+            &conn,
+            "note",
+            "the freeze is on!",
+            &[1.0, 0.0, 0.0],
+            recent + 60,
+        );
+        store::set_expiry(&conn, new.id, Some(now_unix() - 60), None).unwrap();
+
+        let report = consolidate(&conn, MODEL, false).unwrap();
+
+        assert_eq!(report.superseded, 0, "{report:?}");
+        assert!(store::get_node(&conn, old.id)
+            .unwrap()
+            .lifecycle(now_unix())
+            .is_current());
+    }
+
+    /// A merge is the column, the `supersedes` edge and the dated ledger
+    /// row, written by the same operation every other supersession uses.
+    #[test]
+    fn a_merge_is_a_complete_supersession() {
+        let conn = db::open_in_memory().unwrap();
+        let old = add(
+            &conn,
+            "note",
+            "sqlite wal is great",
+            &[1.0, 0.0, 0.01],
+            1000,
+        );
+        let new = add(
+            &conn,
+            "note",
+            "sqlite wal is great!",
+            &[1.0, 0.0, 0.0],
+            2000,
+        );
+        consolidate(&conn, MODEL, false).unwrap();
+
+        let edges = store::edges_of(&conn, old.id).unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(
+            (edges[0].src, edges[0].dst, edges[0].rel),
+            (new.id, old.id, Rel::Supersedes)
+        );
+        assert!(crate::audit::superseded_at(&conn, old.id)
+            .unwrap()
+            .is_some());
+    }
+
+    fn arc(conn: &Connection, count: usize) -> Vec<Node> {
+        // Points on an arc, 25° apart — see `clusters_distilled_once`.
+        (0..count)
+            .map(|i| {
+                let theta = 25f32.to_radians() * i as f32;
+                add(
+                    conn,
+                    "gotcha",
+                    &format!("docker network gotcha number {i}"),
+                    &[theta.cos(), theta.sin()],
+                    now_unix() - 60 + i as i64,
+                )
+            })
+            .collect()
+    }
+
+    fn summaries(conn: &Connection) -> Vec<Node> {
+        let mut stmt = conn
+            .prepare(&format!(
+                "SELECT {NODE_COLS} FROM node WHERE subkind = 'summary' ORDER BY id"
+            ))
+            .unwrap();
+        let rows = stmt.query_map([], row_to_node).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    }
+
+    /// A summary that has been superseded is not shown, so a cluster it
+    /// covered is not covered: it gets distilled again.
+    #[test]
+    fn a_superseded_summary_does_not_cover_its_cluster() {
+        let conn = db::open_in_memory().unwrap();
+        arc(&conn, 6);
+        assert_eq!(consolidate(&conn, MODEL, false).unwrap().distilled, 1);
+        assert_eq!(consolidate(&conn, MODEL, false).unwrap().distilled, 0);
+
+        let summary = summaries(&conn).remove(0);
+        let replacement = add(&conn, "note", "unrelated", &[0.0, -1.0], now_unix());
+        store::supersede(
+            &conn,
+            summary.id,
+            replacement.id,
+            crate::model::Actor::Human,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(consolidate(&conn, MODEL, false).unwrap().distilled, 1);
+    }
+
+    /// Two summaries that say the same thing are merged like any other
+    /// near-duplicates, and the survivor covers both clusters. The run must
+    /// settle: no new summary on the next pass, or the pass after.
+    #[test]
+    fn merged_summaries_do_not_make_consolidation_distil_forever() {
+        let conn = db::open_in_memory().unwrap();
+        arc(&conn, 6);
+        assert_eq!(consolidate(&conn, MODEL, false).unwrap().distilled, 1);
+        let first = summaries(&conn).remove(0);
+
+        // The summary gets its vector (as `embed_pending` would give it),
+        // and a second summary saying the same thing is written later.
+        let mut v = vec![0.6f32, -0.8];
+        crate::embed::l2_normalize(&mut v);
+        conn.execute(
+            "INSERT INTO embedding (node_id, model, dim, vec, content_hash)
+             VALUES (?1, ?2, ?3, ?4, x'00')",
+            rusqlite::params![first.id, MODEL, v.len() as i64, to_blob(&v)],
+        )
+        .unwrap();
+        add(
+            &conn,
+            "summary",
+            "the same summary, written again",
+            &[0.6, -0.8],
+            now_unix() + 5,
+        );
+
+        let merged = consolidate(&conn, MODEL, false).unwrap();
+        assert_eq!(merged.superseded, 1, "the two summaries merge: {merged:?}");
+        assert_eq!(
+            merged.distilled, 0,
+            "its cluster is still covered: {merged:?}"
+        );
+        let rows = summaries(&conn).len();
+        for pass in 0..3 {
+            let report = consolidate(&conn, MODEL, false).unwrap();
+            assert_eq!(
+                (report.superseded, report.distilled),
+                (0, 0),
+                "pass {pass} did not settle: {report:?}"
+            );
+        }
+        assert_eq!(summaries(&conn).len(), rows, "summary rows kept growing");
+    }
+
+    /// A summary is a memory, and its hash is what `remember` compares a new
+    /// capture against. Hashed any other way, the same text offered again
+    /// would not be recognised as the summary.
+    #[test]
+    fn a_summary_is_hashed_like_any_memory() {
+        let conn = db::open_in_memory().unwrap();
+        arc(&conn, 6);
+        consolidate(&conn, MODEL, false).unwrap();
+        let summary = summaries(&conn).remove(0);
+        assert_eq!(
+            summary.content_hash,
+            Some(crate::memory::content_hash(
+                summary.body.as_deref().unwrap()
+            ))
+        );
+    }
+
+    /// A dry run reports what a real run would do. The archive pass reads
+    /// `superseded_by` from the database, which a dry run has not written,
+    /// so it has to be told what pass 1 would have retired.
+    #[test]
+    fn a_dry_run_counts_what_a_real_run_does() {
+        let build = || {
+            let conn = db::open_in_memory().unwrap();
+            let long_ago = now_unix() - 500 * 86_400;
+            add(&conn, "idea", "a stale idea", &[1.0, 0.0, 0.01], long_ago);
+            add(
+                &conn,
+                "idea",
+                "a stale idea!",
+                &[1.0, 0.0, 0.0],
+                long_ago + 60,
+            );
+            conn
+        };
+        let dry = consolidate(&build(), MODEL, true).unwrap();
+        let real = consolidate(&build(), MODEL, false).unwrap();
+
+        assert_eq!((real.superseded, real.archived), (1, 1));
+        assert_eq!(
+            (dry.superseded, dry.archived),
+            (real.superseded, real.archived),
+            "one memory must not be counted both as superseded and as archived"
+        );
+    }
+
+    fn file_conn(dir: &tempfile::TempDir) -> Connection {
+        db::open(&dir.path().join("mimir.db")).unwrap()
+    }
+
+    /// The CLI's recall and the MCP server's startup thread both ask whether
+    /// the weekly pass is due. Both can read "due" before either has run it;
+    /// only one of them may then run it.
+    #[test]
+    fn two_processes_do_not_both_run_the_weekly_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, second) = (file_conn(&dir), file_conn(&dir));
+        let week_ago = now_unix() - 8 * 86_400;
+        first
+            .execute(
+                "INSERT INTO meta (key, value) VALUES ('last_consolidate', ?1)",
+                [week_ago.to_string()],
+            )
+            .unwrap();
+
+        // Both have seen the stale stamp; the first runs the pass.
+        assert!(run_if_due(&first, MODEL).unwrap().is_some());
+        assert!(
+            run_if_due(&second, MODEL).unwrap().is_none(),
+            "the second must find the pass already claimed"
+        );
+
+        // And from the top: not due for another week, on either connection.
+        assert!(maybe_auto(&first, MODEL, "weekly").is_none());
+        assert!(maybe_auto(&second, MODEL, "weekly").is_none());
+    }
+
+    #[test]
+    fn the_weekly_pass_runs_on_a_store_that_never_consolidated() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = file_conn(&dir);
+        assert!(maybe_auto(&conn, MODEL, "off").is_none());
+        assert!(maybe_auto(&conn, MODEL, "weekly").is_some());
+        assert!(maybe_auto(&conn, MODEL, "weekly").is_none());
     }
 
     #[test]

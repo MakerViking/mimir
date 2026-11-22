@@ -2,7 +2,7 @@
 //! compact text table agents can show inline (or `--json` for machines).
 
 use anyhow::Result;
-use mimir_core::model::{now_unix, short_uid, Kind};
+use mimir_core::model::{now_unix, short_uid, Kind, RecallEvent, Rel};
 use mimir_core::Mimir;
 
 const PERIODS: [(&str, i64); 5] = [
@@ -48,7 +48,10 @@ pub fn report(json: bool) -> Result<()> {
              FROM node WHERE kind='{kind}' AND deleted_at IS NULL"
         ))
     };
-    let event_counts = |event: &str| -> Result<Vec<i64>> {
+    // One event per row: "opened" here is `RecallEvent::Opened` alone, with
+    // marks on their own row. (The dashboard's chart draws the two together
+    // and says so in its key — `RecallEvent::is_engagement`.)
+    let event_counts = |event: RecallEvent| -> Result<Vec<i64>> {
         counts(&format!(
             "SELECT COALESCE(sum(at>=?1),0), COALESCE(sum(at>=?2),0), COALESCE(sum(at>=?3),0),
                     COALESCE(sum(at>=?4),0), count(*)
@@ -62,17 +65,20 @@ pub fn report(json: bool) -> Result<()> {
         ("symbols extracted", node_counts("symbol")?),
         (
             // `count(*) FROM edge` would fold in the store's own co_recall
-            // observations, and this row is labelled as work somebody did: a
-            // week of heavy recalling would read as a week of heavy linking.
+            // observations and every `calls`/`imports` edge the code-graph
+            // extractor wrote, and this row is labelled as work somebody
+            // did: a week of heavy recalling, or one `graph build`, would
+            // read as a week of heavy linking.
             // The predicate lives in WHERE rather than inside the four period
             // sums so the all-time column is filtered the same way — filtering
             // only the periods leaves a total that no column adds up to.
             "links created",
-            counts(
+            counts(&format!(
                 "SELECT COALESCE(sum(created_at>=?1),0), COALESCE(sum(created_at>=?2),0),
                         COALESCE(sum(created_at>=?3),0), COALESCE(sum(created_at>=?4),0),
-                        count(*) FROM edge WHERE rel <> 'co_recalled'",
-            )?,
+                        count(*) FROM edge WHERE rel IN ({AUTHORED_RELS})",
+                AUTHORED_RELS = authored_rels_sql()
+            ))?,
         ),
         (
             "searches run",
@@ -95,9 +101,9 @@ pub fn report(json: bool) -> Result<()> {
                  FROM recall_miss WHERE resolved_at IS NULL",
             )?,
         ),
-        ("results shown", event_counts("shown")?),
-        ("memories opened", event_counts("opened")?),
-        ("marked useful", event_counts("useful")?),
+        ("results shown", event_counts(RecallEvent::Shown)?),
+        ("memories opened", event_counts(RecallEvent::Opened)?),
+        ("marked useful", event_counts(RecallEvent::Useful)?),
         ("tokens saved", counts(&saved_sql())?),
     ];
 
@@ -191,6 +197,16 @@ pub fn report(json: bool) -> Result<()> {
 /// The five period sums of tokens saved. Cost sources (the session brief,
 /// recorded with `before = 0`) are excluded exactly as `mimir savings` excludes
 /// them: summed raw they net against real savings and a quiet day reads negative.
+/// The relations that are links somebody made, as a SQL `IN` list. Read
+/// from the same list `mimir link` accepts, so the report cannot count a
+/// relation the store derives for itself.
+fn authored_rels_sql() -> String {
+    Rel::authorable()
+        .map(|rel| format!("'{}'", rel.as_str()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn saved_sql() -> String {
     let cost = mimir_core::savings::COST_SOURCES_SQL;
     format!(
@@ -243,6 +259,20 @@ fn date(ts: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// "links created" is a count of links somebody made. It used to count
+    /// every edge but `co_recalled`, which includes the thousands of `calls`
+    /// and `imports` edges one `graph build` writes.
+    #[test]
+    fn links_created_counts_only_authored_relations() {
+        let sql = super::authored_rels_sql();
+        for authored in ["'relates'", "'about'", "'links'", "'mentions'"] {
+            assert!(sql.contains(authored), "{authored} missing from {sql}");
+        }
+        for derived in ["'calls'", "'imports'", "'co_recalled'", "'supersedes'"] {
+            assert!(!sql.contains(derived), "{derived} counted in {sql}");
+        }
+    }
+
     #[test]
     fn date_formats_known_timestamps() {
         assert_eq!(super::date(0), "1970-01-01");

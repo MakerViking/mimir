@@ -11,8 +11,8 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::format::agent_line;
 use crate::memory;
-use crate::model::{Kind, Scope};
-use crate::search::{fts, Hit, SearchQuery};
+use crate::model::{Kind, MemoryType, Scope};
+use crate::search::{fts, vector_leg, Hit, SearchQuery};
 use crate::{store, Mimir};
 
 /// ~200 tokens — team target, comparable to THOR's ~212. Injecting a wrong
@@ -61,8 +61,8 @@ pub const TOP_CANDIDATES: usize = 1;
 /// memory actively misleads the agent — worse than saying nothing.
 ///
 /// Relevance floor (erring toward silence):
-///   1. Candidate must be `Kind::Memory` with subkind gotcha/decision (the
-///      two "preventer" types, see `learn::type_prior`) OR pinned. Pinned
+///   1. Candidate must be a memory of a preventer type — gotcha or
+///      decision, `MemoryType::is_preventer` — OR pinned. Pinned
 ///      is a deliberate, durable importance marker the user set explicitly
 ///      — unlike `strength` (a usage pump, +0.3/day on open), which would
 ///      auto-inject chatty notes just because they're opened often, so it
@@ -75,11 +75,12 @@ pub const TOP_CANDIDATES: usize = 1;
 ///      prompt's words. `enrich` (client-side git-diff stems, see
 ///      `mimir-cli/src/commands.rs`) tokens count toward this overlap too,
 ///      but can't carry it alone — see the `enrich` note on `compute`.
-///   3. When a vector leg was actually computed (an embedding model is
-///      loaded), the hit must ALSO appear in that leg's own top
-///      `LEG_TOP_K` — lexical+semantic agreement, not just a lucky BM25
-///      match. Skipped (not required) with no model: degrades cleanly to
-///      rules 1+2 alone rather than refusing to ever fire.
+///   3. When a vector leg ran (`search::vector_leg`: a model embedded the
+///      query and ranked at least one node), the hit must ALSO appear in
+///      that leg's own top `LEG_TOP_K` — lexical+semantic agreement, not
+///      just a lucky BM25 match. Skipped (not required) when none ran — no
+///      model, or a model with no usable vectors in this store: degrades
+///      cleanly to rules 1+2 alone rather than refusing to ever fire.
 ///
 /// `enrich`: space-separated stems from the caller's working tree (e.g. changed
 /// file names from `git diff --name-only`), passed separately from `prompt`.
@@ -118,11 +119,11 @@ pub fn compute(
 /// always use the best available signal) keeps calling the unchanged
 /// 4-argument `compute` and behaves identically to before this existed.
 ///
-/// With `bm25_only = true`, `legs` never has a `legs[1]` (vector) entry —
-/// the same shape `clears_floor`'s rule 3 and the self-licensing guard
-/// already handle for a model-less machine today (both check
-/// `legs.get(1)`, which is `None` here), so no floor-rule changes were
-/// needed for this mode; only routing which search variant is called.
+/// With `bm25_only = true` no vector leg runs — the same state
+/// `clears_floor`'s rule 3 and the self-licensing guard already handle for
+/// a model-less machine (both ask `search::vector_leg`, which is `None`
+/// here), so no floor-rule changes were needed for this mode; only routing
+/// which search variant is called.
 pub fn compute_with_mode(
     mimir: &mut Mimir,
     prompt: &str,
@@ -136,18 +137,19 @@ pub fn compute_with_mode(
 /// Same as [`compute_with_mode`], plus an optional per-session dedup ledger:
 /// when `session_id` is `Some`, a candidate that already clears the floor is
 /// still skipped if it was already injected earlier in that same session
-/// (`store::injection_seen`) — the search moves on to the next
-/// floor-clearing candidate instead of repeating it (see
-/// `select_unseen_injection`'s doc comment for why this doesn't reopen the
-/// regression `TOP_CANDIDATES` was pinned against). On a fresh pick, the
-/// injection is recorded (`store::record_injection`) so it won't repeat
-/// later in the same session. `session_id: None` reproduces today's
-/// behavior exactly — no ledger read, no ledger write.
+/// (`store::injection_seen`) — the search moves on to the next candidate
+/// instead of repeating it, for as long as every candidate it passes also
+/// cleared the floor (see `select_unseen_injection`'s doc comment for why
+/// this doesn't reopen the regression `TOP_CANDIDATES` was pinned against).
+/// On a fresh pick, the injection is recorded (`store::record_injection`)
+/// so it won't repeat later in the same session. `session_id: None`
+/// reads and writes no ledger.
 ///
-/// Ledger I/O is fail-open: a read or write error is logged at `debug` and
-/// treated as if the ledger were empty/absent, so a store hiccup degrades
-/// to "inject as if this session has no history" rather than blocking an
-/// otherwise-valid injection.
+/// Everything written after the pick is fail-open: the per-session ledger
+/// and the impression row are bookkeeping about an injection, not part of
+/// deciding it. A read or write error there is logged at `debug` and the
+/// line is returned anyway, so a store hiccup degrades to "inject as if
+/// this session has no history" rather than silencing a valid injection.
 pub fn compute_with_session(
     mimir: &mut Mimir,
     prompt: &str,
@@ -155,6 +157,49 @@ pub fn compute_with_session(
     scope: Scope,
     bm25_only: bool,
     session_id: Option<&str>,
+) -> Result<Option<String>> {
+    compute_admitting(mimir, prompt, enrich, scope, bm25_only, session_id, &|_| {
+        true
+    })
+}
+
+/// [`compute_with_session`] for a prompt typed in a session working in
+/// `checkout` (the canonical root of its checkout; `None` outside any
+/// project): a session handoff written in another checkout is not a
+/// candidate (`context_guard::shown_in_checkout`). What the hook paths
+/// call, cold (`mimir recall-inject`) and warm (`/inject`): in a git linked
+/// worktree the scope is the repository's memory project, which holds the
+/// handoffs of every worktree of it.
+pub fn compute_in_checkout(
+    mimir: &mut Mimir,
+    prompt: &str,
+    enrich: &str,
+    scope: Scope,
+    bm25_only: bool,
+    session_id: Option<&str>,
+    checkout: Option<&str>,
+) -> Result<Option<String>> {
+    compute_admitting(
+        mimir,
+        prompt,
+        enrich,
+        scope,
+        bm25_only,
+        session_id,
+        &|node| crate::context_guard::shown_in_checkout(node, checkout),
+    )
+}
+
+/// The one body of [`compute_with_session`] and [`compute_in_checkout`]:
+/// a hit `admit` turns down is dropped before the floor sees the page.
+fn compute_admitting(
+    mimir: &mut Mimir,
+    prompt: &str,
+    enrich: &str,
+    scope: Scope,
+    bm25_only: bool,
+    session_id: Option<&str>,
+    admit: &dyn Fn(&crate::model::Node) -> bool,
 ) -> Result<Option<String>> {
     let prompt = prompt.trim();
     if prompt.is_empty() {
@@ -178,11 +223,12 @@ pub fn compute_with_session(
         include_superseded: false,
         as_of: None,
     };
-    let (hits, legs) = if bm25_only {
+    let (mut hits, legs) = if bm25_only {
         mimir.search_with_legs_bm25_only(&query)?
     } else {
         mimir.search_with_legs(&query)?
     };
+    hits.retain(|hit| admit(&hit.node));
     let top = match session_id {
         Some(session_id) => {
             match select_unseen_injection(&mimir.conn, session_id, &hits, prompt, enrich, &legs) {
@@ -216,11 +262,13 @@ pub fn compute_with_session(
     // user asked, so it shouldn't fragment the impression key for the same
     // question asked from different working-tree states.
     let query_hash = blake3::hash(prompt.as_bytes());
-    store::record_shown(
+    if let Err(err) = store::record_shown(
         &mimir.conn,
         query_hash.as_bytes(),
         &[(top.node.id, 0i64, top.score)],
-    )?;
+    ) {
+        tracing::debug!(%err, "inject: failed to record the impression");
+    }
 
     if let Some(session_id) = session_id {
         if let Err(err) = store::record_injection(&mimir.conn, session_id, top.node.id) {
@@ -262,23 +310,24 @@ pub fn select_injection<'h>(
 }
 
 /// Same as [`select_injection`], but skips any candidate already recorded
-/// in the per-session dedup ledger (`store::injection_seen`) and, unlike
-/// `select_injection`'s top-1 fallback scan, keeps scanning past the fused
-/// #1 hit there when it does.
+/// in the per-session dedup ledger (`store::injection_seen`), and for that
+/// one reason may return a hit below the fused #1.
 ///
-/// The fallback scan intentionally goes further than [`TOP_CANDIDATES`]
-/// normally allows (see that constant's doc comment for the regression
-/// it's pinned against), but it's not the same relaxation: that regression
-/// came from letting a *lower-quality* hit qualify only because a *better*
-/// hit at rank 1 had already failed [`clears_floor`] — a quality fallback
-/// that let a stale, wrong pick through. Here every candidate this
-/// function returns, at any rank, still has to independently pass the
-/// exact same unrelaxed `clears_floor`; the only reason to move past rank
-/// 1 is that it already qualified and was already shown this session, so
-/// returning `None` for a rank-2 hit that *also* legitimately qualifies
-/// would just mean staying silent for no quality reason. A store read
-/// error on a given candidate is treated as "not seen" (fail-open) rather
-/// than skipping it.
+/// The floor scan walks the hits in fused order and ends at the first one
+/// that does not clear [`clears_floor`]; among the hits before that point it
+/// returns the first this session has not been shown. So the only way past
+/// rank 1 is that rank 1 qualified and was already injected — returning
+/// `None` for a rank-2 hit that also qualifies would be staying silent for
+/// no quality reason. A hit that *failed* the floor is never passed over:
+/// that is the quality fallback [`TOP_CANDIDATES`] records as backed out (a
+/// stale decision at rank 2 injected once the correct one at rank 1 did not
+/// clear), and with no session id [`select_injection`] refuses it the same
+/// way.
+///
+/// The `fires_when` scan is not bounded like this — an author-declared
+/// trigger is checked against every returned hit in both functions, see
+/// [`fires_when_clears`]. A store read error on a given candidate is
+/// treated as "not seen" (fail-open) rather than skipping it.
 fn select_unseen_injection<'h>(
     conn: &Connection,
     session_id: &str,
@@ -297,7 +346,7 @@ fn select_unseen_injection<'h>(
         return Some(hit);
     }
     hits.iter()
-        .filter(|hit| clears_floor(hit, prompt, enrich, legs))
+        .take_while(|hit| clears_floor(hit, prompt, enrich, legs))
         .find(unseen)
 }
 
@@ -324,7 +373,7 @@ fn fires_when_matches(phrase: &str, prompt_lower: &str, prompt_tokens: &HashSet<
 
 /// True if `top` carries an author-declared `meta.fires_when` trigger
 /// matching `prompt` (+ `enrich`) — see [`fires_when_matches`] — AND, when
-/// a vector leg exists, `top` still appears in that leg's own top
+/// a vector leg ran, `top` still appears in that leg's own top
 /// [`LEG_TOP_K`] (the same rule 3 [`clears_floor`] enforces: a declared
 /// trigger says "this topic matters", not "ignore a contradicting
 /// embedding signal"). Deliberately independent of `clears_floor`'s rules
@@ -352,21 +401,17 @@ fn fires_when_clears(top: &Hit, prompt: &str, enrich: &str, legs: &[Vec<i64>]) -
     if !matched {
         return false;
     }
-    match legs.get(1) {
-        Some(vector_leg) => vector_leg
-            .iter()
-            .take(LEG_TOP_K)
-            .any(|id| *id == top.node.id),
-        None => true,
-    }
+    vector_leg(legs).is_none_or(|leg| in_leg_top_k(leg, top.node.id))
+}
+
+/// Rule 3's test: `id` is within the leg's own top [`LEG_TOP_K`].
+fn in_leg_top_k(leg: &[i64], id: i64) -> bool {
+    leg.iter().take(LEG_TOP_K).any(|other| *other == id)
 }
 
 fn clears_floor(top: &Hit, prompt: &str, enrich: &str, legs: &[Vec<i64>]) -> bool {
     // Rule 1: preventer types, or explicitly pinned.
-    let is_preventer = matches!(
-        top.node.subkind.as_deref(),
-        Some("gotcha") | Some("decision")
-    );
+    let is_preventer = top.node.memory_type().is_some_and(MemoryType::is_preventer);
     if !is_preventer && !top.node.pinned {
         return false;
     }
@@ -399,16 +444,11 @@ fn clears_floor(top: &Hit, prompt: &str, enrich: &str, legs: &[Vec<i64>]) -> boo
         return false;
     }
 
-    // Rule 3: dual-leg agreement, only when a vector leg exists (legs[0] is
-    // always FTS, legs[1] is vector iff a model embedded this query).
-    let vector_agrees = match legs.get(1) {
-        Some(vector_leg) => vector_leg
-            .iter()
-            .take(LEG_TOP_K)
-            .any(|id| *id == top.node.id),
-        None => false,
-    };
-    if legs.get(1).is_some() && !vector_agrees {
+    // Rule 3: dual-leg agreement, only when a vector leg ran. With none
+    // there is no second retriever to disagree, and the rule is skipped.
+    let semantic = vector_leg(legs);
+    let vector_agrees = semantic.is_some_and(|leg| in_leg_top_k(leg, top.node.id));
+    if semantic.is_some() && !vector_agrees {
         return false;
     }
 
@@ -431,7 +471,7 @@ fn clears_floor(top: &Hit, prompt: &str, enrich: &str, legs: &[Vec<i64>]) -> boo
     // be strictly larger than `LEG_TOP_K` before its agreement counts here
     // closes that gap without touching rule 3's own (pre-existing,
     // out-of-scope) behavior for the raw_overlap-driven path above.
-    let vector_leg_discriminates = legs.get(1).is_some_and(|l| l.len() > LEG_TOP_K);
+    let vector_leg_discriminates = semantic.is_some_and(|leg| leg.len() > LEG_TOP_K);
     let enrichment_was_needed = raw_overlap < MIN_OVERLAP;
     if enrichment_was_needed && raw_overlap == 0 && !(vector_agrees && vector_leg_discriminates) {
         return false;
@@ -647,6 +687,40 @@ mod tests {
         );
     }
 
+    /// A prompt typed in one checkout is not answered with a session
+    /// handoff written in another: the hooks' entry point leaves it out of
+    /// the candidates, the older entry points do not ask.
+    #[test]
+    fn a_handoff_of_another_checkout_is_not_injected_into_this_one() {
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        let id = seed(
+            &mut mimir,
+            MemoryType::Gotcha,
+            "auth edge case",
+            "remember to check this before shipping",
+            &[
+                "scram",
+                "nfkc",
+                "normalization",
+                crate::context_guard::HANDOFF_TAG,
+            ],
+        );
+        crate::context_guard::set_handoff_checkout(&mimir.conn, id, "/repo/wt-a").unwrap();
+        let prompt = "scram nfkc normalization";
+        let mut in_checkout = |checkout: Option<&str>| {
+            compute_in_checkout(&mut mimir, prompt, "", Scope::All, true, None, checkout).unwrap()
+        };
+        assert!(
+            in_checkout(Some("/repo/wt-a")).is_some(),
+            "its own checkout"
+        );
+        assert_eq!(in_checkout(Some("/repo/wt-b")), None, "a sibling worktree");
+        assert_eq!(in_checkout(None), None, "no checkout at all");
+        assert!(compute_with_mode(&mut mimir, prompt, "", Scope::All, true)
+            .unwrap()
+            .is_some());
+    }
+
     #[test]
     fn bm25_only_mode_still_blocks_enrichment_only_self_licensing() {
         // Same enrichment-only scenario as `enrichment_alone_cannot_clear_floor`,
@@ -774,6 +848,314 @@ mod tests {
             other_session.is_some(),
             "a different session should still inject"
         );
+    }
+
+    /// Hits in the given fused order, read back from the store so the floor
+    /// judges real columns, with a lexical leg and no vector leg.
+    fn ranked(mimir: &Mimir, ids: &[i64]) -> (Vec<Hit>, Vec<Vec<i64>>) {
+        let hits = ids
+            .iter()
+            .enumerate()
+            .map(|(rank, id)| Hit {
+                node: store::get_node(&mimir.conn, *id).unwrap(),
+                score: 1.0 / (rank as f64 + 1.0),
+            })
+            .collect();
+        (hits, vec![ids.to_vec()])
+    }
+
+    const POOL_PROMPT: &str = "how big should the connection pool be";
+
+    fn pool_note(mimir: &mut Mimir) -> i64 {
+        seed(
+            mimir,
+            MemoryType::Note,
+            "Connection pool scratch notes",
+            "the connection pool was sized by guesswork last spring",
+            &[],
+        )
+    }
+
+    fn pool_gotcha(mimir: &mut Mimir, detail: &str) -> i64 {
+        seed(
+            mimir,
+            MemoryType::Gotcha,
+            &format!("Connection pool {detail}"),
+            &format!("the connection pool {detail} under load"),
+            &[],
+        )
+    }
+
+    /// The regression `TOP_CANDIDATES` records, on the path production takes:
+    /// the hook always passes a session id, so this is the selection that
+    /// decides what an agent is shown. A hit below one that failed the floor
+    /// is a quality fallback, whatever it would score on its own.
+    #[test]
+    fn a_session_never_falls_back_past_a_hit_that_failed_the_floor() {
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        let note = pool_note(&mut mimir);
+        let gotcha = pool_gotcha(&mut mimir, "starves writers");
+        let (hits, legs) = ranked(&mimir, &[note, gotcha]);
+
+        assert!(
+            !clears_floor(&hits[0], POOL_PROMPT, "", &legs),
+            "rank 1 is a note: it fails rule 1"
+        );
+        assert!(
+            clears_floor(&hits[1], POOL_PROMPT, "", &legs),
+            "rank 2 would clear the floor on its own"
+        );
+        assert!(
+            select_injection(&hits, POOL_PROMPT, "", &legs).is_none(),
+            "without a session the floor gates the fused #1 hit only"
+        );
+        assert!(
+            select_unseen_injection(&mimir.conn, "s", &hits, POOL_PROMPT, "", &legs).is_none(),
+            "with a session it must gate the same hit, not fall back to rank 2"
+        );
+    }
+
+    #[test]
+    fn a_session_moves_past_rank_one_only_when_it_qualified_and_was_shown() {
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        let first = pool_gotcha(&mut mimir, "starves writers");
+        let second = pool_gotcha(&mut mimir, "leaks idle sockets");
+        let (hits, legs) = ranked(&mimir, &[first, second]);
+
+        let pick = |mimir: &Mimir| {
+            select_unseen_injection(&mimir.conn, "s", &hits, POOL_PROMPT, "", &legs)
+                .map(|hit| hit.node.id)
+        };
+        assert_eq!(pick(&mimir), Some(first), "rank 1 clears and is unseen");
+
+        store::record_injection(&mimir.conn, "s", first).unwrap();
+        assert_eq!(
+            pick(&mimir),
+            Some(second),
+            "rank 1 was already shown this session; rank 2 also qualifies"
+        );
+
+        store::record_injection(&mimir.conn, "s", second).unwrap();
+        assert_eq!(pick(&mimir), None, "everything that qualifies was shown");
+    }
+
+    /// The hermetic preventer eval scores `select_injection`; the hook
+    /// always carries a session id and so runs `select_unseen_injection`.
+    /// For a session that has been shown nothing, the two must reach the
+    /// same decision on every eval prompt — otherwise the eval's
+    /// injected-wrong count says nothing about what an agent is shown.
+    #[test]
+    fn a_fresh_session_decides_exactly_as_the_eval_scores() {
+        use crate::eval::fixtures;
+        let conn = crate::db::open_in_memory().unwrap();
+        let ids = fixtures::insert_fixture_nodes(&conn).unwrap();
+        fixtures::seed_synthetic_vectors(&conn, &ids).unwrap();
+        let scoring = crate::config::ScoringConfig::default();
+        let mut cache = None;
+        let mut injected = 0;
+        for q in fixtures::inject_questions() {
+            let enrich = q.enrich.join(" ");
+            let text = if enrich.is_empty() {
+                q.query.to_string()
+            } else {
+                format!("{} {enrich}", q.query)
+            };
+            let query = SearchQuery {
+                text,
+                scope: Scope::All,
+                kinds: vec![Kind::Memory],
+                since: None,
+                limit: 5,
+                strength_alpha: scoring.strength_alpha,
+                recency_alpha: scoring.recency_alpha,
+                type_prior_alpha: scoring.type_prior_alpha,
+                code_damp: scoring.code_damp,
+                include_superseded: false,
+                as_of: None,
+            };
+            let qvec = fixtures::synthetic_query_vector(q.topic, q.query);
+            let (hits, legs) = crate::search::search_hybrid_with_legs(
+                &conn,
+                &query,
+                Some((fixtures::SYNTHETIC_MODEL, &qvec)),
+                &mut cache,
+            )
+            .unwrap();
+            let scored = select_injection(&hits, q.query, &enrich, &legs).map(|h| h.node.id);
+            let shown = select_unseen_injection(&conn, "fresh", &hits, q.query, &enrich, &legs)
+                .map(|h| h.node.id);
+            assert_eq!(
+                shown.map(|id| fixtures::key_for_id(&ids, id)),
+                scored.map(|id| fixtures::key_for_id(&ids, id)),
+                "prompt: {}",
+                q.query
+            );
+            injected += usize::from(scored.is_some());
+        }
+        assert!(injected > 0, "the comparison must cover real injections");
+    }
+
+    /// The walk stops at the first failure even when later hits qualify:
+    /// "already shown" lets the scan pass a hit, "failed the floor" ends it.
+    #[test]
+    fn a_seen_hit_does_not_license_scanning_past_a_later_failure() {
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        let first = pool_gotcha(&mut mimir, "starves writers");
+        let note = pool_note(&mut mimir);
+        let third = pool_gotcha(&mut mimir, "leaks idle sockets");
+        let (hits, legs) = ranked(&mimir, &[first, note, third]);
+        store::record_injection(&mimir.conn, "s", first).unwrap();
+
+        assert!(
+            select_unseen_injection(&mimir.conn, "s", &hits, POOL_PROMPT, "", &legs).is_none(),
+            "rank 2 failed the floor, so rank 3 is never considered"
+        );
+    }
+
+    /// The three ways a resident model can have nothing to compare a query
+    /// against. Each leaves `vector::leg` with an empty ranking.
+    #[derive(Debug, Clone, Copy)]
+    enum Degraded {
+        NothingEmbedded,
+        ModelSwitched,
+        DimensionMismatch,
+    }
+
+    const LIVE_MODEL: &str = "live-model";
+
+    fn embedding_row(conn: &Connection, node_id: i64, model: &str, vec: &[f32]) {
+        conn.execute(
+            "INSERT INTO embedding (node_id, model, dim, vec, content_hash)
+             VALUES (?1, ?2, ?3, ?4, x'00')",
+            rusqlite::params![node_id, model, vec.len() as i64, crate::embed::to_blob(vec)],
+        )
+        .unwrap();
+    }
+
+    /// The search `compute` runs, with a query embedding supplied the way a
+    /// loaded model would supply one.
+    fn search_as_a_loaded_model(mimir: &Mimir, text: &str) -> (Vec<Hit>, Vec<Vec<i64>>) {
+        let query = SearchQuery {
+            text: text.into(),
+            scope: Scope::All,
+            kinds: vec![Kind::Memory],
+            since: None,
+            limit: 5,
+            strength_alpha: mimir.config.scoring.strength_alpha,
+            recency_alpha: mimir.config.scoring.recency_alpha,
+            type_prior_alpha: mimir.config.scoring.type_prior_alpha,
+            code_damp: mimir.config.scoring.code_damp,
+            include_superseded: false,
+            as_of: None,
+        };
+        crate::search::search_hybrid_with_legs(
+            &mimir.conn,
+            &query,
+            Some((LIVE_MODEL, &[1.0, 0.0])),
+            &mut None,
+        )
+        .unwrap()
+    }
+
+    /// A model that is loaded but has no usable vectors must behave like no
+    /// model: rule 3 asks two retrievers to agree, and a leg that ranked
+    /// nothing is not a second retriever saying no.
+    #[test]
+    fn a_vector_leg_that_ranked_nothing_is_not_a_veto() {
+        for degraded in [
+            Degraded::NothingEmbedded,
+            Degraded::ModelSwitched,
+            Degraded::DimensionMismatch,
+        ] {
+            let mut mimir = Mimir::open_in_memory().unwrap();
+            let id = seed(
+                &mut mimir,
+                MemoryType::Gotcha,
+                "auth edge case",
+                "remember to check this before shipping",
+                &["scram", "nfkc", "normalization"],
+            );
+            match degraded {
+                Degraded::NothingEmbedded => {}
+                Degraded::ModelSwitched => embedding_row(&mimir.conn, id, "old-model", &[1.0, 0.0]),
+                Degraded::DimensionMismatch => {
+                    embedding_row(&mimir.conn, id, LIVE_MODEL, &[1.0, 0.0, 0.0])
+                }
+            }
+            let prompt = "scram nfkc normalization";
+            let (hits, legs) = search_as_a_loaded_model(&mimir, prompt);
+            assert!(
+                crate::search::vector_leg(&legs).is_none(),
+                "{degraded:?}: no vector leg ran, so none may be reported: {legs:?}"
+            );
+            assert_eq!(
+                select_injection(&hits, prompt, "", &legs).map(|hit| hit.node.id),
+                Some(id),
+                "{degraded:?}: must inject on rules 1 and 2, as with no model"
+            );
+        }
+    }
+
+    /// The boundary of the case above: a leg that did rank something and
+    /// left the candidate out is still disagreement.
+    #[test]
+    fn a_vector_leg_that_ran_without_the_hit_still_vetoes() {
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        let candidate = seed(
+            &mut mimir,
+            MemoryType::Gotcha,
+            "auth edge case",
+            "remember to check this before shipping",
+            &["scram", "nfkc", "normalization"],
+        );
+        let other = seed(
+            &mut mimir,
+            MemoryType::Gotcha,
+            "WAL checkpoint pathological growth",
+            "always run PRAGMA wal_checkpoint before assuming corruption",
+            &[],
+        );
+        embedding_row(&mimir.conn, other, LIVE_MODEL, &[1.0, 0.0]);
+
+        let prompt = "scram nfkc normalization";
+        let (hits, legs) = search_as_a_loaded_model(&mimir, prompt);
+        assert_eq!(crate::search::vector_leg(&legs), Some(&[other][..]));
+        assert!(
+            hits.iter().any(|hit| hit.node.id == candidate),
+            "the lexical leg still proposes it"
+        );
+        assert!(select_injection(&hits, prompt, "", &legs).is_none());
+    }
+
+    /// Logging the impression feeds ranking later; it is not part of deciding
+    /// what to inject, and the hook must not go silent because the learning
+    /// ledger could not be written.
+    #[test]
+    fn a_failed_impression_write_does_not_abort_the_injection() {
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        seed(
+            &mut mimir,
+            MemoryType::Gotcha,
+            "auth edge case",
+            "remember to check this before shipping",
+            &["scram", "nfkc", "normalization"],
+        );
+        mimir.conn.execute_batch("DROP TABLE recall_event").unwrap();
+        assert!(
+            store::record_shown(&mimir.conn, b"q", &[(1, 0, 1.0)]).is_err(),
+            "the fixture must actually break the impression write"
+        );
+
+        let out = compute_with_session(
+            &mut mimir,
+            "scram nfkc normalization",
+            "",
+            Scope::All,
+            true,
+            Some("s"),
+        )
+        .unwrap();
+        assert!(out.is_some(), "the injection itself was valid");
     }
 
     #[test]

@@ -3,9 +3,10 @@
 use std::collections::HashMap;
 
 use anyhow::{bail, Context, Result};
-use mimir_core::model::{short_uid, Kind, NewNode, Node, Rel};
+use mimir_core::model::{Kind, NewNode, Node, Rel};
 use mimir_core::{store, Mimir};
-use mimir_graph::{resolve_symbol, symbol_line, CodeGraph};
+use mimir_graph::render::{self, Direction};
+use mimir_graph::{resolve_symbol, symbol_line, CodeGraph, UpdateOptions, UpdateReport};
 
 /// Current project or a clear error (the graph is per-project by nature).
 fn project(mimir: &Mimir) -> Result<Node> {
@@ -18,15 +19,12 @@ fn project(mimir: &Mimir) -> Result<Node> {
 }
 
 /// Build the code graph on first use so queries "just work" in a freshly
-/// detected project — no manual `graph build`. No-op once symbols exist.
+/// detected project — no manual `graph build`. No-op once the project has a
+/// graph, which `mimir_graph::has_graph` decides: a project that was built
+/// and holds no code has one, and is not built again on every query.
 /// Shared with `graph viz`.
 pub(crate) fn ensure_graph(mimir: &mut Mimir, proj: &Node) -> Result<()> {
-    let symbols: i64 = mimir.conn.query_row(
-        "SELECT count(*) FROM node WHERE kind='symbol' AND project_id=?1 AND deleted_at IS NULL",
-        [proj.id],
-        |r| r.get(0),
-    )?;
-    if symbols > 0 {
+    if mimir_graph::has_graph(&mimir.conn, proj.id)? {
         return Ok(());
     }
     let Some(root) = proj.path.clone() else {
@@ -34,25 +32,55 @@ pub(crate) fn ensure_graph(mimir: &mut Mimir, proj: &Node) -> Result<()> {
     };
     eprintln!("building the code graph (first run for this project)…");
     match mimir_graph::update(&mut mimir.conn, proj, std::path::Path::new(&root)) {
-        Ok(s) => eprintln!("  {} symbols, {} call edges", s.symbols, s.calls_resolved),
+        Ok(s) => eprintln!(
+            "  {} symbols, {} call sites resolved",
+            s.symbols, s.calls_resolved
+        ),
         Err(e) => eprintln!("  graph build skipped: {e}"),
     }
     let _ = mimir.embed_pending();
     Ok(())
 }
 
-/// Every project that actually has a graph. The rest cost a query and can
-/// match nothing.
-fn graphed_projects(mimir: &Mimir) -> Result<Vec<Node>> {
-    let mut stmt = mimir.conn.prepare(&format!(
-        "SELECT {} FROM node p WHERE p.kind='project' AND p.deleted_at IS NULL
-           AND EXISTS (SELECT 1 FROM node s WHERE s.kind='symbol'
-                       AND s.project_id=p.id AND s.deleted_at IS NULL)
-         ORDER BY p.title",
-        store::NODE_COLS
-    ))?;
-    let rows = stmt.query_map([], mimir_core::store::row_to_node)?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+/// What an answer read from this project's graph does not show about the
+/// graph itself, one line each: that it is behind the working tree, and that
+/// it was resolved by an older build's rules. A query answers from what is
+/// stored; without these lines an answer about code that has since changed,
+/// or one resting on edges a newer build would not draw, looks exactly like
+/// a current one.
+///
+/// The one list for the CLI (which prints it on stderr) and the MCP `graph`
+/// tool (which appends it to the answer). Read-only, and a failure to work
+/// either line out is no line, never a failed query.
+pub(crate) fn graph_notes(conn: &rusqlite::Connection, proj: &Node) -> Vec<String> {
+    let mut notes = Vec::new();
+    // A project whose checkout is not on this disk has no working tree to
+    // be behind, and comparing against nothing would report every file gone.
+    if let Some(root) = proj
+        .path
+        .as_deref()
+        .map(std::path::Path::new)
+        .filter(|root| root.is_dir())
+    {
+        if let Ok(freshness) = mimir_graph::freshness(conn, proj, root) {
+            notes.extend(freshness.note());
+        }
+    }
+    if let Ok(note) = mimir_graph::rules_note(conn, proj.id) {
+        notes.extend(note);
+    }
+    notes
+}
+
+/// Print [`graph_notes`] on stderr, so stdout stays the answer.
+fn note_if_behind(mimir: &Mimir, proj: &Node, multi: bool) {
+    for note in graph_notes(&mimir.conn, proj) {
+        if multi {
+            eprintln!("{}: {note}", proj.title.as_deref().unwrap_or("(unnamed)"));
+        } else {
+            eprintln!("{note}");
+        }
+    }
 }
 
 /// The projects a query should run against: just this one, or every graphed
@@ -66,7 +94,7 @@ fn targets(mimir: &mut Mimir, all_projects: bool) -> Result<Vec<Node>> {
         ensure_graph(mimir, &proj)?;
         return Ok(vec![proj]);
     }
-    let all = graphed_projects(mimir)?;
+    let all = mimir_graph::graphed_projects(&mimir.conn)?;
     if all.is_empty() {
         bail!("no project has a code graph yet — run `mimir graph build` in one first");
     }
@@ -77,15 +105,48 @@ fn project_header(proj: &Node) -> String {
     format!("── {} ──", proj.title.as_deref().unwrap_or("(unnamed)"))
 }
 
-pub fn build() -> Result<()> {
+pub fn build(full: bool) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let proj = project(&mimir)?;
     let root = std::path::PathBuf::from(proj.path.as_deref().context("project has no root")?);
     let started = std::time::Instant::now();
-    let stats = mimir_graph::update(&mut mimir.conn, &proj, &root)?;
+    // A graph an older Mimir resolved is rebuilt in full without being
+    // asked when the project is small; a large one keeps its note and waits
+    // for `--full`.
+    let upgrade = !full && mimir_graph::wants_full_rebuild(&mimir.conn, proj.id)?;
+    let report = mimir_graph::update_with(
+        &mut mimir.conn,
+        &proj,
+        &root,
+        UpdateOptions {
+            full: full || upgrade,
+        },
+    )?;
     println!(
-        "{}: {} files seen, {} indexed, {} unchanged, {} removed — {} symbols, {} calls resolved ({} by receiver type, +{} heuristic), {} import edges [{:.1?}]",
-        proj.title.as_deref().unwrap_or("project"),
+        "{} [{:.1?}]{}",
+        build_line(proj.title.as_deref().unwrap_or("project"), &report),
+        started.elapsed(),
+        if upgrade {
+            " (rebuilt in full: this graph was resolved by an older Mimir's rules)"
+        } else {
+            ""
+        },
+    );
+    let embedded = mimir.embed_pending()?;
+    if embedded > 0 {
+        println!("embedded {embedded} node(s)");
+    }
+    Ok(())
+}
+
+/// The one line `graph build` prints. The call numbers are call *sites*,
+/// which is what the update counts; edges are fewer, since several sites in
+/// one function share an edge. What the update could not do is appended only
+/// when there is something to say, so an ordinary build reads as before.
+fn build_line(title: &str, report: &UpdateReport) -> String {
+    let stats = &report.stats;
+    let mut line = format!(
+        "{title}: {} files seen, {} indexed, {} unchanged, {} removed — {} symbols, {} call sites resolved ({} by receiver type, +{} heuristic), {} import edges",
         stats.files_seen,
         stats.files_indexed,
         stats.unchanged,
@@ -95,13 +156,26 @@ pub fn build() -> Result<()> {
         stats.calls_typed,
         stats.calls_heuristic,
         stats.imports,
-        started.elapsed(),
     );
-    let embedded = mimir.embed_pending()?;
-    if embedded > 0 {
-        println!("embedded {embedded} node(s)");
+    if report.reresolved > 0 {
+        line.push_str(&format!(
+            ", {} unchanged file(s) re-resolved",
+            report.reresolved
+        ));
     }
-    Ok(())
+    if report.parse_failed > 0 {
+        line.push_str(&format!(
+            ", {} file(s) failed to parse (kept as last indexed)",
+            report.parse_failed
+        ));
+    }
+    if report.unreadable > 0 {
+        line.push_str(&format!(
+            ", {} unreadable file(s) skipped",
+            report.unreadable
+        ));
+    }
+    line
 }
 
 /// Report whether the graph still matches the working tree, and say so with
@@ -157,14 +231,19 @@ pub fn check(json: bool) -> Result<()> {
 }
 
 pub fn callers(reference: &str, depth: usize, all_projects: bool) -> Result<()> {
-    walk_relation(reference, depth, true, all_projects)
+    walk_relation(reference, depth, Direction::Callers, all_projects)
 }
 
 pub fn calls(reference: &str, depth: usize, all_projects: bool) -> Result<()> {
-    walk_relation(reference, depth, false, all_projects)
+    walk_relation(reference, depth, Direction::Calls, all_projects)
 }
 
-fn walk_relation(reference: &str, depth: usize, reverse: bool, all_projects: bool) -> Result<()> {
+fn walk_relation(
+    reference: &str,
+    depth: usize,
+    direction: Direction,
+    all_projects: bool,
+) -> Result<()> {
     let mut mimir = Mimir::open()?;
     let projects = targets(&mut mimir, all_projects)?;
     let multi = projects.len() > 1;
@@ -185,23 +264,16 @@ fn walk_relation(reference: &str, depth: usize, reverse: bool, all_projects: boo
         };
         found += 1;
         let graph = CodeGraph::load(&mimir.conn, proj.id)?;
-        let reached = if reverse {
-            graph.callers(sym.id, depth)
-        } else {
-            graph.calls(sym.id, depth)
-        };
         if multi {
             println!("{}", project_header(proj));
         }
-        println!("{}", symbol_line(&sym));
-        if reached.is_empty() {
-            println!("no {} found", if reverse { "callers" } else { "callees" });
-            continue;
-        }
-        for r in reached {
-            let node = store::get_node(&mimir.conn, r.id)?;
-            println!("{}{}", "  ".repeat(r.distance), symbol_line(&node));
-        }
+        // The answer is rendered in one place for the CLI and the MCP tool
+        // alike (`mimir_graph::render`); this only frames it.
+        println!(
+            "{}",
+            render::relation(&mimir.conn, &graph, &sym, depth, direction)?
+        );
+        note_if_behind(&mimir, proj, multi);
     }
     if found == 0 {
         bail!("no project has a symbol named `{reference}`");
@@ -218,43 +290,27 @@ pub fn impact(files: Vec<String>, depth: usize, all_projects: bool) -> Result<()
 
     for proj in &projects {
         let graph = CodeGraph::load(&mimir.conn, proj.id)?;
-        let mut seeds: Vec<i64> = Vec::new();
-        for f in &files {
-            let matches = store::files_by_path_suffix(&mimir.conn, f.trim_start_matches("./"))?;
-            for file in matches {
-                // A suffix like `src/lib.rs` matches in half the repos on
-                // the machine; only this project's files seed its graph.
-                if file.project_id != Some(proj.id) {
-                    continue;
-                }
-                seeds.push(file.id);
-                if let Some(symbols) = graph.file_symbols.get(&file.id) {
-                    seeds.extend(symbols);
-                }
-            }
-        }
-        if seeds.is_empty() {
+        // The outcome is decided in one place for the CLI and the MCP tool
+        // alike (`mimir_graph::Impact`), and so are the words
+        // (`mimir_graph::render`).
+        let trace = graph.impact_of_paths_traced(&mimir.conn, &files, depth)?;
+        let Some(answer) = render::impact(&trace, depth) else {
             continue;
-        }
+        };
         hit_any = true;
-        let reached = graph.impact(&seeds, depth);
         if multi {
             println!("{}", project_header(proj));
         }
-        if reached.is_empty() {
-            println!("no impact outside the changed files");
-            continue;
-        }
-        for r in &reached {
-            let node = store::get_node(&mimir.conn, r.id)?;
-            if node.kind == Kind::Symbol {
-                println!("{}{}", "  ".repeat(r.distance - 1), symbol_line(&node));
-            }
-        }
-        println!("({} affected symbols within {depth} hops)", reached.len());
+        println!("{answer}");
+        note_if_behind(&mimir, proj, multi);
     }
     if !hit_any {
-        bail!("none of those paths are in the code graph (run `mimir graph build`?)");
+        // When the reason is a file added since the last build, the note
+        // says the graph is behind and what to run.
+        if let [proj] = projects.as_slice() {
+            note_if_behind(&mimir, proj, false);
+        }
+        bail!("{}", render::NOT_IN_GRAPH);
     }
     Ok(())
 }
@@ -265,30 +321,9 @@ pub fn node_info(reference: &str) -> Result<()> {
     let proj = project(&mimir)?;
     ensure_graph(&mut mimir, &proj)?;
     let sym = resolve_symbol(&mimir.conn, proj.id, reference)?;
-    println!("{}", symbol_line(&sym));
-    if let Some(body) = &sym.body {
-        println!("{body}");
-    }
+    println!("{}", render::node(&mimir.conn, &sym)?);
     mimir_core::learn::record_opened(&mimir.conn, sym.id)?;
-    for edge in store::edges_of(&mimir.conn, sym.id)? {
-        let (arrow, other_id) = if edge.src == sym.id {
-            ("→", edge.dst)
-        } else {
-            ("←", edge.src)
-        };
-        let Ok(other) = store::get_node(&mimir.conn, other_id) else {
-            continue;
-        };
-        let line = match other.kind {
-            Kind::Symbol => symbol_line(&other),
-            _ => format!(
-                "{} {}",
-                short_uid(other.kind, &other.uid),
-                other.title.as_deref().unwrap_or("")
-            ),
-        };
-        println!("{arrow} {} {line}", edge.rel);
-    }
+    note_if_behind(&mimir, &proj, false);
     Ok(())
 }
 
@@ -315,19 +350,8 @@ pub fn path(a: &str, b: &str, all_projects: bool) -> Result<()> {
         if multi {
             println!("{}", project_header(proj));
         }
-        match graph.path(sa.id, sb.id) {
-            Some(ids) => {
-                for (i, id) in ids.iter().enumerate() {
-                    let node = store::get_node(&mimir.conn, *id)?;
-                    println!("{}{}", "  ".repeat(i), symbol_line(&node));
-                }
-            }
-            None => println!(
-                "no call path {} → {}",
-                sa.title.as_deref().unwrap_or(a),
-                sb.title.as_deref().unwrap_or(b)
-            ),
-        }
+        println!("{}", render::path(&mimir.conn, &graph, &sa, &sb)?);
+        note_if_behind(&mimir, proj, multi);
     }
     if found == 0 {
         bail!("no project has both `{a}` and `{b}`");
@@ -340,15 +364,7 @@ pub fn hubs(limit: usize) -> Result<()> {
     let proj = project(&mimir)?;
     ensure_graph(&mut mimir, &proj)?;
     let graph = CodeGraph::load(&mimir.conn, proj.id)?;
-    let hubs = graph.hubs(limit);
-    if hubs.is_empty() {
-        println!("no call edges yet (run `mimir graph build`)");
-        return Ok(());
-    }
-    for (id, indeg) in hubs {
-        let node = store::get_node(&mimir.conn, id)?;
-        println!("↑{indeg:<4} {}", symbol_line(&node));
-    }
+    println!("{}", render::hubs(&mimir.conn, &graph, limit)?);
     Ok(())
 }
 
@@ -440,5 +456,85 @@ fn community_name(members: &[Node]) -> String {
         theme.join("-")
     } else {
         format!("{dir} ({})", theme.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mimir_graph::GraphStats;
+
+    /// The notes a graph answer carries, in order: nothing for a graph that
+    /// is current and this build's work; the staleness line once a file has
+    /// changed; the older-rules line once the rules stamp is missing — and
+    /// only that one for a project whose checkout is not on this disk.
+    #[test]
+    fn graph_notes_say_what_an_answer_cannot() {
+        let home = tempfile::tempdir().unwrap();
+        let code = tempfile::tempdir().unwrap();
+        std::fs::write(code.path().join("a.rs"), "pub fn a() {}\n").unwrap();
+        let mut mimir = Mimir::open_at(mimir_core::config::Paths::under_root(home.path())).unwrap();
+        let proj =
+            store::ensure_project(&mimir.conn, &code.path().to_string_lossy(), "probe").unwrap();
+        mimir_graph::update(&mut mimir.conn, &proj, code.path()).unwrap();
+        assert_eq!(graph_notes(&mimir.conn, &proj), Vec::<String>::new());
+
+        std::fs::write(code.path().join("a.rs"), "pub fn a() { let _ = 1; }\n").unwrap();
+        let stale = graph_notes(&mimir.conn, &proj);
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert!(stale[0].starts_with("note: the code graph is 1 file(s) behind"));
+
+        mimir
+            .conn
+            .execute(
+                "UPDATE node SET meta = json_remove(meta, '$.graph_rules') WHERE id = ?1",
+                [proj.id],
+            )
+            .unwrap();
+        let both = graph_notes(&mimir.conn, &proj);
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert_eq!(both[0], stale[0]);
+        assert!(both[1].starts_with("note: this graph was built with an older Mimir's"));
+
+        drop(code);
+        let gone = graph_notes(&mimir.conn, &proj);
+        assert_eq!(gone, both[1..], "no working tree to compare with");
+    }
+
+    /// The build line names what it counts, and mentions what the update
+    /// could not do only when there is something to mention.
+    #[test]
+    fn build_line_counts_call_sites_and_reports_skips_only_when_there_are_any() {
+        let mut report = UpdateReport {
+            stats: GraphStats {
+                files_seen: 9,
+                files_indexed: 2,
+                unchanged: 7,
+                removed: 1,
+                symbols: 30,
+                calls_resolved: 12,
+                calls_typed: 4,
+                calls_heuristic: 3,
+                imports: 5,
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            build_line("probe", &report),
+            "probe: 9 files seen, 2 indexed, 7 unchanged, 1 removed — 30 symbols, \
+             12 call sites resolved (4 by receiver type, +3 heuristic), 5 import edges"
+        );
+
+        report.reresolved = 2;
+        report.parse_failed = 1;
+        report.unreadable = 3;
+        let line = build_line("probe", &report);
+        assert!(
+            line.ends_with(
+                "5 import edges, 2 unchanged file(s) re-resolved, 1 file(s) failed to parse \
+                 (kept as last indexed), 3 unreadable file(s) skipped"
+            ),
+            "{line}"
+        );
     }
 }

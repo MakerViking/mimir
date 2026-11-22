@@ -7,51 +7,27 @@
 //!
 //! Two entry points:
 //! - `show()` — the SessionStart hook (stdin JSON: session_id, source,
-//!   cwd). Silent unless `[brief] enabled = true` (the kill-switch; the
+//!   cwd, read through `context_guard_cmd::HookEvent` like every other
+//!   hook). Silent unless `[brief] enabled = true` (the kill-switch; the
 //!   hook entry itself is always installed, same rollback pattern as the
-//!   context guard).
+//!   context guard). Fails open: an error is a line on stderr and exit 0.
 //! - `dry_run()` — human-facing `mimir brief`: prints exactly what a
 //!   startup fire would inject, then the ranked candidates with scores,
 //!   so "why did this appear?" always has an answer. Records nothing.
 
 use std::collections::HashSet;
-use std::io::Read;
 
 use anyhow::Result;
+use mimir_core::config::ContextGuardMode;
+use mimir_core::context_guard::SessionSource;
 use mimir_core::model::{now_unix, short_uid, Scope};
 use mimir_core::savings::{self, source};
-use mimir_core::{brief, memory, store, tokens, Mimir};
+use mimir_core::{brief, store, tokens, Mimir};
+
+use crate::context_guard_cmd::{fail_open, HookEvent};
 
 const FIRE_COUNT_KEY: &str = "brief_fire_count";
 const SHOWN_PREFIX: &str = "brief_shown:";
-/// Wall-clock fallback: any node briefed in ANY session inside this
-/// window is excluded, covering the unverified case where a resume (or a
-/// client's compact) mints a fresh session_id — without it, a fresh id
-/// would re-show the identical brief minutes later.
-const RECENT_SHOWN_SECS: i64 = 6 * 3600;
-
-fn read_stdin_json() -> serde_json::Value {
-    let mut buf = String::new();
-    if std::io::stdin().read_to_string(&mut buf).is_err() {
-        return serde_json::Value::Null;
-    }
-    serde_json::from_str(&buf).unwrap_or(serde_json::Value::Null)
-}
-
-/// Same cwd→scope resolution as the context guard's hook entry.
-fn scope_for_cwd(mimir: &Mimir, input: &serde_json::Value) -> Scope {
-    input
-        .get("cwd")
-        .and_then(|v| v.as_str())
-        .and_then(|c| {
-            mimir
-                .project_for_cwd(std::path::Path::new(c))
-                .ok()
-                .flatten()
-        })
-        .map(|p| Scope::Project(p.id))
-        .unwrap_or(Scope::Global)
-}
 
 /// Node ids to suppress for this fire. Semantics differ by fire kind:
 ///
@@ -77,7 +53,7 @@ fn suppressed(mimir: &Mimir, session_id: &str, now: i64, recap: bool) -> Result<
         rusqlite::params![
             format!("{SHOWN_PREFIX}%"),
             session_id,
-            now - RECENT_SHOWN_SECS
+            now - brief::RECENT_SHOWN_SECS
         ],
         |r| r.get::<_, String>(0),
     )?;
@@ -103,29 +79,38 @@ fn rules_body(mimir: &Mimir, scope: Scope) -> Option<String> {
     }
 }
 
-/// SessionStart hook entry.
+/// SessionStart hook entry. Never fails the event: see [`fail_open`].
 pub fn show() -> Result<()> {
-    let input = read_stdin_json();
-    let mimir = Mimir::open()?;
+    fail_open("brief show", || {
+        let event = HookEvent::from_stdin();
+        let mimir = Mimir::open()?;
+        fire(&mimir, &event)
+    })
+}
+
+/// Print the brief this event calls for, if any, and record that it fired.
+fn fire(mimir: &Mimir, event: &HookEvent) -> Result<()> {
     if !mimir.config.brief.enabled {
         return Ok(());
     }
-    let Some(session_id) = input.get("session_id").and_then(|v| v.as_str()) else {
+    let Some(session_id) = event.session_id() else {
         return Ok(());
     };
-    let event_source = input.get("source").and_then(|v| v.as_str()).unwrap_or("");
+    let event_source = event.source();
     // resume and fork (v2.1.214+; older clients report forks as "resume"):
     // the transcript already contains prior context including any earlier
     // brief. Unknown values: fail closed (never fire), matching the
-    // context guard's inert-default arm. session_id stability across
-    // clear/compact is undocumented upstream — the wall-clock fallback in
-    // suppressed() covers a minted id, so nothing here depends on it.
+    // context guard's leave-alone arm; a *missing* source is a start-up
+    // (`SessionSource::parse`), for the guard and for the brief alike.
+    // session_id stability across clear/compact is undocumented upstream —
+    // the wall-clock fallback in suppressed() covers a minted id, so
+    // nothing here depends on it.
     let budget = match event_source {
-        "startup" => mimir.config.brief.max_tokens,
-        "clear" | "compact" => mimir.config.brief.recap_tokens,
-        _ => return Ok(()),
+        SessionSource::Startup => mimir.config.brief.max_tokens,
+        SessionSource::Clear | SessionSource::Compact => mimir.config.brief.recap_tokens,
+        SessionSource::Resume | SessionSource::Other => return Ok(()),
     };
-    let recap = matches!(event_source, "clear" | "compact");
+    let recap = event_source.is_context_reset();
     let now = now_unix();
     // Fire-cap check before any selection work — a capped session pays
     // zero query cost. Only RENDERED fires increment it (below): a
@@ -137,21 +122,26 @@ pub fn show() -> Result<()> {
         return Ok(());
     }
 
-    let scope = scope_for_cwd(&mimir, &input);
-    let mut exclude = suppressed(&mimir, session_id, now, recap)?;
-    // Compact-boundary overlap: in handoff mode the context guard is about
-    // to restore the handoff memory on this same event — don't brief it too.
-    if matches!(event_source, "clear" | "compact") && mimir.config.hooks.context_guard == "handoff"
-    {
-        if let Some(n) = memory::list(&mimir.conn, scope, None, Some("session-handoff"), 1)?
-            .into_iter()
-            .next()
-        {
+    let place = event.place(mimir);
+    let scope = place.scope;
+    let mut exclude = suppressed(mimir, session_id, now, recap)?;
+    // Compact-boundary overlap: in handoff mode the context guard restores
+    // the handoff memory on this same event — don't brief it too. The two
+    // hooks run side by side, so "restores" has to cover "has just
+    // restored": see `handoff_being_restored_in`. The guard restores the
+    // handoff of this checkout, so that is the one excluded.
+    if recap && mimir.config.hooks.context_guard() == ContextGuardMode::Handoff {
+        if let Some(n) = mimir_core::context_guard::handoff_being_restored_in(
+            &mimir.conn,
+            scope,
+            place.checkout.as_deref(),
+            now,
+        )? {
             exclude.insert(n.id);
         }
     }
 
-    let rules = rules_body(&mimir, scope);
+    let rules = rules_body(mimir, scope);
     let ranked = brief::select(
         &mimir.conn,
         scope,
@@ -192,7 +182,7 @@ pub fn show() -> Result<()> {
         source::BRIEF,
         0,
         tokens::count(&composed.text),
-        serde_json::json!({ "items": composed.shown.len(), "source": event_source }),
+        serde_json::json!({ "items": composed.shown.len(), "source": event_source.as_str() }),
     );
     Ok(())
 }
@@ -202,10 +192,8 @@ pub fn show() -> Result<()> {
 /// or written, nothing is recorded — pure preview/explainability.
 pub fn dry_run() -> Result<()> {
     let mimir = Mimir::open()?;
-    let scope = mimir
-        .project_for_cwd(&std::env::current_dir()?)?
-        .map(|p| Scope::Project(p.id))
-        .unwrap_or(Scope::Global);
+    let project = mimir.memory_project_for_cwd(&std::env::current_dir()?)?;
+    let scope = mimir_core::scope::push_scope(project.map(|p| p.id));
     let now = now_unix();
     let rules = rules_body(&mimir, scope);
     let ranked = brief::select(
@@ -255,7 +243,7 @@ pub fn dry_run() -> Result<()> {
                 "{mark} {:>6.3}  {}  {}  [{flags}]",
                 r.score,
                 short_uid(r.node.kind, &r.node.uid),
-                r.node.subkind.as_deref().unwrap_or("memory"),
+                r.node.type_label(),
             );
         }
     }

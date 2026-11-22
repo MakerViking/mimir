@@ -3,12 +3,13 @@
 //! Strength is always a *tiebreaker* in ranking, never a gate — a decayed
 //! memory still surfaces when it's the best match. Signals: `opened`
 //! (auto, +0.3), explicit `mark` (±1.0); both capped at one effect per
-//! node per day so loops can't pump a memory.
+//! node per day so loops can't pump a memory. The events themselves are
+//! [`RecallEvent`]s, written to `recall_event` under its `as_str` spelling.
 
 use rusqlite::{Connection, OptionalExtension};
 
 use crate::error::Result;
-use crate::model::{now_unix, Kind, Node};
+use crate::model::{now_unix, Kind, MemoryType, Node, RecallEvent};
 use crate::store;
 
 pub const STRENGTH_MIN: f64 = 0.05;
@@ -16,20 +17,35 @@ pub const STRENGTH_MAX: f64 = 10.0;
 const OPENED_BONUS: f64 = 0.3;
 const MARK_DELTA: f64 = 1.0;
 
-/// Half-life in days for a memory subkind. None = never decays
-/// (person notes, docs, code, summaries).
+/// Half-life in days for a memory type. None = never decays (person notes
+/// and summaries). Every type is listed, so adding one is a decision about
+/// its decay rather than a silent default.
+pub fn memory_half_life_days(mtype: MemoryType) -> Option<f64> {
+    match mtype {
+        MemoryType::Gotcha => Some(180.0),
+        MemoryType::Decision => Some(365.0),
+        MemoryType::Insight => Some(120.0),
+        MemoryType::Note => Some(90.0),
+        MemoryType::Idea => Some(60.0),
+        MemoryType::Person | MemoryType::Summary => None,
+    }
+}
+
+/// Half-life in days for a node, read from its [`Node::memory_type`]. None =
+/// never decays: docs and code (not memories), person notes, summaries, and
+/// a memory of a type this build does not know.
+pub fn node_half_life_days(node: &Node) -> Option<f64> {
+    node.memory_type().and_then(memory_half_life_days)
+}
+
+/// [`node_half_life_days`] for a caller holding the columns rather than the
+/// node. A missing subkind on a memory is a note, as everywhere else
+/// (`MemoryType::from_subkind`).
 pub fn half_life_days(kind: Kind, subkind: Option<&str>) -> Option<f64> {
     if kind != Kind::Memory {
         return None;
     }
-    match subkind.unwrap_or("note") {
-        "gotcha" => Some(180.0),
-        "decision" => Some(365.0),
-        "insight" => Some(120.0),
-        "note" => Some(90.0),
-        "idea" => Some(60.0),
-        _ => None, // person, summary
-    }
+    MemoryType::from_subkind(subkind).and_then(memory_half_life_days)
 }
 
 /// Strength after time decay: `strength · 2^(−age/half_life)`, where age
@@ -39,7 +55,7 @@ pub fn effective_strength(node: &Node, now: i64) -> f64 {
     if node.pinned {
         return node.strength;
     }
-    let Some(half_life) = half_life_days(node.kind, node.subkind.as_deref()) else {
+    let Some(half_life) = node_half_life_days(node) else {
         return node.strength;
     };
     let reference = node.last_accessed.unwrap_or(node.created_at);
@@ -51,7 +67,7 @@ pub fn effective_strength(node: &Node, now: i64) -> f64 {
 /// information wins), using the same type-aware half-lives as decay. Returns
 /// 1.0 for pinned or never-decaying kinds (docs, code, person, summary) —
 /// but 1.0 is the *max* of this range, not a neutral "no boost" value, so
-/// callers MUST gate its use on `half_life_days(kind, subkind).is_some()`
+/// callers MUST gate its use on `node_half_life_days(node).is_some()`
 /// (see the score site in `search/mod.rs`) rather than applying it
 /// unconditionally; otherwise every non-decaying node gets a permanent
 /// boost relative to every aging memory instead of staying recency-neutral.
@@ -62,24 +78,36 @@ pub fn recency_factor(node: &Node, now: i64) -> f64 {
     if node.pinned {
         return 1.0;
     }
-    let Some(half_life) = half_life_days(node.kind, node.subkind.as_deref()) else {
+    let Some(half_life) = node_half_life_days(node) else {
         return 1.0;
     };
     let age_days = (now - node.created_at).max(0) as f64 / 86_400.0;
     2f64.powf(-age_days / half_life)
 }
 
-/// Fixed per-subkind priority multiplier: gotcha (drift-preventer) and
-/// decision (policy call) memories are worth surfacing over an
-/// equally-matching but non-critical note/idea/insight/summary/person, or a
-/// non-Memory node. Scaled by `scoring.type_prior_alpha` (0.0 = off) at the
-/// fused score site — this table only says which subkinds get a prior, not
-/// how strongly it counts.
-pub fn type_prior(subkind: Option<&str>) -> f64 {
-    match subkind {
-        Some("gotcha") | Some("decision") => 1.25,
-        _ => 1.0,
+/// Priority multiplier for the preventer types
+/// ([`MemoryType::is_preventer`]): a gotcha (drift-preventer) or decision
+/// (policy call) memory is worth surfacing over an equally-matching but
+/// non-critical note/idea/insight/summary/person. Scaled by
+/// `scoring.type_prior_alpha` (0.0 = off) at the fused score site — this
+/// only says which types get a prior, not how strongly it counts.
+pub fn memory_type_prior(mtype: Option<MemoryType>) -> f64 {
+    if mtype.is_some_and(MemoryType::is_preventer) {
+        1.25
+    } else {
+        1.0
     }
+}
+
+/// [`memory_type_prior`] for a node: a non-Memory node gets none.
+pub fn node_type_prior(node: &Node) -> f64 {
+    memory_type_prior(node.memory_type())
+}
+
+/// [`memory_type_prior`] for a caller holding only the subkind text. A
+/// missing subkind gets no prior.
+pub fn type_prior(subkind: Option<&str>) -> f64 {
+    memory_type_prior(subkind.and_then(|text| text.parse().ok()))
 }
 
 /// Per-node impression counts from the `recall_event` ledger
@@ -131,13 +159,11 @@ pub fn impression_damp(stats: &ImpressionStats, alpha: f64, now: i64) -> f64 {
 }
 
 /// Has this node already received an event of this type today?
-fn capped_today(conn: &Connection, node_id: i64, event: &str) -> Result<bool> {
-    let now = now_unix();
-    let midnight = now - (now % 86_400);
+fn capped_today(conn: &Connection, node_id: i64, event: RecallEvent) -> Result<bool> {
     let n: i64 = conn.query_row(
         "SELECT count(*) FROM recall_event
          WHERE node_id = ?1 AND event = ?2 AND at >= ?3",
-        rusqlite::params![node_id, event, midnight],
+        rusqlite::params![node_id, event.as_str(), midnight(now_unix())],
         |r| r.get(0),
     )?;
     Ok(n > 0)
@@ -155,9 +181,16 @@ fn adjust_strength(conn: &Connection, node_id: i64, delta: f64) -> Result<()> {
 /// bumps access stats, logs the event, and applies the (daily-capped)
 /// strength bonus.
 pub fn record_opened(conn: &Connection, node_id: i64) -> Result<()> {
-    let first_today = !capped_today(conn, node_id, "opened")?;
+    let first_today = !capped_today(conn, node_id, RecallEvent::Opened)?;
     store::touch_accessed(conn, node_id)?;
-    store::record_event(conn, node_id, "opened", None, None, None)?;
+    store::record_event(
+        conn,
+        node_id,
+        RecallEvent::Opened.as_str(),
+        None,
+        None,
+        None,
+    )?;
     if first_today {
         adjust_strength(conn, node_id, OPENED_BONUS)?;
     }
@@ -175,9 +208,13 @@ pub fn record_opened(conn: &Connection, node_id: i64) -> Result<()> {
 /// Explicit feedback: ±1.0 strength, one effect per node per day.
 /// Returns the node's new strength.
 pub fn apply_mark(conn: &Connection, node_id: i64, useful: bool) -> Result<f64> {
-    let event = if useful { "useful" } else { "not_useful" };
+    let event = if useful {
+        RecallEvent::Useful
+    } else {
+        RecallEvent::NotUseful
+    };
     let first_today = !capped_today(conn, node_id, event)?;
-    store::record_event(conn, node_id, event, None, None, None)?;
+    store::record_event(conn, node_id, event.as_str(), None, None, None)?;
     if first_today {
         adjust_strength(conn, node_id, if useful { MARK_DELTA } else { -MARK_DELTA })?;
     }
@@ -238,13 +275,23 @@ pub fn coactivation_weight(stored: f64, last_fired_at: i64, now: i64) -> f64 {
     stored * 2f64.powf(-age_days / COACTIVATION_HALF_LIFE_DAYS)
 }
 
-/// Start of `now`'s UTC day. Mirrors [`capped_today`]'s boundary, using
-/// `rem_euclid` so a pre-epoch timestamp floors instead of rounding toward
-/// zero. The cap it feeds is per PAIR, which is why `capped_today` itself
-/// cannot be reused: that one asks whether a node was opened today, and both
-/// nodes of a pair can be opened repeatedly without the pair ever firing.
+/// Start of `now`'s UTC day: the one boundary every once-a-day cap in this
+/// module is measured from — [`capped_today`]'s per node, and the per-PAIR
+/// cap in [`fire_pair`]. (Two caps, because both nodes of a pair can be
+/// opened repeatedly in a day without the pair ever firing.) `rem_euclid`
+/// so a pre-epoch timestamp floors instead of rounding toward zero.
 fn midnight(now: i64) -> i64 {
     now - now.rem_euclid(86_400)
+}
+
+/// SQL for when a co-activation edge last fired, with `prefix` the edge
+/// table's qualifier (`""`, or `"e."`): its `meta.last_fired_at`, or the
+/// edge's creation when it carries none. [`fire_pair`] always writes the
+/// stamp, so the fallback is for an edge that reached the table some other
+/// way; aging it from its creation is the one reading under which the fire,
+/// the eviction and the display all see the same weight.
+fn last_fired_sql(prefix: &str) -> String {
+    format!("COALESCE(json_extract({prefix}meta, '$.last_fired_at'), {prefix}created_at)")
 }
 
 /// Is this node a live memory? Co-activation is memory↔memory only.
@@ -292,10 +339,13 @@ fn has_authored_edge(conn: &Connection, a: i64, b: i64) -> Result<bool> {
 /// mimir-graph is the precedent for an edge writer that carries its own meta.
 fn fire_pair(conn: &Connection, a: i64, b: i64, now: i64) -> Result<bool> {
     let (src, dst) = (a.min(b), a.max(b));
-    let existing: Option<(i64, f64, Option<i64>)> = conn
+    let existing: Option<(i64, f64, i64)> = conn
         .query_row(
-            "SELECT id, weight, json_extract(meta, '$.last_fired_at') FROM edge
-             WHERE src = ?1 AND dst = ?2 AND rel = 'co_recalled'",
+            &format!(
+                "SELECT id, weight, {} FROM edge
+                 WHERE src = ?1 AND dst = ?2 AND rel = 'co_recalled'",
+                last_fired_sql("")
+            ),
             [src, dst],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
@@ -303,7 +353,6 @@ fn fire_pair(conn: &Connection, a: i64, b: i64, now: i64) -> Result<bool> {
 
     match existing {
         Some((id, weight, last_fired_at)) => {
-            let last_fired_at = last_fired_at.unwrap_or(0);
             if last_fired_at >= midnight(now) {
                 return Ok(false);
             }
@@ -336,10 +385,11 @@ fn fire_pair(conn: &Connection, a: i64, b: i64, now: i64) -> Result<bool> {
 /// is the opposite of what the decay is for. `id` breaks ties, since the
 /// same-day cap makes exact float ties common.
 fn evict_beyond_cap(conn: &Connection, node_id: i64, now: i64) -> Result<()> {
-    let mut stmt = conn.prepare(
-        "SELECT id, weight, COALESCE(json_extract(meta, '$.last_fired_at'), created_at)
+    let mut stmt = conn.prepare(&format!(
+        "SELECT id, weight, {}
          FROM edge WHERE rel = 'co_recalled' AND (src = ?1 OR dst = ?1)",
-    )?;
+        last_fired_sql("")
+    ))?;
     let mut rows: Vec<(i64, f64)> = stmt
         .query_map([node_id], |r| {
             let id: i64 = r.get(0)?;
@@ -372,13 +422,17 @@ pub fn record_coactivation(conn: &Connection, node_id: i64, now: i64) -> Result<
     let mut stmt = conn.prepare(
         "SELECT DISTINCT e.node_id FROM recall_event e
          JOIN node n ON n.id = e.node_id
-         WHERE e.event = 'opened' AND e.at >= ?2 AND e.node_id <> ?1
+         WHERE e.event = ?3 AND e.at >= ?2 AND e.node_id <> ?1
            AND n.kind = 'memory'
            AND n.deleted_at IS NULL AND n.superseded_by IS NULL",
     )?;
     let partners: Vec<i64> = stmt
         .query_map(
-            rusqlite::params![node_id, now - COACTIVATION_WINDOW_SECS],
+            rusqlite::params![
+                node_id,
+                now - COACTIVATION_WINDOW_SECS,
+                RecallEvent::Opened.as_str()
+            ],
             |r| r.get(0),
         )?
         .collect::<rusqlite::Result<_>>()?;
@@ -406,15 +460,16 @@ pub fn record_coactivation(conn: &Connection, node_id: i64, now: i64) -> Result<
 /// `supersede` are soft — neither deletes the row, so `ON DELETE CASCADE`
 /// never fires and edges to retired memories survive indefinitely.
 pub fn coactivation_partners(conn: &Connection, node_id: i64, now: i64) -> Result<Vec<(i64, f64)>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare(&format!(
         "SELECT CASE WHEN e.src = ?1 THEN e.dst ELSE e.src END,
                 e.weight,
-                COALESCE(json_extract(e.meta, '$.last_fired_at'), e.created_at)
+                {}
          FROM edge e
          JOIN node n ON n.id = CASE WHEN e.src = ?1 THEN e.dst ELSE e.src END
          WHERE e.rel = 'co_recalled' AND (e.src = ?1 OR e.dst = ?1)
            AND n.deleted_at IS NULL AND n.superseded_by IS NULL",
-    )?;
+        last_fired_sql("e.")
+    ))?;
     let mut partners: Vec<(i64, f64)> = stmt
         .query_map([node_id], |r| {
             let other: i64 = r.get(0)?;
@@ -465,6 +520,50 @@ mod tests {
         node.last_accessed = Some(now + 90 * 86_400);
         let fresh = effective_strength(&node, now + 90 * 86_400);
         assert!((fresh - 1.0).abs() < 1e-9);
+    }
+
+    /// The three readings of a missing subkind used to be three different
+    /// defaults. They are one now: a note.
+    #[test]
+    fn a_memory_without_a_subkind_decays_and_ranks_as_a_note() {
+        let conn = db::open_in_memory().unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.title = Some("t".into());
+        new.body = Some("b".into());
+        let untyped = store::insert_node(&conn, new).unwrap();
+        let note = memory(&conn, "note");
+        assert!(untyped.subkind.is_none());
+
+        assert_eq!(node_half_life_days(&untyped), Some(90.0));
+        assert_eq!(node_half_life_days(&untyped), node_half_life_days(&note));
+        assert_eq!(half_life_days(Kind::Memory, None), Some(90.0));
+        assert_eq!(node_type_prior(&untyped), node_type_prior(&note));
+
+        // The column-taking wrappers agree with the node-taking ones for
+        // every type, and for the cases that are not a known memory type.
+        for mtype in MemoryType::ALL {
+            let node = memory(&conn, mtype.as_str());
+            assert_eq!(
+                half_life_days(node.kind, node.subkind.as_deref()),
+                node_half_life_days(&node),
+                "{mtype}"
+            );
+            assert_eq!(
+                type_prior(node.subkind.as_deref()),
+                node_type_prior(&node),
+                "{mtype}"
+            );
+            assert_eq!(
+                node_type_prior(&node) > 1.0,
+                mtype.is_preventer(),
+                "{mtype}"
+            );
+        }
+        assert_eq!(half_life_days(Kind::Memory, Some("hypothesis")), None);
+        assert_eq!(half_life_days(Kind::Chunk, Some("note")), None);
+        let symbol = store::insert_node(&conn, NewNode::new(Kind::Symbol)).unwrap();
+        assert_eq!(node_half_life_days(&symbol), None);
+        assert_eq!(node_type_prior(&symbol), 1.0);
     }
 
     #[test]
@@ -738,6 +837,43 @@ mod tests {
         );
         assert_eq!(last_fired_at, tomorrow);
         assert_eq!(co_edges(&conn).len(), 1, "still one row, not a second one");
+    }
+
+    /// An edge with no `last_fired_at` (one written by anything but
+    /// `fire_pair`) has to be aged from somewhere. Display and eviction age
+    /// it from its creation; the next fire used to age it from 1970, which
+    /// decays any weight to nothing and restarts the pair at the learning
+    /// rate — so the same edge was strong to one function and brand new to
+    /// another.
+    #[test]
+    fn an_edge_with_no_fire_stamp_is_aged_from_its_creation_by_every_reader() {
+        let conn = db::open_in_memory().unwrap();
+        let a = memory(&conn, "note");
+        let b = memory(&conn, "note");
+        let created = T - 10 * 86_400;
+        conn.execute(
+            "INSERT INTO edge (src, dst, rel, weight, meta, created_at)
+             VALUES (?1, ?2, 'co_recalled', 0.9, '{}', ?3)",
+            rusqlite::params![a.id, b.id, created],
+        )
+        .unwrap();
+
+        // What display sees: ten days of decay on 0.9.
+        let seen = coactivation_partners(&conn, a.id, T).unwrap();
+        let aged = coactivation_weight(0.9, created, T);
+        assert_eq!(seen.len(), 1);
+        assert!((seen[0].1 - aged).abs() < 1e-12, "{seen:?}");
+
+        // The next fire starts from that same weight.
+        opened_at(&conn, a.id, T - 60);
+        assert_eq!(record_coactivation(&conn, b.id, T).unwrap(), 1);
+        let (_, _, weight, last_fired_at) = co_edges(&conn)[0];
+        let expected = aged + COACTIVATION_RATE * (1.0 - aged);
+        assert!(
+            (weight - expected).abs() < 1e-12,
+            "fired from {aged}, expected {expected}, got {weight}"
+        );
+        assert_eq!(last_fired_at, T, "and the edge now carries its own stamp");
     }
 
     #[test]

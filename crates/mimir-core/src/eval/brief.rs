@@ -696,7 +696,6 @@ pub struct ReplayFire {
 /// sessions' recent shows). Assertions live in the tests; the report
 /// prints each rendered brief for the agent-compliance half.
 pub fn replay_sessions(now: i64) -> Result<Vec<ReplayFire>> {
-    const RECENT_SHOWN_SECS: i64 = 6 * 3600;
     let config = Config::default();
     let built = StoreFixture::Aria.build(now)?;
     // (session, node_id, shown_at) — the session_state log this replay
@@ -714,7 +713,7 @@ pub fn replay_sessions(now: i64) -> Result<Vec<ReplayFire>> {
         let exclude: HashSet<i64> = log
             .iter()
             .filter(|(s, _, shown_at)| {
-                let recent = *shown_at > t - RECENT_SHOWN_SECS;
+                let recent = *shown_at > t - brief::RECENT_SHOWN_SECS;
                 if recap {
                     *s != session && recent
                 } else {

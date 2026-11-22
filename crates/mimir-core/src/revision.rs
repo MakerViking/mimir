@@ -27,15 +27,25 @@ pub struct Revision {
 
 /// Snapshot a memory's current text before an edit replaces it.
 ///
-/// Fails open, like the mutation ledger: an edit that landed must not be
-/// reported as failed because the history write hiccuped. Memories only —
+/// Fails open, like the mutation ledger: a caller that has already changed
+/// the row must not report failure because the history write hiccuped (see
+/// [`try_snapshot`] for the caller that has not). Memories only —
 /// doc chunks and symbols are re-derived from a source that is itself the
 /// history, so versioning them would duplicate the repository.
 pub fn snapshot(conn: &Connection, node: &Node) {
+    let _ = try_snapshot(conn, node);
+}
+
+/// As [`snapshot`], reporting a failed write. `memory::edit` uses this one:
+/// it takes the snapshot and replaces the text in a single
+/// [`crate::db::atomic`] step, so an edit whose previous wording could not
+/// be kept does not land at all — which is the only way "what did this used
+/// to say?" stays answerable for every edit that did.
+pub(crate) fn try_snapshot(conn: &Connection, node: &Node) -> Result<()> {
     if node.kind != Kind::Memory {
-        return;
+        return Ok(());
     }
-    let _ = conn.execute(
+    conn.execute(
         "INSERT INTO node_revision (node_id, at, title, body, meta)
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![
@@ -45,7 +55,8 @@ pub fn snapshot(conn: &Connection, node: &Node) {
             node.body,
             node.meta.to_string()
         ],
-    );
+    )?;
+    Ok(())
 }
 
 /// Every superseded version of `node_id`, oldest first.

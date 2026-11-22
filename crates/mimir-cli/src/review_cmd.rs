@@ -24,12 +24,12 @@ pub fn list(json: bool, limit: usize) -> Result<()> {
         return Ok(());
     }
     for item in &items {
-        let node = store::resolve_ref_including_deleted(&mimir.conn, &item.node_id.to_string())
-            .or_else(|_| store::get_node(&mimir.conn, item.node_id));
-        let title = node
-            .as_ref()
+        // `node_id` is a row id, so it is looked up as one. The uid resolver
+        // takes the text of a reference, and the digits of a row id can be
+        // the tail of some other node's uid.
+        let title = store::get_node(&mimir.conn, item.node_id)
             .ok()
-            .and_then(|n| n.title.clone())
+            .and_then(|n| n.title)
             .unwrap_or_default();
         if json {
             println!(

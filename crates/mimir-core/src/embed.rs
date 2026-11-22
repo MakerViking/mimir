@@ -43,7 +43,7 @@ pub fn gpu_backend() -> Option<&'static str> {
 /// default. EPs that fail to initialize at session build fall back to
 /// CPU with a logged warning — "auto" never hard-fails.
 fn execution_providers(device: &str) -> Vec<ort::ep::ExecutionProviderDispatch> {
-    if device == "cpu" {
+    if crate::config::EmbeddingDevice::resolve(device) == crate::config::EmbeddingDevice::Cpu {
         return Vec::new();
     }
     let eps: Vec<ort::ep::ExecutionProviderDispatch> = vec![
@@ -178,6 +178,117 @@ fn marker_path(paths: &Paths, name: &str) -> PathBuf {
 
 pub fn model_ready(paths: &Paths, name: &str) -> bool {
     marker_path(paths, name).exists()
+}
+
+/// How long a model that failed to load is left alone before a caller may
+/// try again. Loading is the expensive step (an ONNX session; on GPU builds
+/// a whole device, and creating and dropping those repeatedly was measured
+/// to leak driver memory), so a broken model must not be retried on every
+/// recall, nor every few seconds for the life of a daemon. Five minutes
+/// still lets a long-lived server recover by itself once whatever was wrong
+/// (a half-written cache, a busy GPU) is fixed.
+pub(crate) const LOAD_RETRY_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The longest a failed model is left alone. Each failure in a row doubles
+/// the wait up to this: a GPU that was merely busy is retried within
+/// minutes, while a load that keeps failing settles at one attempt an hour
+/// instead of one every five minutes for the life of a daemon, each of
+/// which costs the device set-up described above.
+pub(crate) const LOAD_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// How long to leave a model alone after its `failures`-th failure in a row.
+pub(crate) fn retry_after(failures: u32) -> std::time::Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    LOAD_RETRY_COOLDOWN
+        .saturating_mul(1u32 << doublings)
+        .min(LOAD_RETRY_MAX)
+}
+
+/// One lazily loaded model, and what this process knows about it.
+///
+/// ```text
+///   Unloaded ── load succeeds ─▶ Loaded        (until the process exits)
+///   Unloaded ── load fails ────▶ Failed
+///   Failed ── `retry_after(failures)` has passed, or the caller now
+///             allows the download the failed attempt was refused
+///          ── load ────────────▶ Loaded | Failed (failures + 1)
+/// ```
+///
+/// A failure is remembered so a hot path does not pay for the same doomed
+/// load on every call, but it is not final: a server that started while
+/// the weights were unusable must not stay BM25-only until someone
+/// restarts it, and an explicit `--fetch` must be able to do what a silent
+/// load could not.
+pub(crate) enum ModelSlot<T> {
+    /// No load has been attempted.
+    Unloaded,
+    Loaded(T),
+    Failed {
+        at: std::time::Instant,
+        /// Whether the failed attempt was allowed to download the weights.
+        /// One that was not says nothing about what a download would do.
+        allowed_download: bool,
+        /// Failed loads in a row, this one included. Sets the wait before
+        /// the next attempt (see [`retry_after`]).
+        failures: u32,
+    },
+}
+
+impl<T> ModelSlot<T> {
+    pub(crate) fn get_mut(&mut self) -> Option<&mut T> {
+        match self {
+            ModelSlot::Loaded(model) => Some(model),
+            ModelSlot::Unloaded | ModelSlot::Failed { .. } => None,
+        }
+    }
+
+    pub(crate) fn is_loaded(&self) -> bool {
+        matches!(self, ModelSlot::Loaded(_))
+    }
+
+    /// Whether a caller arriving at `now` should attempt a load.
+    pub(crate) fn wants_load(&self, allow_download: bool, now: std::time::Instant) -> bool {
+        match self {
+            ModelSlot::Unloaded => true,
+            ModelSlot::Loaded(_) => false,
+            ModelSlot::Failed {
+                at,
+                allowed_download,
+                failures,
+            } => {
+                (allow_download && !allowed_download)
+                    || now.saturating_duration_since(*at) >= retry_after(*failures)
+            }
+        }
+    }
+
+    /// Record the result of a load attempted at `now`, handing back the
+    /// error of a failed one for the caller to log.
+    pub(crate) fn settle(
+        &mut self,
+        loaded: Result<T>,
+        allow_download: bool,
+        now: std::time::Instant,
+    ) -> Option<Error> {
+        match loaded {
+            Ok(model) => {
+                *self = ModelSlot::Loaded(model);
+                None
+            }
+            Err(err) => {
+                let failures = match self {
+                    ModelSlot::Failed { failures, .. } => failures.saturating_add(1),
+                    ModelSlot::Unloaded | ModelSlot::Loaded(_) => 1,
+                };
+                *self = ModelSlot::Failed {
+                    at: now,
+                    allowed_download: allow_download,
+                    failures,
+                };
+                Some(err)
+            }
+        }
+    }
 }
 
 pub struct Embedder {
@@ -404,30 +515,30 @@ pub fn from_blob(blob: &[u8]) -> Vec<f32> {
     chunks.iter().copied().map(f32::from_le_bytes).collect()
 }
 
-/// Embed every node whose content is new or changed for this model.
-/// Unchanged content never reaches the model: embeddings are keyed by
-/// content hash, and identical text elsewhere in the store is copied.
-///
-/// Work is committed in batches so the single SQLite writer lock is yielded
-/// between chunks instead of held for the whole run, and — crucially — the
-/// CPU-bound model inference happens OUTSIDE any transaction, so a big embed
-/// never starves concurrent sessions. Each batch is independent: embeddings
-/// carry no cross-row invariant, so a partial run just leaves the rest pending
-/// for next time.
-///
-/// Returns the ids of every node embedded (fresh inference or dedup copy),
-/// so callers can patch a live vector-matrix cache instead of dropping it.
+/// Which nodes can be embedded at all, as a predicate on `node n`: live, with
+/// a body, of a kind whose text takes part in semantic recall. Every count
+/// of "embeddable" in the crate reads this, so none can drift from what
+/// [`embed_pending`] selects.
+pub(crate) fn embeddable_where() -> String {
+    format!("n.deleted_at IS NULL AND n.body IS NOT NULL AND n.kind IN ({EMBEDDABLE_KINDS})")
+}
+
+/// Whether an embeddable node's embedding row is missing or no longer
+/// describes it for model ?1, as a predicate on
+/// `node n LEFT JOIN embedding e ON e.node_id = n.id`: no row, a row from
+/// another model, or a row made from different content. A node with no
+/// `content_hash` of its own counts too — there is nothing to compare the
+/// row against — and [`embed_pending`] gives it one, so that state lasts
+/// for one pass.
+const STALE_WHERE: &str = "(e.node_id IS NULL OR e.model <> ?1
+                OR n.content_hash IS NULL OR e.content_hash <> n.content_hash)";
+
 /// WHERE clause selecting nodes that still need (re-)embedding for model ?1,
 /// against `node n LEFT JOIN embedding e ON e.node_id = n.id`. Shared by
-/// `embed_pending` and `has_pending` so the probe can never drift from the
-/// real selection.
+/// `embed_pending`, `has_pending` and `coverage` so neither the probe nor
+/// the reported number can drift from the real selection.
 fn pending_where() -> String {
-    format!(
-        "n.deleted_at IS NULL AND n.body IS NOT NULL
-           AND n.kind IN ({EMBEDDABLE_KINDS})
-           AND (e.node_id IS NULL OR e.model <> ?1
-                OR n.content_hash IS NULL OR e.content_hash <> n.content_hash)"
-    )
+    format!("{} AND {STALE_WHERE}", embeddable_where())
 }
 
 /// Cheap existence probe for embeddable work. Callers that would otherwise
@@ -443,6 +554,57 @@ pub fn has_pending(conn: &Connection, model: &str) -> Result<bool> {
     Ok(conn.query_row(&sql, [model], |r| r.get(0))?)
 }
 
+/// `(embedded, embeddable)` for `model`: how many embeddable nodes there
+/// are, and how many of them [`embed_pending`] would leave alone.
+///
+/// Counted from the pending predicate rather than from the `embedding`
+/// table, because a row there is not the same thing as coverage: it may
+/// belong to a deleted node, to another model, or to content that has
+/// since changed. `embedded` can never exceed `embeddable`.
+pub fn coverage(conn: &Connection, model: &str) -> Result<(i64, i64)> {
+    let sql = format!(
+        "SELECT count(*), COALESCE(sum(CASE WHEN {STALE_WHERE} THEN 1 ELSE 0 END), 0)
+         FROM node n LEFT JOIN embedding e ON e.node_id = n.id
+         WHERE {}",
+        embeddable_where()
+    );
+    let (embeddable, pending): (i64, i64) =
+        conn.query_row(&sql, [model], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    Ok((embeddable - pending, embeddable))
+}
+
+/// The `content_hash` a node of `kind` carries for `body`: the normalized
+/// dedup key `memory` writes for a memory, the plain body hash the indexer
+/// writes for everything else. Used for the nodes that reached the store
+/// without one.
+fn content_hash_for(kind: &str, body: &str) -> Vec<u8> {
+    if kind == crate::model::Kind::Memory.as_str() {
+        crate::memory::content_hash(body)
+    } else {
+        blake3::hash(body.as_bytes()).as_bytes().to_vec()
+    }
+}
+
+/// Embed every node whose content is new or changed for this model.
+/// Unchanged content never reaches the model: embeddings are keyed by
+/// content hash, and identical text elsewhere in the store is copied.
+///
+/// A node stored without a `content_hash` (a memory synced from a peer that
+/// sent none, a docs note written by an older build) is given one here, in
+/// the same transaction as its embedding row. Without that the node would
+/// stay pending for ever — see [`STALE_WHERE`] — and be re-embedded on
+/// every pass. `updated_at` is left alone: nothing about the node changed,
+/// and bumping it would push the row back out over sync.
+///
+/// Work is committed in batches so the single SQLite writer lock is yielded
+/// between chunks instead of held for the whole run, and — crucially — the
+/// CPU-bound model inference happens OUTSIDE any transaction, so a big embed
+/// never starves concurrent sessions. Each batch is independent: embeddings
+/// carry no cross-row invariant, so a partial run just leaves the rest pending
+/// for next time.
+///
+/// Returns the ids of every node embedded (fresh inference or dedup copy),
+/// so callers can patch a live vector-matrix cache instead of dropping it.
 pub fn embed_pending(
     conn: &Connection,
     model: &str,
@@ -452,9 +614,13 @@ pub fn embed_pending(
         id: i64,
         text: String,
         hash: Vec<u8>,
+        /// Set when the node itself has no hash yet: the body `hash` was
+        /// computed from, so the hash is written back only if the row still
+        /// holds that body.
+        hashed_body: Option<String>,
     }
     let mut stmt = conn.prepare(&format!(
-        "SELECT n.id, n.title, n.body, n.content_hash
+        "SELECT n.id, n.title, n.body, n.content_hash, n.kind
          FROM node n LEFT JOIN embedding e ON e.node_id = n.id
          WHERE {}",
         pending_where()
@@ -464,13 +630,19 @@ pub fn embed_pending(
             let title: Option<String> = r.get(1)?;
             let body: String = r.get(2)?;
             let hash: Option<Vec<u8>> = r.get(3)?;
+            let kind: String = r.get(4)?;
             let text = match &title {
                 Some(t) if !t.is_empty() => format!("{t}\n{body}"),
                 _ => body.clone(),
             };
+            let (hash, hashed_body) = match hash {
+                Some(hash) => (hash, None),
+                None => (content_hash_for(&kind, &body), Some(body)),
+            };
             Ok(Pending {
                 id: r.get(0)?,
-                hash: hash.unwrap_or_else(|| blake3::hash(body.as_bytes()).as_bytes().to_vec()),
+                hash,
+                hashed_body,
                 text,
             })
         })?
@@ -522,6 +694,26 @@ pub fn embed_pending(
         }
         for (p, vec) in to_embed.iter().zip(&vectors) {
             upsert(&tx, p.id, model, vec.len(), &to_blob(vec), &p.hash)?;
+        }
+        // Only the rows whose embedding was just written: a node the model
+        // returned no vector for stays pending and is retried.
+        let written = copies
+            .iter()
+            .map(|(p, _, _)| *p)
+            .chain(to_embed.iter().zip(&vectors).map(|(p, _)| *p));
+        // Inference ran outside any lock, so the row may have been
+        // rewritten since it was read (a sync apply from a peer that sends
+        // no hash is exactly the population this backfill serves). The hash
+        // goes on the row only while the row still holds the body it was
+        // computed from; otherwise the row stays without one, and pending.
+        for p in written {
+            if let Some(body) = &p.hashed_body {
+                tx.execute(
+                    "UPDATE node SET content_hash = ?2
+                     WHERE id = ?1 AND content_hash IS NULL AND body = ?3",
+                    params![p.id, p.hash, body],
+                )?;
+            }
         }
         tx.commit()?;
     }
@@ -627,13 +819,248 @@ mod tests {
         );
     }
 
+    /// A canned model: a fixed vector per text, counting how many texts it
+    /// was actually asked to embed.
+    fn counting_embedder(
+        calls: &std::cell::Cell<usize>,
+    ) -> impl FnMut(Vec<String>) -> Result<Vec<Vec<f32>>> + '_ {
+        move |texts| {
+            calls.set(calls.get() + texts.len());
+            Ok(texts.iter().map(|_| vec![0.5; 4]).collect())
+        }
+    }
+
+    /// Inference runs outside any lock. A row rewritten while its old body
+    /// is being embedded must not be stamped with the hash of that old
+    /// body: the row would then look embedded, with a vector and a hash for
+    /// text it no longer holds, and nothing would embed the new text.
+    #[test]
+    fn a_body_rewritten_during_inference_stays_pending() {
+        use crate::model::{Kind, NewNode};
+        let conn = crate::db::open_in_memory().unwrap();
+        let model = "bge-small-en-v1.5";
+        let mut memory = NewNode::new(Kind::Memory);
+        memory.title = Some("Deploys go to eu-north-1".into());
+        memory.body = Some("Deploys go to eu-north-1".into());
+        let memory = crate::store::insert_node(&conn, memory).unwrap();
+        assert!(memory.content_hash.is_none());
+
+        let mut rewriting = |texts: Vec<String>| -> Result<Vec<Vec<f32>>> {
+            // What a sync apply from a peer that sends no hash does.
+            conn.execute(
+                "UPDATE node SET body = 'Deploys go to eu-west-1' WHERE id = ?1",
+                [memory.id],
+            )
+            .unwrap();
+            Ok(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+        };
+        embed_pending(&conn, model, &mut rewriting).unwrap();
+
+        let after = crate::store::get_node(&conn, memory.id).unwrap();
+        assert_eq!(after.content_hash, None, "hash of a body it no longer has");
+        assert!(
+            has_pending(&conn, model).unwrap(),
+            "the rewritten text still has to be embedded"
+        );
+    }
+
+    /// A node stored without a `content_hash` used to be pending for ever:
+    /// the embedding row got a hash, the node never did, and "the node has no
+    /// hash" is itself a reason to be pending. Every pass re-embedded it and
+    /// `has_pending` never went false, which also defeated the probe that
+    /// keeps a no-op pass from loading the model.
+    #[test]
+    fn a_node_stored_without_a_hash_is_embedded_once() {
+        use crate::model::{Kind, NewNode};
+        let conn = crate::db::open_in_memory().unwrap();
+        let model = "bge-small-en-v1.5";
+
+        // A memory as a sync apply stores it when the wire carried no hash,
+        // and a docs note as older builds wrote it.
+        let mut memory = NewNode::new(Kind::Memory);
+        memory.title = Some("Deploys go to eu-north-1".into());
+        memory.body = Some("Deploys go to eu-north-1".into());
+        let memory = crate::store::insert_node(&conn, memory).unwrap();
+        let mut note = NewNode::new(Kind::Annotation);
+        note.title = Some("Runbooks".into());
+        note.body = Some("Runbooks for the on-call rotation".into());
+        let note = crate::store::insert_node(&conn, note).unwrap();
+        assert!(memory.content_hash.is_none() && note.content_hash.is_none());
+        conn.execute("UPDATE node SET updated_at = 1000", [])
+            .unwrap();
+
+        let calls = std::cell::Cell::new(0);
+        let first = embed_pending(&conn, model, &mut counting_embedder(&calls)).unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(calls.get(), 2);
+        assert!(
+            !has_pending(&conn, model).unwrap(),
+            "one pass must leave nothing pending"
+        );
+
+        let second = embed_pending(&conn, model, &mut counting_embedder(&calls)).unwrap();
+        assert!(
+            second.is_empty(),
+            "a second pass embeds nothing: {second:?}"
+        );
+        assert_eq!(calls.get(), 2, "and never reaches the model");
+
+        // The node now carries the hash its kind is keyed by everywhere else,
+        // so later dedup and change detection see it; it was not edited.
+        let memory = crate::store::get_node(&conn, memory.id).unwrap();
+        let note = crate::store::get_node(&conn, note.id).unwrap();
+        assert_eq!(
+            memory.content_hash,
+            Some(crate::memory::content_hash("Deploys go to eu-north-1"))
+        );
+        assert_eq!(
+            note.content_hash,
+            Some(
+                blake3::hash(b"Runbooks for the on-call rotation")
+                    .as_bytes()
+                    .to_vec()
+            )
+        );
+        assert_eq!((memory.updated_at, note.updated_at), (1000, 1000));
+    }
+
+    /// `coverage` is the pending predicate counted the other way, so the
+    /// number a dashboard shows can never disagree with what `embed_pending`
+    /// would do next.
+    #[test]
+    fn coverage_counts_what_embed_pending_would_leave_alone() {
+        use crate::model::{Kind, NewNode};
+        let conn = crate::db::open_in_memory().unwrap();
+        let model = "bge-small-en-v1.5";
+        assert_eq!(coverage(&conn, model).unwrap(), (0, 0));
+
+        let add = |kind: Kind, body: Option<&str>| {
+            let mut new = NewNode::new(kind);
+            new.title = Some("t".into());
+            new.body = body.map(str::to_string);
+            new.content_hash = body.map(|b| blake3::hash(b.as_bytes()).as_bytes().to_vec());
+            crate::store::insert_node(&conn, new).unwrap()
+        };
+        let current = add(Kind::Memory, Some("embedded at the current hash"));
+        let stale = add(Kind::Chunk, Some("edited since it was embedded"));
+        let other_model = add(Kind::Symbol, Some("embedded by a retired model"));
+        let _missing = add(Kind::CodeChunk, Some("never embedded"));
+        let gone = add(Kind::Memory, Some("embedded, then deleted"));
+        let _bodiless = add(Kind::Symbol, None);
+        let _not_embeddable = add(Kind::File, Some("files are not embedded"));
+
+        let hash_of = |n: &crate::model::Node| n.content_hash.clone().unwrap();
+        upsert(
+            &conn,
+            current.id,
+            model,
+            4,
+            &to_blob(&[0.5; 4]),
+            &hash_of(&current),
+        )
+        .unwrap();
+        upsert(
+            &conn,
+            stale.id,
+            model,
+            4,
+            &to_blob(&[0.5; 4]),
+            b"an older hash",
+        )
+        .unwrap();
+        upsert(
+            &conn,
+            other_model.id,
+            "retired-model",
+            4,
+            &to_blob(&[0.5; 4]),
+            &hash_of(&other_model),
+        )
+        .unwrap();
+        upsert(
+            &conn,
+            gone.id,
+            model,
+            4,
+            &to_blob(&[0.5; 4]),
+            &hash_of(&gone),
+        )
+        .unwrap();
+        crate::store::soft_delete(&conn, gone.id, crate::model::Actor::System, None).unwrap();
+
+        // Four embedding rows exist; one describes a live node as it is now.
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM embedding", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, 4);
+        assert_eq!(coverage(&conn, model).unwrap(), (1, 4));
+
+        let calls = std::cell::Cell::new(0);
+        let embedded = embed_pending(&conn, model, &mut counting_embedder(&calls)).unwrap();
+        assert_eq!(embedded.len(), 3, "exactly the gap coverage reported");
+        assert_eq!(coverage(&conn, model).unwrap(), (4, 4));
+    }
+
     #[test]
     fn embed_pending_skips_model_load_when_nothing_pending() {
         let mut m = crate::Mimir::open_in_memory().unwrap();
         assert_eq!(m.embed_pending().unwrap(), 0);
         // The probe must return before `ensure_embedder` runs — a speculative
         // load would create a GPU device on GPU builds just to do nothing.
-        assert!(!m.embedder_tried, "embedder load was attempted on a no-op");
+        assert!(
+            matches!(m.embedder, ModelSlot::Unloaded),
+            "embedder load was attempted on a no-op"
+        );
+    }
+
+    /// The slot's whole policy, on a clock the test controls.
+    #[test]
+    fn a_failed_load_is_retried_after_the_cooldown_or_when_a_download_is_newly_allowed() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let just_before = t0 + LOAD_RETRY_COOLDOWN - Duration::from_secs(1);
+        let after = t0 + LOAD_RETRY_COOLDOWN;
+        let fail = || Err::<u8, _>(Error::Embed("no weights".into()));
+
+        let mut slot: ModelSlot<u8> = ModelSlot::Unloaded;
+        assert!(slot.wants_load(false, t0), "nothing was tried yet");
+        assert!(slot.get_mut().is_none() && !slot.is_loaded());
+
+        // A silent load failed.
+        assert!(slot.settle(fail(), false, t0).is_some());
+        assert!(
+            !slot.wants_load(false, just_before),
+            "not on every call: the cooldown holds"
+        );
+        assert!(
+            slot.wants_load(true, just_before),
+            "a caller who allows the download is not bound by a failure that could not download"
+        );
+        assert!(slot.wants_load(false, after), "the cooldown has passed");
+
+        // A load that was allowed to download failed too. It is the second
+        // failure in a row, so the wait before the next attempt doubles.
+        assert!(slot.settle(fail(), true, t0).is_some());
+        assert!(
+            !slot.wants_load(true, just_before),
+            "allowing a download again is no new information"
+        );
+        assert!(
+            !slot.wants_load(true, after),
+            "a second failure waits longer"
+        );
+        let after_two = t0 + retry_after(2);
+        assert_eq!(retry_after(2), LOAD_RETRY_COOLDOWN * 2);
+        assert!(slot.wants_load(true, after_two) && slot.wants_load(false, after_two));
+        // The wait stops growing at the cap, however long it keeps failing.
+        assert_eq!(retry_after(1), LOAD_RETRY_COOLDOWN);
+        assert_eq!(retry_after(40), LOAD_RETRY_MAX);
+
+        // Loaded is the end of it.
+        assert!(slot.settle(Ok(7), false, after).is_none());
+        assert!(slot.is_loaded());
+        assert_eq!(slot.get_mut().copied(), Some(7));
+        assert!(!slot.wants_load(true, after + LOAD_RETRY_COOLDOWN));
     }
 
     #[test]
