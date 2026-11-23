@@ -330,10 +330,11 @@ fn leaks_anywhere(conn: &Connection, token: &str) -> Vec<String> {
 
 /// The atlas's thirteen-step deletion-durability sequence, run end to end.
 ///
-/// `hard` selects which contract is under test. A soft delete is documented
-/// as a *reversible tombstone*, so the row itself legitimately still holds
-/// the text — the assertion there is unreachability, not absence. A hard
-/// delete claims absence, and is held to it.
+/// `hard` selects which contract is under test. A soft delete is a
+/// tombstone: the row itself legitimately still holds the text (that is
+/// what lets `remember` recognise and refuse the same text later), so the
+/// assertion there is unreachability, not absence. A hard delete claims
+/// absence, and is held to it.
 pub fn durability(hard: bool) -> crate::error::Result<Scorecard> {
     let conn = db::open_in_memory()?;
     let mut card = Scorecard::default();

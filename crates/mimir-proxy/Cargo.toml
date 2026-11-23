@@ -20,6 +20,7 @@ reqwest.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# raw_value: `patch` copies the parts of a request it does not change as text.
+serde_json = { workspace = true, features = ["raw_value"] }
 tracing.workspace = true
 rusqlite.workspace = true

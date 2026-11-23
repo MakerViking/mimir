@@ -29,12 +29,30 @@ content*:
   you can A/B the two against `mimir savings` instead of guessing. Only applies
   to breakpoints *we* add — a client that manages its own caching is untouched.
 - **Block dedup** (default **on**, safe/lossless). When the same large content
-  block (a re-read file, a repeated tool result) appears more than once, later
-  copies are replaced with `[identical to an earlier block …]`. The model still
-  sees the content once. Disable with `--no-dedup` / `[proxy] dedup = false`.
+  block (a re-read file, a repeated tool result, a repeated plain-text
+  message) appears more than once, later copies are replaced with `[identical
+  to an earlier block …]`. The model still sees the content once. Disable with
+  `--no-dedup` / `[proxy] dedup = false`. Two things are never replaced: a
+  per-turn system reminder (the API clears the earlier copy, so the newest is
+  the only one the model sees), and a tool result that carries a client cache
+  breakpoint inside its content.
 - **Prune stale tool results** (default **off**, lossy). Replaces large
   `tool_result` blocks in older turns with a short placeholder. This changes
   what the model sees, so it's opt-in (`--prune` or `[proxy] prune = true`).
+  The boundary moves in steps of 20 messages, so the request prefix stays
+  byte-identical between steps and the prompt cache keeps hitting; between 6
+  and 25 of the most recent messages are always left intact. Each step still
+  rewrites turns the model has already seen. The API documentation lists
+  removing old tool results among the edits that invalidate later thinking
+  blocks, so if requests start failing with `--prune` on a model that uses
+  extended thinking, turn it off.
+
+Requests are forwarded with the client's own bytes: untouched when no pass
+changed anything, and otherwise with only the changed values replaced (key
+order and number spelling elsewhere are the client's). Because of that,
+replace a running proxy between conversations, not in the middle of one: the
+first request after the swap spells the conversation differently from the
+ones before it, which costs that conversation one prompt-cache miss.
 - **Runaway circuit breaker** (`--max-request-tokens N`, `[proxy]
   max_request_tokens`, default `0` = off). Rejects a `/v1/messages` request
   whose estimated input exceeds `N` tokens, returning an Anthropic-shaped

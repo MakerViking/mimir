@@ -4,7 +4,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::memory::tokens;
-use crate::search::{scope_sql, SearchQuery};
+use crate::search::{Reach, SearchQuery};
 
 /// Column weights for bm25(): title, body, path, tags_text.
 const BM25_WEIGHTS: &str = "4.0, 1.0, 2.0, 3.0";
@@ -49,7 +49,17 @@ pub fn match_expr(text: &str) -> String {
 
 /// Ranked node ids (best first), capped.
 pub fn leg(conn: &Connection, query: &SearchQuery, cap: usize) -> Result<Vec<i64>> {
-    ranked_ids(conn, query, &match_expr(&query.text), cap)
+    leg_within(conn, query, Reach::uniform(query.scope), cap)
+}
+
+/// [`leg`] over a [`Reach`], which is read instead of `query.scope`.
+pub fn leg_within(
+    conn: &Connection,
+    query: &SearchQuery,
+    reach: Reach,
+    cap: usize,
+) -> Result<Vec<i64>> {
+    ranked_ids(conn, query, reach, &match_expr(&query.text), cap)
 }
 
 /// Exact-phrase FTS leg for identifier-shaped fragments of the query
@@ -63,17 +73,34 @@ pub fn leg(conn: &Connection, query: &SearchQuery, cap: usize) -> Result<Vec<i64
 /// Empty (no query run) when nothing in the text looks like an identifier,
 /// so it costs nothing on ordinary prose queries.
 pub fn identifier_leg(conn: &Connection, query: &SearchQuery, cap: usize) -> Result<Vec<i64>> {
+    identifier_leg_within(conn, query, Reach::uniform(query.scope), cap)
+}
+
+/// [`identifier_leg`] over a [`Reach`], which is read instead of
+/// `query.scope`.
+pub fn identifier_leg_within(
+    conn: &Connection,
+    query: &SearchQuery,
+    reach: Reach,
+    cap: usize,
+) -> Result<Vec<i64>> {
     let expr = identifier_match_expr(&query.text);
     if expr.is_empty() {
         return Ok(vec![]);
     }
-    ranked_ids(conn, query, &expr, cap)
+    ranked_ids(conn, query, reach, &expr, cap)
 }
 
-/// Shared MATCH runner behind [`leg`] and [`identifier_leg`]: same
-/// scope/kind/since filtering and BM25 ordering, different MATCH
+/// Shared MATCH runner behind [`leg_within`] and [`identifier_leg_within`]:
+/// same reach/kind/since filtering and BM25 ordering, different MATCH
 /// expression. `expr` empty short-circuits to no query at all.
-fn ranked_ids(conn: &Connection, query: &SearchQuery, expr: &str, cap: usize) -> Result<Vec<i64>> {
+fn ranked_ids(
+    conn: &Connection,
+    query: &SearchQuery,
+    reach: Reach,
+    expr: &str,
+    cap: usize,
+) -> Result<Vec<i64>> {
     if expr.is_empty() {
         return Ok(vec![]);
     }
@@ -81,7 +108,7 @@ fn ranked_ids(conn: &Connection, query: &SearchQuery, expr: &str, cap: usize) ->
         "SELECT n.id FROM node_fts JOIN node n ON n.id = node_fts.rowid
          WHERE node_fts MATCH ?1 AND {} AND {}",
         crate::search::liveness_sql(query.as_of),
-        scope_sql(query.scope)
+        reach.sql()
     );
     if !query.kinds.is_empty() {
         let kinds = query

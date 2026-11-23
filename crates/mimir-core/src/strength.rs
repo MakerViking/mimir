@@ -36,7 +36,7 @@ use std::collections::HashSet;
 use crate::inject::{LEG_TOP_K, MIN_OVERLAP};
 use crate::memory;
 use crate::model::Kind;
-use crate::search::{fts, Hit};
+use crate::search::{fts, vector_leg, Hit};
 
 /// Evidence behind one hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -70,12 +70,14 @@ pub fn query_terms(query: &str) -> HashSet<String> {
 }
 
 /// Label one hit. `legs` is what [`crate::Mimir::search_with_evidence`]
-/// returns: `legs[0]` the lexical leg, `legs[1]` the semantic leg iff an
-/// embedding model ran for this query.
+/// returns: `legs[0]` the lexical leg, plus the semantic leg when one ran
+/// for this query (see [`crate::search`]'s module docs; read here through
+/// [`vector_leg`]).
 ///
 /// `strong` when the query names this symbol exactly, or when the hit
 /// contains the query's words AND both legs rank it in their own top-K.
-/// Without a semantic leg there is nothing to agree with, so covering
+/// Without a semantic leg — no model, or a model with nothing in this
+/// store it can rank — there is nothing to agree with, so covering
 /// *every* content word (at least two) stands in for the agreement.
 /// Everything else is `weak`: in the list because something had to be.
 ///
@@ -95,11 +97,12 @@ pub fn classify(hit: &Hit, terms: &HashSet<String>, legs: &[Vec<i64>]) -> MatchS
         return MatchStrength::Strong;
     }
     let id = hit.node.id;
-    let in_top = |leg: Option<&Vec<i64>>| {
+    let in_top = |leg: Option<&[i64]>| {
         leg.is_some_and(|leg| leg.iter().take(LEG_TOP_K).any(|other| *other == id))
     };
-    let lexical = in_top(legs.first());
-    let semantic = in_top(legs.get(1));
+    let lexical = in_top(legs.first().map(Vec::as_slice));
+    let semantic_leg = vector_leg(legs);
+    let semantic = in_top(semantic_leg);
 
     let hay = format!(
         "{} {} {}",
@@ -125,7 +128,7 @@ pub fn classify(hit: &Hit, terms: &HashSet<String>, legs: &[Vec<i64>]) -> MatchS
     // kept honest.
     let covers = overlap >= MIN_OVERLAP.min(terms.len());
 
-    let agrees = if legs.len() > 1 {
+    let agrees = if semantic_leg.is_some() {
         lexical && semantic
     } else {
         lexical && overlap == terms.len() && overlap >= MIN_OVERLAP
@@ -253,6 +256,60 @@ mod tests {
         assert_eq!(
             classify(&h, &terms("wal file growth policy"), &lexical_only),
             MatchStrength::Weak
+        );
+    }
+
+    /// A model with nothing to compare against (nothing embedded yet, a
+    /// switched model, a dimension mismatch) ranks nothing. That is the
+    /// no-semantic-leg case, not "the semantic leg disagreed with every hit":
+    /// read the second way, every page on such a store is a page of misses.
+    #[test]
+    fn a_vector_leg_that_ranked_nothing_reads_as_no_semantic_leg() {
+        let conn = db::open_in_memory().unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.title = Some("WAL file growth".into());
+        new.body = Some("checkpoint starvation".into());
+        let node = store::insert_node(&conn, new).unwrap();
+        // Vectors exist, but under a model this query was not embedded with.
+        conn.execute(
+            "INSERT INTO embedding (node_id, model, dim, vec, content_hash)
+             VALUES (?1, 'old-model', 2, ?2, x'00')",
+            rusqlite::params![node.id, crate::embed::to_blob(&[1.0, 0.0])],
+        )
+        .unwrap();
+
+        let query = crate::search::SearchQuery {
+            text: "wal file growth".into(),
+            scope: crate::model::Scope::All,
+            kinds: vec![],
+            since: None,
+            limit: 5,
+            strength_alpha: 0.0,
+            recency_alpha: 0.0,
+            type_prior_alpha: 0.0,
+            code_damp: 1.0,
+            include_superseded: false,
+            as_of: None,
+        };
+        let (hits, legs) = crate::search::search_hybrid_with_legs(
+            &conn,
+            &query,
+            Some(("live-model", &[1.0, 0.0])),
+            &mut None,
+        )
+        .unwrap();
+        assert!(crate::search::vector_leg(&legs).is_none(), "{legs:?}");
+        assert_eq!(
+            classify_page(&hits, &query.text, &legs),
+            vec![MatchStrength::Strong],
+            "full coverage stands in for agreement, as with no model"
+        );
+
+        // The same reading for a caller that built the slot by hand.
+        let h = hit(1, Kind::Memory, "WAL file growth", "checkpoint starvation");
+        assert_eq!(
+            classify(&h, &terms("wal file growth"), &[vec![1], vec![]]),
+            MatchStrength::Strong
         );
     }
 

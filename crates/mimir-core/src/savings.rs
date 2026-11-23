@@ -1,9 +1,11 @@
 //! Token-savings ledger: append-only record of every context-shrinking
 //! operation, plus the aggregations the dashboard/report render.
 //!
-//! A "source" is one of: `outline`, `peek`, `filter`, `cap`, `proxy_cache`,
-//! `proxy_prune`. `saved = before - after` (cache savings are billed-token
-//! reductions; the rest are tokens the agent never had to read).
+//! A "source" is one of the identifiers in [`source`]: `outline`, `peek`,
+//! `filter`, `cap`, `proxy_cache`, `proxy_dedup`, `proxy_prune` — and
+//! `brief`, the one that is a cost rather than a saving ([`COST_SOURCES`]).
+//! `saved = before - after` (cache savings are billed-token reductions; the
+//! rest are tokens the agent never had to read).
 
 use rusqlite::{params, Connection};
 use serde_json::Value;
@@ -61,11 +63,19 @@ pub struct Summary {
     pub all: Totals,
 }
 
-/// SQL `IN`-list of pure-cost sources (tokens injected, nothing shrunk).
+/// The pure-cost sources: tokens injected, nothing shrunk.
+pub const COST_SOURCES: &[&str] = &[source::BRIEF];
+
+/// SQL `IN`-list of [`COST_SOURCES`].
 /// Every "saved" aggregate (`summary`, `totals`, `daily_saved`) excludes
 /// them — a cost event must never net against real savings, which the raw
 /// `before - after` sums would silently do. They remain visible in
 /// `by_source` (its per-source `Totals::saved()` clamps to 0).
+///
+/// Written out because a `const` string cannot be assembled from other
+/// constants; `the_cost_list_in_sql_is_the_cost_list` holds it to
+/// [`COST_SOURCES`], so a second cost source added to one and not the
+/// other fails the build's tests instead of netting against savings.
 pub const COST_SOURCES_SQL: &str = "('brief')";
 
 /// One-scan equivalent of calling `totals` for day/week/month/all.
@@ -287,6 +297,20 @@ mod tests {
             after: 25,
         };
         assert_eq!(t.saved(), 0);
+    }
+
+    #[test]
+    fn the_cost_list_in_sql_is_the_cost_list() {
+        let rendered = format!(
+            "({})",
+            COST_SOURCES
+                .iter()
+                .map(|source| format!("'{source}'"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(COST_SOURCES_SQL, rendered);
+        assert!(COST_SOURCES.contains(&source::BRIEF));
     }
 
     /// A pure-cost source (brief) must never net against real savings in

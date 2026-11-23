@@ -15,12 +15,36 @@ this code runs and the zero-telemetry promise is unchanged.
 - Each install stays authoritative over its own SQLite store; sync is
   uid-keyed **last-write-wins** (newest edit wins, deletes propagate), so it's
   convergent and safe to run from any machine in any order.
+- **Supersession**: a memory you supersede on one machine is superseded on the
+  others (when the hub and both machines run a build that carries it). A pin
+  on another machine does not hold it off: the memory ends up superseded and
+  pinned everywhere.
+- **What a memory says is decided by the latest decision about its text.**
+  Writing it, rewording it and forgetting it are decisions about the text;
+  pinning, tagging, anchoring or giving it an expiry only annotate it. When
+  two machines changed one memory without having synced, the later *text*
+  decision wins, on every machine:
+  - Forget on one machine, pin (or tag, or anchor) on another that had not
+    heard: it stays forgotten, however much later the pin was made.
+  - Reword on one machine, pin on another: the new wording is kept.
+  - Forget on one, reword later on another: the rewording is kept; that is
+    someone deciding the memory should say something.
+  - Two annotations on the same text: the later one is kept.
+  - Two different changes in the very same second: one of them is kept, the
+    same one everywhere.
+  A machine or hub on a build older than this one still orders by the last
+  write of any kind, so until all of them are upgraded a pin made there can
+  still bring a forgotten memory back. One thing is never a write: the decay
+  pass archiving a memory locally, so it cannot shield a memory from a
+  forget or an edit made elsewhere.
 
 **Not synced** (by design): project memories of projects you haven't opted in,
 the code graph and indexed docs (they're tied to a specific checkout/folder on
 each machine), and your usage signals (strength, recall history). Embeddings
 aren't shipped either — each machine recomputes them locally, so there's nothing
-heavy on the wire.
+heavy on the wire. **Decay archival** is not synced for the same reason as the
+usage signals it is computed from: a memory that sat idle on one machine and
+was archived there stays live on the machine that uses it.
 
 ## Project-scoped memories
 
@@ -144,9 +168,26 @@ expose it raw to the public internet.** Two good options:
 mimir sync            # full sync (push + pull, or snapshot + merge in file mode)
 mimir sync push       # send local changes only
 mimir sync pull       # fetch + merge remote changes only
-mimir sync status     # mode, endpoint/dir, pending changes, token presence
+mimir sync status     # mode, endpoint/dir, pending changes, where the token comes from
 mimir sync token      # print the active token (env, else the hub's persisted one)
+mimir sync push --full   # send every synced memory again (safe to repeat)
+mimir sync pull --full   # ask the hub for everything (safe to repeat)
 ```
+
+### After upgrading the hub
+
+Two things are fixed on the hub and do not reach back in time by themselves:
+a hub on 0.17.1 or older never relayed a memory that was pushed long after
+it was written, and it dropped the part of a record that says which memory
+replaced it. So upgrade in this order:
+
+1. Upgrade the hub and restart `mimir serve`.
+2. Upgrade each machine.
+3. On each machine, once: `mimir sync push --full`, then `mimir sync pull --full`.
+
+Both are ordinary merges (each machine keeps the winning version of every
+memory), so running them twice, or on a machine that missed nothing, changes
+nothing.
 
 ### Background sync
 
@@ -161,7 +202,9 @@ interval_mins = 30
 ```
 
 The MCP server then syncs on start and every `interval_mins` (server mode needs
-`MIMIR_SYNC_TOKEN` in the MCP server's environment).
+`MIMIR_SYNC_TOKEN` in the MCP server's environment). It re-reads `[sync]` on
+every tick, so turning sync or `auto` on or off takes effect within one
+interval, without restarting the server.
 
 ### The `/m-sync` slash command
 
@@ -171,12 +214,15 @@ enabled**. After turning sync on in `config.toml`, re-run `mimir init` to add it
 ## Troubleshooting
 
 - **`sync is off`** — set `[sync] mode` to `"file"` or `"server"`.
+- **`unknown [sync] mode`** — the value is misspelled; it is treated as off
+  until it is one of `off`, `file` or `server` (`mimir doctor` names it too).
 - **`401` / token rejected** — the client's `MIMIR_SYNC_TOKEN` doesn't match the
   hub's. Check the env var on both sides.
 - **`hub unreachable`** — wrong `endpoint`, hub not running, or not reachable on
   your network (is it on the tailnet?).
-- **A memory didn't appear** — only **global** memories sync. Store with `-g`
-  (CLI) or `global: true` (MCP). Project-scoped memories stay local for now.
+- **A memory didn't appear** — global memories sync, and project memories of
+  projects you opted in (see above); others stay local. If it was written
+  while the hub ran an older build, run `mimir sync pull --full` once.
 - **Clocks** — last-write-wins compares timestamps, so keep machines roughly
   NTP-synced (a small grace window absorbs minor skew).
 

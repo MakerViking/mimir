@@ -161,8 +161,10 @@ pub struct DaemonConfig {
     ///   load their own embedder CPU-only — measured *faster* than GPU for
     ///   batch-1 query embeds — and never load a local reranker while the
     ///   daemon is reachable, so a session holds zero GPU memory. Daemon
-    ///   down at session start: exactly the old behavior ([rerank] auto =
-    ///   "warm" eager-loads a local reranker on the configured device);
+    ///   down at session start: the embedder is still CPU-only, and the
+    ///   reranker behaves as it did before delegation existed ([rerank]
+    ///   auto = "warm" eager-loads a local one on the configured device,
+    ///   which then stays resident for the session);
     ///   daemon dies mid-session: embeds fall back to the session's CPU
     ///   embedder in the same call, reranks degrade to fused order, and
     ///   delegation resumes on its own when the daemon returns. The only
@@ -170,6 +172,8 @@ pub struct DaemonConfig {
     ///   (first contact with a big repo) runs on CPU instead of GPU.
     /// - "off": pre-daemon behavior — every process loads its own models
     ///   on the [embedding] device and nothing is delegated.
+    ///
+    /// Read through [`DaemonConfig::inference`]; any other value is "off".
     pub inference: String,
 }
 
@@ -178,6 +182,14 @@ impl Default for DaemonConfig {
         DaemonConfig {
             inference: "auto".into(),
         }
+    }
+}
+
+impl DaemonConfig {
+    /// The typed `[daemon] inference`; an unrecognized value is
+    /// [`DaemonInference::Off`].
+    pub fn inference(&self) -> DaemonInference {
+        DaemonInference::resolve(&self.inference)
     }
 }
 
@@ -214,15 +226,16 @@ pub struct HooksConfig {
     ///   is available locally) on the cold path too, same as before this
     ///   setting existed.
     pub cold_mode: String,
-    /// Context-window guard mode: `"off"` (default) | `"pause"` | `"handoff"`.
+    /// Context-window guard mode: `"off"` (default) | `"pause"` | `"handoff"`
+    /// — read through [`HooksConfig::context_guard`]; any other value is off.
     /// See `mimir_core::context_guard` for the estimation/messaging logic and
     /// `mimir context-guard` (crates/mimir-cli) for the hook subcommands that
     /// consume it. `"off"` installs no new hook entries and changes nothing.
     /// `"pause"` nudges the user to deliberately `/clear`/`/compact` once the
     /// transcript crosses `context_guard_threshold_pct`. `"handoff"`
     /// instructs the agent to write a structured handoff memory via `mimir
-    /// remember` before the user clears, then auto-restores it on the next
-    /// `SessionStart`.
+    /// remember` before the user clears, then restores it, once, on the
+    /// `SessionStart` that follows the clear.
     pub context_guard: String,
     /// Percent of the estimated context window (see `context_window_tokens`)
     /// at which the guard first fires. Default 45 — well before Claude
@@ -251,6 +264,20 @@ impl Default for HooksConfig {
             context_window_tokens: 200_000,
             transcript_bytes_per_token: 8.0,
         }
+    }
+}
+
+impl HooksConfig {
+    /// The typed `[hooks] context_guard`; an unrecognized value is
+    /// [`ContextGuardMode::Off`].
+    pub fn context_guard(&self) -> ContextGuardMode {
+        ContextGuardMode::resolve(&self.context_guard)
+    }
+
+    /// The typed `[hooks] cold_mode`; an unrecognized value is
+    /// [`ColdMode::Full`].
+    pub fn cold_mode(&self) -> ColdMode {
+        ColdMode::resolve(&self.cold_mode)
     }
 }
 
@@ -391,13 +418,34 @@ impl Default for ProxyConfig {
     }
 }
 
+impl ProxyConfig {
+    /// The typed `[proxy] cache_ttl`, or `None` when the value is not an
+    /// accepted spelling — which `mimir proxy` treats as a reason not to
+    /// start (see [`ProxyCacheTtl`]). Surrounding whitespace is ignored,
+    /// as the proxy's own parser ignores it.
+    pub fn cache_ttl(&self) -> Option<ProxyCacheTtl> {
+        ProxyCacheTtl::parse(self.cache_ttl.trim())
+    }
+
+    fn cache_ttl_issue(&self) -> Option<ConfigIssue> {
+        self.cache_ttl().is_none().then(|| ConfigIssue {
+            section: ProxyCacheTtl::SECTION,
+            key: ProxyCacheTtl::KEY,
+            found: self.cache_ttl.clone(),
+            accepted: ProxyCacheTtl::ACCEPTED,
+            behaves_as: None,
+        })
+    }
+}
+
 /// OPTIONAL centralized sync of global memories. Off by default — when
 /// `mode = "off"` nothing runs and there is zero added cost. See docs/sync.md.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SyncConfig {
     /// "off" (default) | "file" (a replicated folder) | "server" (a `mimir
-    /// serve` hub).
+    /// serve` hub). Read through [`SyncConfig::mode`]; any other value is
+    /// off.
     pub mode: String,
     /// file mode: a directory your file-sync tool (Syncthing/Dropbox/…)
     /// replicates between machines.
@@ -424,8 +472,15 @@ impl Default for SyncConfig {
 }
 
 impl SyncConfig {
+    /// The typed `[sync] mode`; an unrecognized value is [`SyncMode::Off`].
+    pub fn mode(&self) -> SyncMode {
+        SyncMode::resolve(&self.mode)
+    }
+
+    /// Whether sync runs at all: file or server mode. A mode nobody
+    /// recognizes is off, like every other reading of [`SyncConfig::mode`].
     pub fn enabled(&self) -> bool {
-        self.mode != "off"
+        self.mode() != SyncMode::Off
     }
 }
 
@@ -452,7 +507,9 @@ impl Default for AutoConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EmbeddingConfig {
-    /// fastembed model name; switching models requires `mimir embed --all`.
+    /// fastembed model name. After a switch every stored vector is for the
+    /// other model, so the next `mimir embed` (or any capture) re-embeds the
+    /// store; until it has, search is lexical only.
     pub model: String,
     /// "auto" uses a GPU execution provider when one was compiled in
     /// (--features gpu-webgpu / gpu-cuda), falling back to CPU if it
@@ -473,6 +530,14 @@ impl Default for ConsolidateConfig {
         ConsolidateConfig {
             auto: "weekly".into(),
         }
+    }
+}
+
+impl ConsolidateConfig {
+    /// The typed `[consolidate] auto`; an unrecognized value is
+    /// [`ConsolidateAuto::Off`].
+    pub fn auto(&self) -> ConsolidateAuto {
+        ConsolidateAuto::resolve(&self.auto)
     }
 }
 
@@ -605,6 +670,14 @@ impl Default for EmbeddingConfig {
     }
 }
 
+impl EmbeddingConfig {
+    /// The typed `[embedding] device`; an unrecognized value is
+    /// [`EmbeddingDevice::Auto`].
+    pub fn device(&self) -> EmbeddingDevice {
+        EmbeddingDevice::resolve(&self.device)
+    }
+}
+
 impl Default for RerankConfig {
     fn default() -> Self {
         RerankConfig {
@@ -615,6 +688,14 @@ impl Default for RerankConfig {
             candidates: 15,
             auto: "off".into(),
         }
+    }
+}
+
+impl RerankConfig {
+    /// The typed `[rerank] auto`; an unrecognized value is
+    /// [`RerankAuto::Off`].
+    pub fn auto(&self) -> RerankAuto {
+        RerankAuto::resolve(&self.auto)
     }
 }
 
@@ -639,6 +720,235 @@ impl Default for OutputConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Mode settings
+//
+// Eight settings are a word from a short list rather than a number or a
+// path. They stay `String` fields so a config written by any version keeps
+// loading, but nothing compares those strings: each has an enum below, and
+// every reader goes through the section's typed accessor
+// (`config.sync.mode()`, `config.hooks.context_guard()`, …).
+//
+// One policy covers a value that is not on the list (a typo, or a mode from
+// a newer version): the setting behaves as the enum's `UNKNOWN` value — the
+// one that does least — and `Config::issues` reports it, which is what
+// `mimir doctor` prints and what a long-lived server logs once at start-up.
+// Readers never warn on their own, so one typo is one report, not one per
+// query. `[proxy] cache_ttl` is the exception, and says so on its type.
+// ---------------------------------------------------------------------------
+
+/// One mode value in config.toml that is not an accepted spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigIssue {
+    /// The TOML table the key lives in, without brackets (`sync`).
+    pub section: &'static str,
+    /// The key inside that table (`mode`).
+    pub key: &'static str,
+    /// The value as written.
+    pub found: String,
+    /// Every spelling the setting accepts.
+    pub accepted: &'static [&'static str],
+    /// The accepted value the setting behaves as until it is fixed. `None`
+    /// for the one setting with no fallback, `[proxy] cache_ttl`: there
+    /// `mimir proxy` refuses to start instead.
+    pub behaves_as: Option<&'static str>,
+}
+
+impl std::fmt::Display for ConfigIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "[{}] {} = {:?} is not a known value (accepted: {}); ",
+            self.section,
+            self.key,
+            self.found,
+            self.accepted.join(", ")
+        )?;
+        match self.behaves_as {
+            Some(value) => write!(f, "behaving as {value:?}"),
+            None => f.write_str("`mimir proxy` refuses to start"),
+        }
+    }
+}
+
+macro_rules! mode_setting {
+    // The enum, its spellings and its parser.
+    (@values $(#[$meta:meta])* $name:ident, [$section:literal] $key:literal, {
+        $($(#[$vmeta:meta])* $variant:ident => $text:literal),+ $(,)?
+    }) => {
+        $(#[$meta])*
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum $name {
+            $($(#[$vmeta])* $variant),+
+        }
+
+        impl $name {
+            /// The config.toml table this setting lives in.
+            pub const SECTION: &'static str = $section;
+            /// Its key inside that table.
+            pub const KEY: &'static str = $key;
+            /// Every accepted spelling.
+            pub const ACCEPTED: &'static [&'static str] = &[$($text),+];
+
+            /// The mode an accepted spelling names; `None` for anything
+            /// else. Exact match: no trimming, no case folding.
+            pub fn parse(raw: &str) -> Option<Self> {
+                match raw {
+                    $($text => Some($name::$variant),)+
+                    _ => None,
+                }
+            }
+
+            /// The spelling config.toml uses for this mode.
+            pub fn as_str(self) -> &'static str {
+                match self {
+                    $($name::$variant => $text),+
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+    };
+    // A setting whose unrecognized values fall back to `$unknown`.
+    ($(#[$meta:meta])* $name:ident, [$section:literal] $key:literal, unknown => $unknown:ident, {
+        $($body:tt)+
+    }) => {
+        mode_setting!(@values $(#[$meta])* $name, [$section] $key, { $($body)+ });
+
+        impl $name {
+            /// What a value that is not in [`Self::ACCEPTED`] behaves as.
+            pub const UNKNOWN: $name = $name::$unknown;
+
+            /// The mode `raw` selects: the one it names, or
+            /// [`Self::UNKNOWN`] when it names none.
+            pub fn resolve(raw: &str) -> Self {
+                Self::parse(raw).unwrap_or(Self::UNKNOWN)
+            }
+
+            fn issue(raw: &str) -> Option<ConfigIssue> {
+                Self::parse(raw).is_none().then(|| ConfigIssue {
+                    section: Self::SECTION,
+                    key: Self::KEY,
+                    found: raw.to_string(),
+                    accepted: Self::ACCEPTED,
+                    behaves_as: Some(Self::UNKNOWN.as_str()),
+                })
+            }
+        }
+    };
+}
+
+mode_setting! {
+    /// `[sync] mode`: whether memories replicate, and through what.
+    /// An unrecognized value is [`SyncMode::Off`]: nothing leaves the
+    /// machine on the strength of a typo.
+    SyncMode, ["sync"] "mode", unknown => Off, {
+        /// Local store only; no sync code runs.
+        Off => "off",
+        /// Snapshots in `[sync] dir`, replicated by a file-sync tool.
+        File => "file",
+        /// Push/pull against the `mimir serve` hub at `[sync] endpoint`.
+        Server => "server",
+    }
+}
+
+mode_setting! {
+    /// `[hooks] context_guard`: what the context-window guard does once the
+    /// transcript crosses its threshold (see `crate::context_guard`).
+    /// An unrecognized value is [`ContextGuardMode::Off`] at every gate:
+    /// no hook entries installed, no session state written, nothing said.
+    ContextGuardMode, ["hooks"] "context_guard", unknown => Off, {
+        /// The guard is not installed and its hook commands do nothing.
+        Off => "off",
+        /// Nudge the user toward a deliberate `/clear` or `/compact`.
+        Pause => "pause",
+        /// Have the agent write a handoff memory first, and restore it into
+        /// the session that follows the clear.
+        Handoff => "handoff",
+    }
+}
+
+mode_setting! {
+    /// `[hooks] cold_mode`: how much search the cold `mimir recall-inject`
+    /// fallback runs. An unrecognized value is [`ColdMode::Full`] — not
+    /// the default, but the mode that can only find more, which is what
+    /// this setting has always fallen back to.
+    ColdMode, ["hooks"] "cold_mode", unknown => Full, {
+        /// BM25 and identifier legs only; the embedder is never loaded.
+        Fast => "fast",
+        /// Hybrid search, loading the embedder cold when a model is present.
+        Full => "full",
+    }
+}
+
+mode_setting! {
+    /// `[daemon] inference`: whether an MCP session hands bulk embedding
+    /// and reranking to a running `mimir daemon`. An unrecognized value is
+    /// [`DaemonInference::Off`]: every process keeps to its own models.
+    DaemonInference, ["daemon"] "inference", unknown => Off, {
+        /// Delegate whenever the daemon answers.
+        Auto => "auto",
+        /// Never delegate.
+        Off => "off",
+    }
+}
+
+mode_setting! {
+    /// `[rerank] auto`: whether a search nobody asked to rerank is reranked
+    /// anyway. An unrecognized value is [`RerankAuto::Off`].
+    RerankAuto, ["rerank"] "auto", unknown => Off, {
+        /// Only an explicit request reranks.
+        Off => "off",
+        /// Rerank when a model is already resident or a daemon holds one.
+        Warm => "warm",
+        /// Rerank, loading the model on demand.
+        Always => "always",
+    }
+}
+
+mode_setting! {
+    /// `[consolidate] auto`: the cadence of unattended consolidation.
+    /// An unrecognized value is [`ConsolidateAuto::Off`]: a pass that
+    /// archives and supersedes does not run on a guess.
+    ConsolidateAuto, ["consolidate"] "auto", unknown => Off, {
+        /// At most once every seven days.
+        Weekly => "weekly",
+        /// Only when `mimir consolidate` is run by hand.
+        Off => "off",
+    }
+}
+
+mode_setting! {
+    /// `[embedding] device`: where the models run. An unrecognized value is
+    /// [`EmbeddingDevice::Auto`], which is what every value other than
+    /// `"cpu"` has always meant.
+    EmbeddingDevice, ["embedding"] "device", unknown => Auto, {
+        /// A compiled-in GPU execution provider when it initializes, CPU
+        /// otherwise.
+        Auto => "auto",
+        /// CPU even in a GPU build.
+        Cpu => "cpu",
+    }
+}
+
+mode_setting! {
+    @values
+    /// `[proxy] cache_ttl`: the lifetime of the prompt-cache breakpoints
+    /// the proxy adds. The one mode with no fallback: `mimir proxy` refuses
+    /// to start on an unrecognized value, because a user who asked for one
+    /// lifetime and silently got the other sees no error and a bill they
+    /// cannot explain. [`Config::issues`] still lists it, so `doctor` says
+    /// so before the proxy is ever started.
+    ProxyCacheTtl, ["proxy"] "cache_ttl", {
+        FiveMin => "5m",
+        OneHour => "1h",
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         match std::fs::read_to_string(path) {
@@ -657,6 +967,29 @@ impl Config {
         let text = toml::to_string_pretty(self)
             .map_err(|e| Error::Config(format!("serialize config: {e}")))?;
         std::fs::write(path, text).map_err(|e| Error::io(path, e))
+    }
+
+    /// Every mode setting whose value is not an accepted spelling, in the
+    /// order the sections appear in [`Config`]. Empty for a healthy config.
+    ///
+    /// This is the only place an invalid mode is reported from: the typed
+    /// accessors fall back without a word, so the surfaces that tell a
+    /// person about it (`mimir doctor`, a server's start-up log) each ask
+    /// here once.
+    pub fn issues(&self) -> Vec<ConfigIssue> {
+        [
+            EmbeddingDevice::issue(&self.embedding.device),
+            RerankAuto::issue(&self.rerank.auto),
+            ConsolidateAuto::issue(&self.consolidate.auto),
+            SyncMode::issue(&self.sync.mode),
+            self.proxy.cache_ttl_issue(),
+            ContextGuardMode::issue(&self.hooks.context_guard),
+            ColdMode::issue(&self.hooks.cold_mode),
+            DaemonInference::issue(&self.daemon.inference),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 }
 
@@ -694,5 +1027,187 @@ mod learn_config_tests {
             ..LearnConfig::default()
         };
         assert_eq!(cfg.effective_retention_days(), Some(60));
+    }
+}
+
+#[cfg(test)]
+mod mode_tests {
+    use super::*;
+
+    /// A config with a value no setting accepts in every mode field.
+    fn all_typos() -> Config {
+        let mut c = Config::default();
+        c.sync.mode = "sever".into();
+        c.hooks.context_guard = "handof".into();
+        c.hooks.cold_mode = "quick".into();
+        c.daemon.inference = "on".into();
+        c.rerank.auto = "alwyas".into();
+        c.consolidate.auto = "daily".into();
+        c.embedding.device = "gpu".into();
+        c.proxy.cache_ttl = "10m".into();
+        c
+    }
+
+    #[test]
+    fn the_shipped_defaults_are_accepted_spellings() {
+        let c = Config::default();
+        assert_eq!(c.issues(), Vec::new());
+        assert_eq!(c.sync.mode(), SyncMode::Off);
+        assert_eq!(c.hooks.context_guard(), ContextGuardMode::Off);
+        assert_eq!(c.hooks.cold_mode(), ColdMode::Fast);
+        assert_eq!(c.daemon.inference(), DaemonInference::Auto);
+        assert_eq!(c.rerank.auto(), RerankAuto::Off);
+        assert_eq!(c.consolidate.auto(), ConsolidateAuto::Weekly);
+        assert_eq!(c.embedding.device(), EmbeddingDevice::Auto);
+        assert_eq!(c.proxy.cache_ttl(), Some(ProxyCacheTtl::FiveMin));
+    }
+
+    #[test]
+    fn every_spelling_round_trips() {
+        fn check<T: Copy + PartialEq + std::fmt::Debug>(
+            accepted: &[&str],
+            parse: fn(&str) -> Option<T>,
+            as_str: fn(T) -> &'static str,
+        ) {
+            for text in accepted {
+                let mode = parse(text).unwrap_or_else(|| panic!("{text} must parse"));
+                assert_eq!(as_str(mode), *text);
+            }
+        }
+        check(SyncMode::ACCEPTED, SyncMode::parse, SyncMode::as_str);
+        check(
+            ContextGuardMode::ACCEPTED,
+            ContextGuardMode::parse,
+            ContextGuardMode::as_str,
+        );
+        check(ColdMode::ACCEPTED, ColdMode::parse, ColdMode::as_str);
+        check(
+            DaemonInference::ACCEPTED,
+            DaemonInference::parse,
+            DaemonInference::as_str,
+        );
+        check(RerankAuto::ACCEPTED, RerankAuto::parse, RerankAuto::as_str);
+        check(
+            ConsolidateAuto::ACCEPTED,
+            ConsolidateAuto::parse,
+            ConsolidateAuto::as_str,
+        );
+        check(
+            EmbeddingDevice::ACCEPTED,
+            EmbeddingDevice::parse,
+            EmbeddingDevice::as_str,
+        );
+        check(
+            ProxyCacheTtl::ACCEPTED,
+            ProxyCacheTtl::parse,
+            ProxyCacheTtl::as_str,
+        );
+    }
+
+    #[test]
+    fn an_unknown_value_behaves_as_the_settings_safe_value() {
+        let c = all_typos();
+        assert_eq!(c.sync.mode(), SyncMode::Off);
+        assert_eq!(c.hooks.context_guard(), ContextGuardMode::Off);
+        assert_eq!(c.daemon.inference(), DaemonInference::Off);
+        assert_eq!(c.rerank.auto(), RerankAuto::Off);
+        assert_eq!(c.consolidate.auto(), ConsolidateAuto::Off);
+        // The two that keep the fallback they always had.
+        assert_eq!(c.hooks.cold_mode(), ColdMode::Full);
+        assert_eq!(c.embedding.device(), EmbeddingDevice::Auto);
+        // The one with no fallback.
+        assert_eq!(c.proxy.cache_ttl(), None);
+    }
+
+    /// `enabled()` used to be `mode != "off"`, so a typo switched sync on
+    /// and every sync command then failed on the mode it could not name.
+    #[test]
+    fn sync_is_enabled_only_for_file_and_server() {
+        let mut c = Config::default();
+        for (mode, enabled) in [
+            ("off", false),
+            ("file", true),
+            ("server", true),
+            ("sever", false),
+            ("", false),
+            ("Server", false),
+        ] {
+            c.sync.mode = mode.into();
+            assert_eq!(c.sync.enabled(), enabled, "[sync] mode = {mode:?}");
+        }
+    }
+
+    #[test]
+    fn issues_names_every_invalid_value_and_nothing_else() {
+        let issues = all_typos().issues();
+        let seen: Vec<(&str, &str, &str, Option<&str>)> = issues
+            .iter()
+            .map(|i| (i.section, i.key, i.found.as_str(), i.behaves_as))
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                ("embedding", "device", "gpu", Some("auto")),
+                ("rerank", "auto", "alwyas", Some("off")),
+                ("consolidate", "auto", "daily", Some("off")),
+                ("sync", "mode", "sever", Some("off")),
+                ("proxy", "cache_ttl", "10m", None),
+                ("hooks", "context_guard", "handof", Some("off")),
+                ("hooks", "cold_mode", "quick", Some("full")),
+                ("daemon", "inference", "on", Some("off")),
+            ]
+        );
+        let sync = issues.iter().find(|i| i.section == "sync").unwrap();
+        assert_eq!(sync.accepted, ["off", "file", "server"]);
+
+        // One typo is one issue.
+        let mut one = Config::default();
+        one.rerank.auto = "warn".into();
+        assert_eq!(one.issues().len(), 1);
+    }
+
+    #[test]
+    fn an_issue_reads_as_one_line_a_person_can_act_on() {
+        let issues = all_typos().issues();
+        let line = |section: &str| {
+            issues
+                .iter()
+                .find(|i| i.section == section)
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            line("sync"),
+            "[sync] mode = \"sever\" is not a known value (accepted: off, file, server); \
+             behaving as \"off\""
+        );
+        assert_eq!(
+            line("proxy"),
+            "[proxy] cache_ttl = \"10m\" is not a known value (accepted: 5m, 1h); \
+             `mimir proxy` refuses to start"
+        );
+    }
+
+    /// The proxy's own parser trims, so a padded value must not be reported
+    /// as invalid here while the proxy accepts it.
+    #[test]
+    fn cache_ttl_ignores_surrounding_whitespace_like_the_proxy_does() {
+        let mut c = Config::default();
+        c.proxy.cache_ttl = " 1h ".into();
+        assert_eq!(c.proxy.cache_ttl(), Some(ProxyCacheTtl::OneHour));
+        assert!(c.issues().is_empty());
+    }
+
+    /// The string fields stay the wire format: a config with an unknown
+    /// mode still loads and saves the value it was given.
+    #[test]
+    fn an_unknown_mode_survives_a_load_and_save_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[sync]\nmode = \"sever\"\n").unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.sync.mode, "sever");
+        loaded.save(&path).unwrap();
+        assert_eq!(Config::load(&path).unwrap().sync.mode, "sever");
     }
 }

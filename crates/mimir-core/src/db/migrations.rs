@@ -376,7 +376,8 @@ CREATE INDEX shadow_rank_at ON shadow_rank(candidate, at);
 
 pub const SCHEMA_VERSION: i64 = MIGRATIONS.len() as i64;
 
-pub fn migrate(conn: &Connection) -> Result<()> {
+/// The schema version `conn` is at, refusing one this binary is too old for.
+fn schema_version(conn: &Connection) -> Result<i64> {
     let found: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     if found > SCHEMA_VERSION {
         return Err(Error::SchemaTooNew {
@@ -384,14 +385,38 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             supported: SCHEMA_VERSION,
         });
     }
-    for (i, sql) in MIGRATIONS.iter().enumerate().skip(found as usize) {
-        let target = i as i64 + 1;
-        conn.execute_batch(&format!(
-            "BEGIN;\n{sql}\nPRAGMA user_version = {target};\nCOMMIT;"
-        ))?;
+    Ok(found)
+}
+
+/// Bring the schema up to [`SCHEMA_VERSION`], one migration per transaction.
+///
+/// Which migration to run is decided under the write lock: each step takes
+/// the lock, reads `user_version`, applies the migration that version calls
+/// for, and commits the two together. The CLI and the MCP server are
+/// separate processes that are upgraded together and opened moments apart;
+/// with the version read before the lock, both saw the old one and the
+/// second failed on a table the first had just created.
+///
+/// A store that is already current — every open but the first after an
+/// upgrade — is recognised by a plain read and takes no lock at all, so
+/// opening the database never waits behind a writer.
+pub fn migrate(conn: &Connection) -> Result<()> {
+    if schema_version(conn)? == SCHEMA_VERSION {
+        return Ok(());
+    }
+    loop {
+        let tx =
+            rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+        let found = schema_version(&tx)?;
+        let Some(sql) = MIGRATIONS.get(found as usize) else {
+            // Another connection finished the upgrade while this one waited.
+            return Ok(());
+        };
+        let target = found + 1;
+        tx.execute_batch(&format!("{sql}\nPRAGMA user_version = {target};"))?;
+        tx.commit()?;
         tracing::info!(version = target, "applied schema migration");
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -547,6 +572,76 @@ mod tests {
             0,
             "upgraded store must be able to read the shadow ledger"
         );
+    }
+
+    /// Two processes opening an old store at the same moment — the CLI and
+    /// the MCP server after an upgrade — must not both run the migration.
+    /// The second waits for the first and then finds nothing left to do.
+    #[test]
+    fn two_connections_upgrading_at_once_run_each_migration_once() {
+        for round in 0..8 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("mimir.db");
+            let previous = MIGRATIONS.len() - 1;
+            let open_raw = || {
+                let conn = rusqlite::Connection::open(&path).unwrap();
+                conn.busy_timeout(std::time::Duration::from_secs(10))
+                    .unwrap();
+                conn
+            };
+            {
+                let conn = open_raw();
+                conn.execute_batch("PRAGMA journal_mode = WAL;").unwrap();
+                conn.execute_batch(&format!(
+                    "BEGIN;\n{}\nPRAGMA user_version = {previous};\nCOMMIT;",
+                    MIGRATIONS[..previous].join("\n")
+                ))
+                .unwrap();
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let conn = open_raw();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        migrate(&conn).map_err(|e| e.to_string())
+                    })
+                })
+                .collect();
+            for handle in handles {
+                let outcome = handle.join().unwrap();
+                assert!(outcome.is_ok(), "round {round}: {outcome:?}");
+            }
+            let v: i64 = open_raw()
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, SCHEMA_VERSION);
+        }
+    }
+
+    /// A migration that fails must leave neither half of itself nor an open
+    /// transaction behind, so the next open can try again.
+    #[test]
+    fn a_failed_migration_rolls_back_and_releases_the_connection() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        // The table the first migration creates is already there, so it fails
+        // partway through its own batch.
+        conn.execute_batch("CREATE TABLE edge (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        assert!(migrate(&conn).is_err());
+        assert!(
+            conn.is_autocommit(),
+            "the transaction must not be left open"
+        );
+        let tables: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name = 'node'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 0, "the half-applied migration must roll back");
     }
 
     #[test]

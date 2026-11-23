@@ -14,7 +14,8 @@ use serde_json::json;
 
 pub fn viz(out: Option<String>, open: bool, max_nodes: usize) -> Result<()> {
     let mut mimir = Mimir::open()?;
-    let proj = mimir.project_for_cwd(&std::env::current_dir()?)?.context(
+    let here = mimir.projects_for_cwd(&std::env::current_dir()?)?;
+    let proj = here.checkout.clone().context(
         "not inside a project. Mimir scopes the graph to a project root — a VCS \
              marker (.git/.hg/.svn/.jj), a build file (Cargo.toml/package.json/…), \
              or `touch .mimir`.",
@@ -24,9 +25,10 @@ pub fn viz(out: Option<String>, open: bool, max_nodes: usize) -> Result<()> {
     // otherwise the viz renders empty and looks broken.
     crate::graph_cmd::ensure_graph(&mut mimir, &proj)?;
 
-    let html = render(
+    let html = render_for(
         &mimir,
         proj.id,
+        here.memory_id().unwrap_or(proj.id),
         proj.title.as_deref().unwrap_or("project"),
         max_nodes,
     )?;
@@ -68,7 +70,23 @@ struct VizNode {
     pinned: bool,
 }
 
+/// [`render_for`] a checkout whose memories are filed under its own project.
+#[cfg(test)]
 fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Result<String> {
+    render_for(mimir, project_id, project_id, project, max_nodes)
+}
+
+/// The view of one checkout: the code graph, communities and collections of
+/// `project_id`, with the memories of `memory_project_id` (and the global
+/// ones) and what they link to. The two ids differ in a git linked
+/// worktree, whose memories are its main checkout's.
+fn render_for(
+    mimir: &Mimir,
+    project_id: i64,
+    memory_project_id: i64,
+    project: &str,
+    max_nodes: usize,
+) -> Result<String> {
     let conn = &mimir.conn;
 
     // One pass over the edge table serves both the degree map here and the
@@ -146,7 +164,7 @@ fn render(mimir: &Mimir, project_id: i64, project: &str, max_nodes: usize) -> Re
                 "SELECT {COLS} FROM node WHERE kind='memory' AND {live}
                  AND (project_id = ?1 OR project_id IS NULL)"
             ),
-            &[&project_id],
+            &[&memory_project_id],
         )?,
         &mut nodes,
     );
@@ -684,6 +702,29 @@ mod tests {
                 rusqlite::params![src, dst, rel],
             )
             .unwrap();
+    }
+
+    /// A linked worktree's view is its own code graph with its repository's
+    /// memories: not the main checkout's symbols, and not empty of memories
+    /// because none are filed under the worktree's own row.
+    #[test]
+    fn a_worktrees_view_has_its_own_symbols_and_its_repositorys_memories() {
+        let m = Mimir::open_in_memory().unwrap();
+        let home = node(&m, "p:home", "project", "home", None);
+        let wt = node(&m, "p:wt", "project", "wt", None);
+        node(&m, "m:shared", "memory", "REPOMEMORY", Some(home));
+        node(&m, "s:wt", "symbol", "WTSYMBOL", Some(wt));
+        node(&m, "s:home", "symbol", "HOMESYMBOL", Some(home));
+
+        let out = render_for(&m, wt, home, "wt", 500).unwrap();
+        assert!(out.contains("REPOMEMORY"), "{out}");
+        assert!(out.contains("WTSYMBOL"), "{out}");
+        assert!(!out.contains("HOMESYMBOL"), "{out}");
+
+        // Asked for the worktree's row alone, the memory is out of reach.
+        let alone = render(&m, wt, "wt", 500).unwrap();
+        assert!(!alone.contains("REPOMEMORY"), "{alone}");
+        assert!(alone.contains("WTSYMBOL"), "{alone}");
     }
 
     /// co_recalled must be invisible to the viz in every way it could show:

@@ -208,6 +208,7 @@ mimir recall tricky semantic question --rerank  # cross-encoder rescoring (~1 s 
 # code graph (the MCP server runs build + docs indexing automatically
 # on session start — these are for manual/CLI use)
 mimir graph build                 # tree-sitter extraction, incremental
+mimir graph build --full          # re-extract everything (when an answer looks wrong)
 mimir graph check                 # exit 1 if the graph lags the tree (CI/hooks)
 mimir graph callers resolve_ref   # who calls this?
 mimir graph callers resolve_ref --all-projects   # …in every repo with a graph
@@ -476,7 +477,12 @@ default 200,000):
   `session-handoff`-tagged memory before you clear. The next
   `SessionStart` after a clear or compact restores the latest handoff
   memory automatically, so the new session picks up where the old one
-  left off instead of starting cold.
+  left off instead of starting cold. A handoff is restored once: a later
+  clear without a new handoff restores nothing, where it used to replay
+  the old one. (In `pause` mode nothing is restored; get a saved handoff
+  back with `mimir list --tag session-handoff -n 1`.) A handoff belongs to
+  the project, not to one session: with two sessions in one project, the
+  first to clear takes it.
 
 Tune the estimate in `config.toml`:
 
@@ -567,6 +573,25 @@ the server returns.
 > immediately). Pin a stable identity with `mimir project init --sync` and
 > commit the `.mimir` file. If something still lands in the wrong place,
 > move it with `mimir reproject <ref> --project <name>` (or `--global`).
+
+Because identity is the path, a project outlives its directory: a deleted
+worktree or a scratch clone stays registered, with its whole code graph.
+`mimir project prune` lists projects whose directory is gone and what they
+still hold, and `mimir project prune --apply` removes those code graphs
+(never memories; a symbol or code file a memory is linked to is kept, so
+the memory reads `stale` instead of losing its link). `mimir doctor` tells you when
+there is something to prune.
+
+A git linked worktree (`git worktree add`) is a checkout of its own with its
+repository's memories. It has its own code graph and docs collections, so
+`graph`, `peek` and `outline` read the files in that directory; `remember`,
+the session brief, guard anchors and the rules pack use the project of the
+repository's main checkout; and `recall` answers with both, the repository's
+memories beside the worktree's own code and docs. `mimir status` says which
+is which. What is remembered in a worktree therefore outlives it: once its
+directory is gone, `mimir project prune --apply` removes its code graph and
+its project. A submodule and a worktree of a bare repository are projects of
+their own (global memories are visible everywhere).
 
 `mimir init` also installs a set of `/m-*` slash commands for the agent
 CLIs it finds on the machine — Claude Code, Codex, OpenCode, Gemini CLI

@@ -49,11 +49,17 @@ pub fn sanitize_anchors(patterns: Vec<String>) -> Vec<String> {
 /// `store::set_fires_when` uses for `meta.fires_when`. Kept in this module
 /// rather than `store.rs` since guard anchors are new, self-contained
 /// functionality.
+///
+/// Bumps `updated_at` for the reason `store::set_fires_when` does: `meta`
+/// is on the sync wire and replication selects rows by `updated_at`, so an
+/// anchor added to an existing memory would otherwise never reach a peer.
 pub fn set_anchors(conn: &Connection, id: i64, patterns: &[String]) -> Result<()> {
     let json = serde_json::to_string(patterns).unwrap_or_else(|_| "[]".into());
+    crate::text_clock::keep(conn, id)?;
     conn.execute(
-        "UPDATE node SET meta = json_set(meta, '$.anchors', json(?2)) WHERE id = ?1",
-        params![id, json],
+        "UPDATE node SET meta = json_set(meta, '$.anchors', json(?2)), updated_at = ?3
+         WHERE id = ?1",
+        params![id, json, crate::model::now_unix()],
     )?;
     Ok(())
 }
@@ -62,6 +68,10 @@ pub fn set_anchors(conn: &Connection, id: i64, patterns: &[String]) -> Result<()
 /// Small by construction (anchors are an explicit, rare author opt-in), so
 /// filtering by pattern match happens in Rust after this one query rather
 /// than pushing glob logic into SQL.
+///
+/// "Live" here means *stored* — not a tombstone. A superseded or expired
+/// memory is still returned, on purpose: whether its anchor may fire, and
+/// with whose text, is decided per match in [`find_and_record`].
 fn anchored_candidates(conn: &Connection, scope: Scope) -> Result<Vec<crate::model::Node>> {
     let sql = format!(
         "SELECT {NODE_COLS} FROM node n
@@ -155,6 +165,7 @@ pub fn find_and_record(
         Ok(c) => c,
         Err(_) => return Ok(None),
     };
+    let now = crate::model::now_unix();
     for node in candidates {
         let Some(patterns) = node.meta.get("anchors").and_then(|v| v.as_array()) else {
             continue;
@@ -169,6 +180,19 @@ pub fn find_and_record(
         if !hit {
             continue;
         }
+        // The anchor matched; what it surfaces is whatever now stands in
+        // that memory's place. A retired guard used to be injected verbatim
+        // — and, candidates being ordered by id, ahead of the memory that
+        // replaced it, at the exact moment the agent was about to act. Its
+        // replacement speaks for it instead; a guard that expired or was
+        // forgotten says nothing. Simply dropping superseded guards would be
+        // wrong the other way: the replacement rarely repeats the anchor, so
+        // consolidation merging two near-duplicates would switch a guard off.
+        let Some(node) = crate::lifecycle::resolve_current(conn, node, now)
+            .filter(|n| scope.admits(n.project_id))
+        else {
+            continue;
+        };
         if store::injection_seen(conn, session_id, node.id).unwrap_or(false) {
             continue;
         }

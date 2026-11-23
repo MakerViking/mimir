@@ -1,4 +1,7 @@
 mod brief_cmd;
+mod capture;
+#[cfg(test)]
+mod cli_tests;
 mod commands;
 mod context_cmd;
 mod context_guard_cmd;
@@ -51,11 +54,13 @@ enum Command {
         /// one clears the relevance floor (see `recall-inject`).
         #[arg(long)]
         auto_recall: bool,
-        /// Also install the opt-in context-window guard (implies --hooks):
-        /// "off" (default, installs nothing new) | "pause" (nudge to
+        /// Set the opt-in context-window guard: "pause" (nudge to
         /// deliberately /clear or /compact) | "handoff" (also
-        /// auto-save/restore a handoff memory across the clear). See
-        /// `mimir context-guard` and `[hooks] context_guard` in config.toml.
+        /// auto-save/restore a handoff memory across the clear) — both
+        /// imply --hooks, which installs the guard's hook entries — or
+        /// "off" (the default: records the mode and installs nothing; an
+        /// already-installed guard goes quiet). See `mimir context-guard`
+        /// and `[hooks] context_guard` in config.toml.
         #[arg(long)]
         context_guard: Option<String>,
     },
@@ -88,7 +93,8 @@ enum Command {
     Report,
     /// Token-savings analytics (outline/peek/filter/proxy).
     Savings {
-        /// Print a compact one-line segment (for a statusline).
+        /// Print a compact one-line segment (for a statusline). Takes
+        /// precedence over --json.
         #[arg(long)]
         oneline: bool,
     },
@@ -173,7 +179,7 @@ enum Command {
         #[arg(long, default_value = "all")]
         kind: String,
         /// Only cross-project (global) results.
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "all")]
         global: bool,
         /// Search every project (no scope filter).
         #[arg(long)]
@@ -197,7 +203,8 @@ enum Command {
         /// Show nodes linked to each hit (memories on code, code on memories).
         #[arg(long)]
         linked: bool,
-        /// Include superseded memories (default hides them).
+        /// Include retired memories: superseded ones, and ones past their
+        /// declared expiry (default hides both). Each is labelled on its line.
         #[arg(long)]
         include_superseded: bool,
         /// Answer as the store stood on this date (YYYY-MM-DD) instead of
@@ -221,8 +228,10 @@ enum Command {
         /// Filter by tag.
         #[arg(long)]
         tag: Option<String>,
-        #[arg(short, long)]
+        /// Only cross-project (global) memories.
+        #[arg(short, long, conflicts_with = "all")]
         global: bool,
+        /// Every project's memories (no scope filter).
         #[arg(long)]
         all: bool,
         #[arg(short = 'n', long, default_value_t = 20)]
@@ -300,23 +309,22 @@ enum Command {
     Link {
         a: Option<String>,
         b: Option<String>,
-        /// links|about|relates|mentions|describes|supersedes|summarizes|
-        /// derived_from. `co_recalled` is not in the vocabulary here: the
-        /// store writes those for itself from what you actually recall.
-        #[arg(long, default_value = "relates")]
+        #[arg(long, default_value = "relates", help = commands::rel_help())]
         rel: String,
         /// Auto-link memories to code symbols their text mentions
         /// (current project; precision-first heuristic, idempotent).
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["a", "b", "rel"])]
         scan: bool,
-        /// With --scan: show what would be linked without writing.
-        #[arg(long)]
+        /// With --scan: show what would be linked without writing. Refused
+        /// with two endpoints: there it would be ignored and the link
+        /// written.
+        #[arg(long, conflicts_with_all = ["a", "b"])]
         dry_run: bool,
         /// With --scan: scan every project that has a code graph, not just
         /// the current one. Global memories (most of them) can match
         /// symbols in any project, so scanning one at a time leaves the
         /// rest unlinked.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["a", "b"])]
         all_projects: bool,
     },
     /// Manage docs collections.
@@ -342,7 +350,8 @@ enum Command {
         /// Allow downloading the model if it isn't cached yet.
         #[arg(long)]
         fetch: bool,
-        /// With --fetch: also download the reranker model.
+        /// Also load the reranker model; with --fetch, download it when it
+        /// isn't cached yet.
         #[arg(long)]
         rerank: bool,
     },
@@ -378,7 +387,7 @@ enum Command {
     /// when a later recall of the same question finds a strong match.
     Misses {
         /// Remove this row (from the list): noise, not a gap.
-        #[arg(long)]
+        #[arg(long, conflicts_with_all = ["all", "resolved"])]
         dismiss: Option<i64>,
         /// Every project's misses, not just this one's and the global ones.
         #[arg(long)]
@@ -429,16 +438,16 @@ enum Command {
         /// Decide this finding (from `mimir review`). Omit to list.
         id: Option<i64>,
         /// Both are right, or it isn't a problem. Changes nothing.
-        #[arg(long, group = "disposition")]
+        #[arg(long, group = "disposition", requires = "id")]
         keep: bool,
         /// Retire the older memory in favour of the newer.
-        #[arg(long, group = "disposition")]
+        #[arg(long, group = "disposition", requires = "id")]
         supersede: bool,
         /// Not worth acting on, and not worth showing again.
-        #[arg(long, group = "disposition")]
+        #[arg(long, group = "disposition", requires = "id")]
         dismiss: bool,
         /// Why. This is what carries your own words into `mimir audit`.
-        #[arg(long)]
+        #[arg(long, requires = "id")]
         reason: Option<String>,
         /// How many findings to list.
         #[arg(long, default_value_t = 20)]
@@ -487,7 +496,10 @@ enum Command {
     /// Run the warm daemon: a thin alias for `mimir mcp --http <addr>`
     /// where <addr> comes from `[hooks] inject_url` (host:port only, scheme
     /// and /inject path stripped) — the same config key the auto-recall
-    /// hook already reads, so one setting drives both sides. Does nothing
+    /// hook already reads, so one setting drives both sides, and the
+    /// `MIMIR_INJECT_URL` environment variable overrides it for both.
+    /// Loopback addresses only; a deliberate non-loopback bind is
+    /// `mimir mcp --http <addr> --http-allow-remote`. Does nothing
     /// beyond that: no auto-spawn, no process supervision — see
     /// contrib/mimir-daemon.service to run it as a systemd unit.
     Daemon,
@@ -585,7 +597,13 @@ enum RulesCmd {
     /// Set/replace the rules pack (text from args, or stdin if omitted).
     Set { text: Vec<String> },
     /// Print the rules pack (what the SessionStart hook injects).
-    Show,
+    Show {
+        /// Run as the SessionStart hook: read the hook event on stdin, use
+        /// the project of the event's `cwd`, and never fail the session
+        /// start. `mimir init --hooks` installs the command with this flag.
+        #[arg(long)]
+        hook: bool,
+    },
     /// Remove the rules pack.
     Clear,
 }
@@ -601,8 +619,26 @@ enum ProjectCmd {
     /// Write/refresh `.mimir` with a stable id (and `--sync` to replicate this
     /// project's memories across machines). Commit the file so every clone shares it.
     Init {
+        /// Turn sync on for this project (`sync = true` in the marker).
         #[arg(long)]
         sync: bool,
+        /// Turn sync off again (`sync = false`). With neither flag, the
+        /// marker's setting is kept.
+        #[arg(long, conflicts_with = "sync")]
+        no_sync: bool,
+    },
+    /// List the projects whose directory no longer exists, with the size of
+    /// the code graph still stored for each. Changes nothing without
+    /// --apply.
+    Prune {
+        /// Remove those projects' code graphs (symbols, code-file rows and
+        /// their edges): everything `mimir graph build` would recreate if
+        /// the directory came back. Memories are never removed, and a
+        /// symbol a memory is linked to is kept. A directory on a drive
+        /// that is not mounted right now also counts as missing, so read
+        /// the list first.
+        #[arg(long)]
+        apply: bool,
     },
 }
 
@@ -634,9 +670,24 @@ enum ImportCmd {
 #[derive(Subcommand)]
 enum SyncCmd {
     /// Send local changes to the central store.
-    Push,
+    Push {
+        /// Send every synced memory again, not only what changed since the
+        /// last push. Safe to repeat: the hub keeps whatever it holds that
+        /// is newer. Use it once after the hub is upgraded, so it receives
+        /// what an older hub dropped (which memory replaced which).
+        #[arg(long)]
+        full: bool,
+    },
     /// Fetch and merge remote changes.
-    Pull,
+    Pull {
+        /// Ask the hub for everything, not only what reached it since the
+        /// last pull. Safe to repeat: the merge is last-write-wins and
+        /// changes nothing that is already here. Use it once after the hub
+        /// is upgraded, to collect what an older hub never passed on (rows
+        /// pushed long after they were written).
+        #[arg(long)]
+        full: bool,
+    },
     /// Show sync configuration and pending changes.
     Status,
     /// Print the active sync token (env var, else the hub's persisted token) so
@@ -647,9 +698,18 @@ enum SyncCmd {
 #[derive(Subcommand)]
 enum GraphCmd {
     /// Extract/refresh symbols and call edges (incremental).
-    Build,
-    /// Alias of build (always incremental).
-    Update,
+    Build {
+        /// Re-extract every file and rebuild every edge, ignoring what the
+        /// graph already has. Slower; use it when an answer looks wrong.
+        #[arg(long)]
+        full: bool,
+    },
+    /// Alias of build.
+    Update {
+        /// Re-extract every file and rebuild every edge.
+        #[arg(long)]
+        full: bool,
+    },
     /// Is the graph still current? Exits 1 on drift; never writes.
     Check {
         /// Machine-readable report for CI.
@@ -829,7 +889,40 @@ fn cli_main() -> i32 {
     }
 }
 
+/// Whether `command` reads or writes memories and is typed on purpose, so
+/// it first moves what a linked worktree's own project row still holds to
+/// the project its memories are filed under
+/// (`commands::move_worktree_memories_here`). The one list of them. Hooks
+/// (`context-guard`, `brief show`, `rules show --hook`, `recall-inject`),
+/// `status`, `doctor`, `sync` and the servers are not on it: a hook must
+/// not take the write lock for a move, `status` and `doctor` only report,
+/// and `sync` would publish a move it was not asked to make.
+fn moves_worktree_memories(command: &Command) -> bool {
+    match command {
+        Command::Remember { .. }
+        | Command::Recall { .. }
+        | Command::Get { .. }
+        | Command::List { .. }
+        | Command::Forget { .. }
+        | Command::Supersede { .. }
+        | Command::Anchor { .. }
+        | Command::Edit { .. }
+        | Command::Reproject { .. }
+        | Command::Link { .. }
+        | Command::Mark { .. }
+        | Command::Consolidate { .. }
+        | Command::Misses { .. }
+        | Command::Review { .. }
+        | Command::Brief { cmd: None } => true,
+        Command::Rules { cmd } => !matches!(cmd, RulesCmd::Show { hook: true }),
+        _ => false,
+    }
+}
+
 fn run(cli: Cli) -> anyhow::Result<()> {
+    if moves_worktree_memories(&cli.command) {
+        commands::move_worktree_memories_here();
+    }
     match cli.command {
         Command::Init {
             no_model,
@@ -838,7 +931,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             context_guard,
         } => commands::init(
             no_model,
-            hooks || auto_recall || context_guard.is_some(),
+            // `--context-guard` implies hooks only for a mode that needs
+            // them; `init` decides that once it has parsed the mode.
+            hooks || auto_recall,
             auto_recall,
             context_guard.as_deref(),
         ),
@@ -1065,14 +1160,14 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         ),
         Command::Sync { cmd } => match cmd {
             None => sync::sync(),
-            Some(SyncCmd::Push) => sync::push(),
-            Some(SyncCmd::Pull) => sync::pull(),
+            Some(SyncCmd::Push { full }) => sync::push(full),
+            Some(SyncCmd::Pull { full }) => sync::pull(full),
             Some(SyncCmd::Status) => sync::status(),
             Some(SyncCmd::Token) => sync::token(),
         },
         Command::Serve { bind } => sync::serve(bind),
         Command::Graph { cmd } => match cmd {
-            GraphCmd::Build | GraphCmd::Update => graph_cmd::build(),
+            GraphCmd::Build { full } | GraphCmd::Update { full } => graph_cmd::build(full),
             GraphCmd::Check { json } => graph_cmd::check(json),
             GraphCmd::Callers {
                 symbol,
@@ -1109,7 +1204,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Peek { symbol } => context_cmd::peek(&symbol, cli.json),
         Command::Rules { cmd } => match cmd {
             RulesCmd::Set { text } => rules_cmd::set(text),
-            RulesCmd::Show => rules_cmd::show(),
+            RulesCmd::Show { hook } => rules_cmd::show(hook),
             RulesCmd::Clear => rules_cmd::clear(),
         },
         Command::Brief { cmd } => match cmd {
@@ -1117,7 +1212,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             None => brief_cmd::dry_run(),
         },
         Command::Project { cmd } => match cmd {
-            ProjectCmd::Init { sync } => project_cmd::init(sync),
+            ProjectCmd::Init { sync, no_sync } => {
+                project_cmd::init(project_cmd::SyncChange::from_flags(sync, no_sync))
+            }
+            ProjectCmd::Prune { apply } => project_cmd::prune(apply),
         },
         Command::ContextGuard { cmd } => match cmd {
             ContextGuardCmd::Prompt => context_guard_cmd::prompt(),

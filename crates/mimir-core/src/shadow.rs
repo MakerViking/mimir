@@ -31,7 +31,7 @@ use rusqlite::{params, Connection};
 
 use crate::error::Result;
 use crate::learn::{self, COACTIVATION_WINDOW_SECS};
-use crate::model::Kind;
+use crate::model::{Kind, RecallEvent};
 use crate::search::Hit;
 
 /// The co-activation candidate: a memory co-activated with something opened
@@ -59,10 +59,13 @@ pub const MIN_DECIDED: usize = 20;
 pub fn primed(conn: &Connection, now: i64) -> Result<HashMap<i64, f64>> {
     let mut stmt = conn.prepare_cached(
         "SELECT DISTINCT node_id FROM recall_event
-         WHERE event = 'opened' AND at >= ?1",
+         WHERE event = ?2 AND at >= ?1",
     )?;
     let opened: Vec<i64> = stmt
-        .query_map([now - COACTIVATION_WINDOW_SECS], |r| r.get(0))?
+        .query_map(
+            params![now - COACTIVATION_WINDOW_SECS, RecallEvent::Opened.as_str()],
+            |r| r.get(0),
+        )?
         .collect::<rusqlite::Result<_>>()?;
     let mut primed: HashMap<i64, f64> = HashMap::new();
     for id in opened {
@@ -222,16 +225,21 @@ pub fn evaluate(conn: &Connection, candidate: &str, since: i64) -> Result<Evalua
     nodes.dedup();
     let mut events = conn.prepare_cached(
         "SELECT event, query_hash, at FROM recall_event
-         WHERE node_id = ?1 AND event IN ('shown', 'opened') AND at >= ?2
+         WHERE node_id = ?1 AND event IN (?3, ?4) AND at >= ?2
          ORDER BY at, id",
     )?;
     for node in nodes {
         let mut last_shown: Option<(Vec<u8>, i64)> = None;
-        let mut events = events.query(params![node, since])?;
+        let mut events = events.query(params![
+            node,
+            since,
+            RecallEvent::Shown.as_str(),
+            RecallEvent::Opened.as_str()
+        ])?;
         while let Some(r) = events.next()? {
             let event: String = r.get(0)?;
             let at: i64 = r.get(2)?;
-            if event == "shown" {
+            if event == RecallEvent::Shown.as_str() {
                 last_shown = r.get::<_, Option<Vec<u8>>>(1)?.map(|hash| (hash, at));
             } else if let Some((hash, shown_at)) = &last_shown {
                 if at - shown_at <= VERDICT_WINDOW_SECS {

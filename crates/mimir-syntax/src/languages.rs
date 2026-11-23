@@ -3,7 +3,7 @@
 
 use tree_sitter::Node;
 
-use crate::extract::ImportRef;
+use crate::extract::{ImportRef, SCOPE_SEP};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lang {
@@ -86,8 +86,9 @@ impl Lang {
         }
     }
 
+    /// [`SCOPE_SEP`], whatever the language's own spelling is.
     pub fn separator(&self) -> String {
-        "::".into()
+        SCOPE_SEP.into()
     }
 
     /// Is this node a symbol definition? Returns (name, kind). The name may
@@ -1056,16 +1057,25 @@ impl Lang {
                 out.push(ImportRef { local, source });
             }
             // C's preprocessor grammar is reused verbatim by C++, so one
-            // arm covers both `#include` forms.
+            // arm covers both languages.
             Lang::C | Lang::Cpp => {
-                // #include "foo.h" / <foo.h> → a file→file edge by path.
+                // #include "foo.h" → a file→file edge by path.
                 if node.kind() != "preproc_include" {
                     return;
                 }
                 let Some(path_node) = node.child_by_field_name("path") else {
                     return;
                 };
-                let source = text(path_node).trim_matches(['"', '<', '>']).to_string();
+                let written = text(path_node);
+                // `<foo.h>` is searched for on the include path only, never
+                // beside the including file: a system or installed header.
+                // It is not reported, because once the brackets are gone a
+                // `<math.h>` cannot be told from a project's own `"math.h"`,
+                // and it would be resolved to it.
+                if !written.starts_with('"') {
+                    return;
+                }
+                let source = written.trim_matches('"').to_string();
                 let local = source
                     .rsplit('/')
                     .next()

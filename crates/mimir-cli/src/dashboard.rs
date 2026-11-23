@@ -4,7 +4,7 @@
 //! one file you can open offline. Charts are hand-rolled inline SVG.
 
 use anyhow::{Context, Result};
-use mimir_core::model::now_unix;
+use mimir_core::model::{now_unix, RecallEvent};
 use mimir_core::{learn, store, Mimir};
 
 pub fn dashboard(out: Option<String>, open: bool) -> Result<()> {
@@ -79,7 +79,15 @@ fn render(mimir: &Mimir) -> Result<String> {
     let projects = q1("SELECT count(*) FROM node WHERE kind='project' AND deleted_at IS NULL")?;
     let collections =
         q1("SELECT count(*) FROM node WHERE kind='collection' AND deleted_at IS NULL")?;
-    let files = q1("SELECT count(*) FROM node WHERE kind='file' AND deleted_at IS NULL")?;
+    // Two writers share `kind='file'`: the code graph (no collection) and the
+    // docs indexer (a collection). One total would add source files to
+    // markdown files under a single unlabelled number.
+    let code_files = q1(
+        "SELECT count(*) FROM node WHERE kind='file' AND deleted_at IS NULL AND collection_id IS NULL",
+    )?;
+    let doc_files = q1(
+        "SELECT count(*) FROM node WHERE kind='file' AND deleted_at IS NULL AND collection_id IS NOT NULL",
+    )?;
 
     // ---- memory types ----
     let mut stmt = conn.prepare(
@@ -98,8 +106,12 @@ fn render(mimir: &Mimir) -> Result<String> {
         "SELECT at/86400, event, count(*) FROM recall_event
          WHERE at >= ?1 GROUP BY 1, 2",
     )?;
+    // Two series, as the chart's key names them: "shown in results" and
+    // "opened / marked useful". The second is engagement — either event —
+    // and is not the count of opens that `mimir report` prints on its own
+    // row; `RecallEvent::is_engagement` is the one definition of it.
     let mut shown = [0i64; 14];
-    let mut opened = [0i64; 14];
+    let mut engaged = [0i64; 14];
     for row in stmt.query_map([day0 * 86_400], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -109,10 +121,11 @@ fn render(mimir: &Mimir) -> Result<String> {
     })? {
         let (day, event, n) = row?;
         let idx = (day - day0).clamp(0, 13) as usize;
-        match event.as_str() {
-            "shown" => shown[idx] += n,
-            "opened" | "useful" => opened[idx] += n,
-            _ => {}
+        match event.parse::<RecallEvent>() {
+            Ok(RecallEvent::Shown) => shown[idx] += n,
+            Ok(event) if event.is_engagement() => engaged[idx] += n,
+            // A mark of "noise", or an event a newer build wrote.
+            Ok(_) | Err(_) => {}
         }
     }
     drop(stmt);
@@ -167,10 +180,22 @@ fn render(mimir: &Mimir) -> Result<String> {
     drop(stmt);
 
     // ---- graph + hygiene + storage ----
-    let calls_resolved =
-        q1("SELECT count(*) FROM edge WHERE rel='calls' AND json_extract(meta,'$.resolved')=1")?;
-    let calls_heuristic =
-        q1("SELECT count(*) FROM edge WHERE rel='calls' AND json_extract(meta,'$.resolved')=0")?;
+    // Call edges a query can actually walk: both ends live symbols. An edge
+    // row outlives a tombstoned end (a deleted file's symbols keep theirs),
+    // and counting those reported calls no `graph callers` would show.
+    let live_calls = |resolved: i64| -> Result<i64> {
+        Ok(conn.query_row(
+            "SELECT count(*) FROM edge e
+             JOIN node s ON s.id = e.src JOIN node d ON d.id = e.dst
+             WHERE e.rel='calls' AND json_extract(e.meta,'$.resolved')=?1
+               AND s.kind='symbol' AND s.deleted_at IS NULL
+               AND d.kind='symbol' AND d.deleted_at IS NULL",
+            [resolved],
+            |r| r.get(0),
+        )?)
+    };
+    let calls_resolved = live_calls(1)?;
+    let calls_heuristic = live_calls(0)?;
     let imports = q1("SELECT count(*) FROM edge WHERE rel='imports'")?;
     let links =
         q1("SELECT count(*) FROM edge WHERE rel IN ('about','relates','links','mentions')")?;
@@ -180,19 +205,17 @@ fn render(mimir: &Mimir) -> Result<String> {
     // row into machine activity. Hiding them entirely was the other option and
     // is worse — the rows exist and take space, so they should be legible.
     let co_recalled = q1("SELECT count(*) FROM edge WHERE rel='co_recalled'")?;
-    let embedded = q1("SELECT count(*) FROM embedding")?;
-    // Kind list mirrors `embed::embed_pending`'s eligibility filter exactly —
-    // drawing from the shared constant means a kind added there (e.g. the
-    // `codechunk` fallback content in index::mod) shows up here too, instead
-    // of silently under-counting against a second, hand-copied list.
-    let embeddable = q1(&format!(
-        "SELECT count(*) FROM node WHERE deleted_at IS NULL AND body IS NOT NULL
-         AND kind IN ({})",
-        mimir_core::embed::EMBEDDABLE_KINDS
-    ))?;
-    let superseded = q1("SELECT count(*) FROM node WHERE superseded_by IS NOT NULL")?;
-    let archived =
-        q1("SELECT count(*) FROM node WHERE deleted_at IS NOT NULL AND json_extract(meta,'$.archived')=1")?;
+    // Both numbers come from the predicate `embed::embed_pending` selects
+    // with, for the configured model: "embedded" is a live node whose vector
+    // matches its current content, not a row in the `embedding` table (those
+    // also exist for deleted nodes, retired models and edited content, which
+    // is how the percentage used to pass 100).
+    let (embedded, embeddable) = mimir_core::embed::coverage(conn, &mimir.config.embedding.model)?;
+    // The same counts `mimir status` prints, from the one derivation of a
+    // memory's state. Counted here by hand, a memory superseded and later
+    // forgotten was in both numbers.
+    let states = mimir_core::lifecycle::counts(conn)?;
+    let (superseded, archived) = (states.superseded, states.archived);
     let pinned = q1("SELECT count(*) FROM node WHERE pinned=1 AND deleted_at IS NULL")?;
     let events_total = q1("SELECT count(*) FROM recall_event")?;
     let db_bytes = std::fs::metadata(&mimir.paths.db_file)?.len();
@@ -238,10 +261,10 @@ fn render(mimir: &Mimir) -> Result<String> {
         ));
     }
 
-    // Activity bars (overlaid shown/opened)
+    // Activity bars (overlaid shown/engaged)
     let max_act = shown
         .iter()
-        .chain(opened.iter())
+        .chain(engaged.iter())
         .copied()
         .max()
         .unwrap_or(1)
@@ -250,7 +273,7 @@ fn render(mimir: &Mimir) -> Result<String> {
     for i in 0..14 {
         let x = i as f64 * 22.0;
         let hs = 72.0 * shown[i] as f64 / max_act as f64;
-        let ho = 72.0 * opened[i] as f64 / max_act as f64;
+        let ho = 72.0 * engaged[i] as f64 / max_act as f64;
         act_bars.push_str(&format!(
             r#"<rect class="grow" style="animation-delay:{}ms" x="{:.0}" y="{:.1}" width="9" height="{:.1}" fill="var(--navy-bright)"/><rect class="grow" style="animation-delay:{}ms" x="{:.0}" y="{:.1}" width="9" height="{:.1}" fill="var(--teal)"/>"#,
             i * 40, x, 76.0 - hs, hs.max(1.0),
@@ -440,7 +463,10 @@ fn render(mimir: &Mimir) -> Result<String> {
         .replace("{{PROJECT_ROWS}}", &project_rows)
         .replace("{{PROJECTS}}", &fmt_n(projects))
         .replace("{{COLLECTIONS}}", &fmt_n(collections))
-        .replace("{{FILES}}", &fmt_n(files))
+        .replace(
+            "{{FILES}}",
+            &format!("{} code · {} docs", fmt_n(code_files), fmt_n(doc_files)),
+        )
         .replace("{{CALLS_R}}", &fmt_n(calls_resolved))
         .replace("{{CALLS_H}}", &fmt_n(calls_heuristic))
         .replace("{{IMPORTS}}", &fmt_n(imports))
@@ -710,3 +736,75 @@ footer span{margin-left:auto}
 <footer>ᛗᛁᛗᛁᚱ — what is remembered, remains<span>local · private · yours</span></footer>
 </div></body></html>
 "##;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &std::path::Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    /// The graph numbers on the dashboard are the graph a query walks: code
+    /// files apart from indexed docs files, and call edges only where both
+    /// ends still exist. A deleted file's symbols keep their outgoing edge
+    /// rows, and those used to be counted as calls.
+    #[test]
+    fn graph_tiles_count_code_files_and_live_call_edges() {
+        let dir = tempfile::tempdir().unwrap();
+        write(
+            dir.path(),
+            "src/main.rs",
+            "fn main() { run(); }\n\nfn run() { slugify(); }\n\npub fn helper() {}\n",
+        );
+        write(
+            dir.path(),
+            "src/util.rs",
+            "pub fn slugify() { helper(); }\n",
+        );
+        write(dir.path(), "README.md", "# Probe\n\nSome words.\n");
+        // A store on disk: the page also reports the database file's size.
+        let home = tempfile::tempdir().unwrap();
+        let mut mimir = Mimir::open_at(mimir_core::config::Paths::under_root(home.path())).unwrap();
+        let proj =
+            mimir_core::store::ensure_project(&mimir.conn, &dir.path().to_string_lossy(), "probe")
+                .unwrap();
+        mimir_graph::update(&mut mimir.conn, &proj, dir.path()).unwrap();
+        let docs = mimir_core::index::add_collection(
+            &mimir.conn,
+            dir.path(),
+            "probe",
+            Some(proj.id),
+            "docs",
+        )
+        .unwrap();
+        mimir_core::index::index_collection(&mut mimir.conn, &docs).unwrap();
+
+        let html = render(&mimir).unwrap();
+        assert!(html.contains("files <b>2 code · 1 docs</b>"), "file legend");
+        assert!(
+            html.contains("<span>calls resolved</span><b class=\"teal\">3</b>"),
+            "main → run → slugify → helper"
+        );
+
+        // util.rs goes. `slugify → helper` is still a row in the edge table.
+        std::fs::remove_file(dir.path().join("src/util.rs")).unwrap();
+        mimir_graph::update(&mut mimir.conn, &proj, dir.path()).unwrap();
+        let rows: i64 = mimir
+            .conn
+            .query_row("SELECT count(*) FROM edge WHERE rel='calls'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 2, "main → run, and the dead slugify → helper");
+
+        let html = render(&mimir).unwrap();
+        assert!(html.contains("files <b>1 code · 1 docs</b>"), "file legend");
+        assert!(
+            html.contains("<span>calls resolved</span><b class=\"teal\">1</b>"),
+            "only main → run is a call any query would show"
+        );
+    }
+}

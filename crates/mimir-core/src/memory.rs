@@ -189,8 +189,12 @@ pub fn parse_expires_in(spec: &str, now: i64) -> Option<i64> {
 /// Refusing to re-learn a fact because a background job archived it six
 /// months ago would be wrong, and would teach people to pass `--force` by
 /// reflex, which is exactly how the guard stops meaning anything.
-const DELIBERATE_TOMBSTONE: &str = "kind = 'memory' AND deleted_at IS NOT NULL \
-     AND COALESCE(json_extract(meta, '$.archived'), 0) != 1";
+fn deliberate_tombstone_sql() -> String {
+    format!(
+        "kind = 'memory' AND deleted_at IS NOT NULL AND NOT ({})",
+        crate::lifecycle::ARCHIVED_SQL
+    )
+}
 
 /// A memory someone deliberately forgot, whose text is being offered again.
 ///
@@ -210,11 +214,12 @@ const DELIBERATE_TOMBSTONE: &str = "kind = 'memory' AND deleted_at IS NOT NULL \
 /// store (people forget on purpose seldom, and decay archival is excluded),
 /// so this is a few dozen short strings, not a table sweep.
 fn find_forgotten(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<Node>> {
+    let deliberate_tombstone = deliberate_tombstone_sql();
     let exact = conn
         .query_row(
             &format!(
                 "SELECT {NODE_COLS} FROM node
-                 WHERE {DELIBERATE_TOMBSTONE} AND content_hash = ?1
+                 WHERE {deliberate_tombstone} AND content_hash = ?1
                  ORDER BY deleted_at DESC LIMIT 1"
             ),
             [hash],
@@ -227,7 +232,7 @@ fn find_forgotten(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<N
 
     let mut stmt = conn.prepare(&format!(
         "SELECT {NODE_COLS} FROM node
-         WHERE {DELIBERATE_TOMBSTONE}
+         WHERE {deliberate_tombstone}
          ORDER BY deleted_at DESC LIMIT {FORGOTTEN_SCAN_LIMIT}"
     ))?;
     let rows = stmt.query_map([], row_to_node)?;
@@ -246,19 +251,27 @@ fn find_forgotten(conn: &Connection, text: &str, hash: &[u8]) -> Result<Option<N
     Ok(None)
 }
 
-/// Exact (normalized) content match against a *live* memory, any scope.
+/// Exact (normalized) content match against a *current* memory, any scope.
+///
+/// Current as [`crate::lifecycle::Lifecycle`] means it, the same test the
+/// near-duplicate pass below applies through `search`. A superseded or
+/// expired memory with this text is history: offering the text again is
+/// someone saying it is true now, and refusing that as a duplicate of a row
+/// recall will not show would leave the fact nowhere.
 fn find_exact(conn: &Connection, hash: &[u8]) -> Result<Option<Node>> {
-    Ok(conn
-        .query_row(
-            &format!(
-                "SELECT {NODE_COLS} FROM node
-                 WHERE kind = 'memory' AND content_hash = ?1 AND deleted_at IS NULL
-                 LIMIT 1"
-            ),
-            [hash],
-            row_to_node,
-        )
-        .optional()?)
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {NODE_COLS} FROM node
+         WHERE kind = 'memory' AND content_hash = ?1 AND deleted_at IS NULL
+         ORDER BY id"
+    ))?;
+    let now = crate::model::now_unix();
+    for row in stmt.query_map([hash], row_to_node)? {
+        let node = row?;
+        if node.lifecycle(now).is_current() {
+            return Ok(Some(node));
+        }
+    }
+    Ok(None)
 }
 
 /// Near-duplicate: high token overlap with the best FTS matches.
@@ -418,6 +431,12 @@ pub struct Edit {
 /// `actor`/`reason` go to the mutation ledger. An edit is the one mutation
 /// that changes what a memory *says* while leaving it live, so the pair of
 /// hashes it records is the only evidence that the text ever read differently.
+///
+/// An edit that leaves body, title, type and tags as they were is not an
+/// edit: it takes no snapshot, writes no ledger row and does not touch
+/// `updated_at`. One that does change something lands whole — the snapshot
+/// of the previous wording, the new row and the ledger entry are a single
+/// [`crate::db::atomic`] step.
 pub fn edit(
     conn: &Connection,
     id: i64,
@@ -425,48 +444,79 @@ pub fn edit(
     actor: crate::model::Actor,
     reason: Option<&str>,
 ) -> Result<Node> {
-    let node = store::get_node(conn, id)?;
-    let before = node.content_hash.clone();
-    let kind = node.kind;
-    // Keep what it said before the update lands — `recall --as-of` reads
-    // this, and after the UPDATE there is nothing left to read.
-    crate::revision::snapshot(conn, &node);
-    let body = edit.text.or(node.body);
-    let title = match edit.title {
-        Some(t) => Some(t),
-        None => body.as_deref().map(derive_title),
-    };
-    let subkind = edit.mtype.map(|t| t.to_string()).or(node.subkind);
-    let tags_text = edit
-        .tags
-        .map(|t| sanitize_tags(t).join(" "))
-        .unwrap_or(node.tags_text);
-    let hash = body.as_deref().map(content_hash);
-    conn.execute(
-        "UPDATE node SET title = ?2, body = ?3, subkind = ?4, tags_text = ?5,
-                         content_hash = ?6, updated_at = ?7
-         WHERE id = ?1",
-        rusqlite::params![
+    crate::db::atomic(conn, || {
+        let node = store::get_node(conn, id)?;
+        let body = edit.text.or_else(|| node.body.clone());
+        let body_changed = body != node.body;
+        let title = match edit.title {
+            Some(t) => Some(t),
+            // The derived title follows the body it was derived from. With
+            // the body untouched, so is the title — which may be one someone
+            // chose, and would otherwise be overwritten by an edit that only
+            // meant to change a tag.
+            None if body_changed => body.as_deref().map(derive_title),
+            None => node.title.clone(),
+        };
+        let subkind = edit
+            .mtype
+            .map(|t| t.to_string())
+            .or_else(|| node.subkind.clone());
+        let tags_text = edit
+            .tags
+            .map(|t| sanitize_tags(t).join(" "))
+            .unwrap_or_else(|| node.tags_text.clone());
+        if !body_changed
+            && title == node.title
+            && subkind == node.subkind
+            && tags_text == node.tags_text
+        {
+            return Ok(node);
+        }
+        // Keep what it said before the update lands — after the UPDATE
+        // there is nothing left to read.
+        crate::revision::try_snapshot(conn, &node)?;
+        let hash = body.as_deref().map(content_hash);
+        // A change of title, type or tags leaves the text as old as it was;
+        // a change of the text makes it new. The clock is removed outright:
+        // its hash cannot tell a rewrite that only changes case or
+        // punctuation, or one back to an earlier wording, from no rewrite.
+        if body_changed {
+            conn.execute(
+                &format!(
+                    "UPDATE node SET meta = json_remove(meta, '$.{}') WHERE id = ?1",
+                    crate::text_clock::KEY
+                ),
+                [id],
+            )?;
+        } else {
+            crate::text_clock::keep(conn, id)?;
+        }
+        conn.execute(
+            "UPDATE node SET title = ?2, body = ?3, subkind = ?4, tags_text = ?5,
+                             content_hash = ?6, updated_at = ?7
+             WHERE id = ?1",
+            rusqlite::params![
+                id,
+                title,
+                body,
+                subkind,
+                tags_text,
+                hash,
+                crate::model::now_unix()
+            ],
+        )?;
+        crate::audit::try_record_for_kind(
+            conn,
+            node.kind,
             id,
-            title,
-            body,
-            subkind,
-            tags_text,
-            hash,
-            crate::model::now_unix()
-        ],
-    )?;
-    crate::audit::record_for_kind(
-        conn,
-        kind,
-        id,
-        crate::model::MutationOp::Edit,
-        actor,
-        reason,
-        before.as_deref(),
-        hash.as_deref(),
-    );
-    store::get_node(conn, id)
+            crate::model::MutationOp::Edit,
+            actor,
+            reason,
+            node.content_hash.as_deref(),
+            hash.as_deref(),
+        )?;
+        store::get_node(conn, id)
+    })
 }
 
 /// Recent memories, newest first, optionally filtered by type and tag.
@@ -483,12 +533,17 @@ pub fn list(
         search::scope_sql(scope)
     );
     if let Some(t) = mtype {
-        sql.push_str(&format!(" AND n.subkind = '{t}'"));
+        // A memory stored without a type is a note everywhere else it is
+        // read (`Node::memory_type`), so the `note` filter has to find it.
+        sql.push_str(&format!(" AND COALESCE(n.subkind, 'note') = '{t}'"));
     }
     if tag.is_some() {
         sql.push_str(" AND (' ' || n.tags_text || ' ') LIKE ?2");
     }
-    sql.push_str(" ORDER BY n.created_at DESC LIMIT ?1");
+    // `created_at` has one-second resolution, so two memories written in the
+    // same second need a tie-break or "newest" is whichever row SQLite
+    // happens to return first; the later insert has the higher id.
+    sql.push_str(" ORDER BY n.created_at DESC, n.id DESC LIMIT ?1");
     let mut stmt = conn.prepare(&sql)?;
     let rows = match tag {
         Some(t) => stmt
@@ -840,6 +895,184 @@ mod tests {
         .unwrap();
         assert_eq!(updated.title.as_deref(), Some("completely new body"));
         assert_ne!(updated.content_hash, old_hash);
+    }
+
+    fn created(conn: &Connection, text: &str) -> Node {
+        match remember_text(conn, text) {
+            RememberOutcome::Created(n) => n,
+            other => panic!("expected Created, got {other:?}"),
+        }
+    }
+
+    /// The exact pass and the near-duplicate pass used to disagree about a
+    /// retired memory: reworded, the fact was accepted; verbatim, it was
+    /// refused as a duplicate of something recall would never show.
+    #[test]
+    fn an_exact_copy_of_a_retired_memory_is_stored_as_new() {
+        let conn = db::open_in_memory().unwrap();
+
+        let old = created(&conn, "the staging database lives on host pg-stage-1");
+        let replacement = created(&conn, "staging moved to the managed cluster in march");
+        store::supersede(
+            &conn,
+            old.id,
+            replacement.id,
+            crate::model::Actor::Human,
+            None,
+        )
+        .unwrap();
+        let again = created(&conn, "the staging database lives on host pg-stage-1");
+        assert_ne!(again.id, old.id);
+
+        let lapsed = created(&conn, "the freeze lasts until the release is cut");
+        store::set_expiry(&conn, lapsed.id, Some(crate::model::now_unix() - 60), None).unwrap();
+        let again = created(&conn, "the freeze lasts until the release is cut");
+        assert_ne!(again.id, lapsed.id);
+
+        // A current copy still refuses, and it is the current one that is
+        // named — not the retired row that shares its hash.
+        match remember_text(&conn, "the freeze lasts until the release is cut") {
+            RememberOutcome::Duplicate(d) => assert_eq!(d.id, again.id),
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
+    fn revisions(conn: &Connection, id: i64) -> usize {
+        crate::revision::history(conn, id).unwrap().len()
+    }
+
+    fn ledger_rows(conn: &Connection, id: i64) -> usize {
+        crate::audit::history(conn, id).unwrap().len()
+    }
+
+    /// `mimir edit <ref> --pin` reaches `edit` with nothing to change. That
+    /// used to snapshot a revision identical to the live text, write an
+    /// `edit` row with equal hashes and bump `updated_at`.
+    #[test]
+    fn an_edit_that_changes_nothing_leaves_no_trace() {
+        let conn = db::open_in_memory().unwrap();
+        let node = created(&conn, "use WAL mode for concurrent readers");
+        conn.execute(
+            "UPDATE node SET updated_at = updated_at - 3600 WHERE id = ?1",
+            [node.id],
+        )
+        .unwrap();
+        let before = store::get_node(&conn, node.id).unwrap();
+
+        let same = [
+            Edit::default(),
+            Edit {
+                text: Some("use WAL mode for concurrent readers".into()),
+                title: before.title.clone(),
+                mtype: Some(MemoryType::Note),
+                tags: Some(vec![]),
+            },
+        ];
+        for unchanged in same {
+            let got = edit(&conn, node.id, unchanged, crate::model::Actor::Human, None).unwrap();
+            assert_eq!(got.updated_at, before.updated_at);
+            assert_eq!(got.content_hash, before.content_hash);
+        }
+        assert_eq!(revisions(&conn, node.id), 0);
+        assert_eq!(ledger_rows(&conn, node.id), 0);
+
+        // A real change still records itself.
+        edit(
+            &conn,
+            node.id,
+            Edit {
+                tags: Some(vec!["sqlite".into()]),
+                ..Default::default()
+            },
+            crate::model::Actor::Human,
+            None,
+        )
+        .unwrap();
+        assert_eq!(ledger_rows(&conn, node.id), 1);
+    }
+
+    /// Only a body edit re-derives the title. An edit that touches the tags
+    /// or the type must leave a title someone chose alone.
+    #[test]
+    fn an_edit_that_leaves_the_body_alone_keeps_the_title() {
+        let conn = db::open_in_memory().unwrap();
+        let node = created(&conn, "first line of the body\nsecond line");
+        let titled = edit(
+            &conn,
+            node.id,
+            Edit {
+                title: Some("a title someone chose".into()),
+                ..Default::default()
+            },
+            crate::model::Actor::Human,
+            None,
+        )
+        .unwrap();
+        assert_eq!(titled.title.as_deref(), Some("a title someone chose"));
+
+        let retagged = edit(
+            &conn,
+            node.id,
+            Edit {
+                tags: Some(vec!["ops".into()]),
+                mtype: Some(MemoryType::Gotcha),
+                ..Default::default()
+            },
+            crate::model::Actor::Human,
+            None,
+        )
+        .unwrap();
+        assert_eq!(retagged.title.as_deref(), Some("a title someone chose"));
+
+        let rewritten = edit(
+            &conn,
+            node.id,
+            Edit {
+                text: Some("a new first line\nand more".into()),
+                ..Default::default()
+            },
+            crate::model::Actor::Human,
+            None,
+        )
+        .unwrap();
+        assert_eq!(rewritten.title.as_deref(), Some("a new first line"));
+    }
+
+    /// The snapshot, the new text and the ledger row are one change. If the
+    /// previous wording cannot be kept, the edit must not land without it.
+    #[test]
+    fn an_edit_lands_whole_or_not_at_all() {
+        for broken in ["node_revision", "mutation"] {
+            let conn = db::open_in_memory().unwrap();
+            let node = created(&conn, "deploys go to eu-west-1");
+            conn.execute_batch(&format!(
+                "CREATE TEMP TRIGGER break_it BEFORE INSERT ON main.{broken}
+                 BEGIN SELECT RAISE(ABORT, 'simulated write failure'); END;"
+            ))
+            .unwrap();
+
+            let outcome = edit(
+                &conn,
+                node.id,
+                Edit {
+                    text: Some("deploys go to eu-north-1".into()),
+                    ..Default::default()
+                },
+                crate::model::Actor::Human,
+                None,
+            );
+
+            assert!(
+                outcome.is_err(),
+                "a failed {broken} write must fail the edit"
+            );
+            assert_eq!(
+                store::get_node(&conn, node.id).unwrap().body.as_deref(),
+                Some("deploys go to eu-west-1")
+            );
+            conn.execute_batch("DROP TRIGGER break_it").unwrap();
+            assert_eq!(revisions(&conn, node.id), 0);
+        }
     }
 
     #[test]

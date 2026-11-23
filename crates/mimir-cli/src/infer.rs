@@ -2,18 +2,31 @@
 //! no async runtime — the engine that calls this is sync).
 //!
 //! One `DaemonClient` is attached to a session's engine at startup (see
-//! `mcp::run`). Failure semantics are "degrade, never block": a transport
-//! error or unexpected status marks the daemon dead for a cooldown window
-//! (`available()` goes false, so the engine works locally at zero probe
-//! cost), a 503 backs off longer (the daemon has no model — that won't
-//! change soon), and a 401 or model mismatch disables delegation for the
-//! session outright (neither self-heals; retrying would spam a misconfig
-//! warning forever).
+//! `mcp::run`), and one more to each background engine that might embed.
+//! Each client carries its own state:
+//!
+//! ```text
+//!   Available ── transport error | unexpected status | unreadable body ──▶ Cooldown(60 s)
+//!   Available ── 503 (the daemon has no model) ──────────────────────────▶ Cooldown(300 s)
+//!   Cooldown  ── the window passes ──────────────────────────────────────▶ Available
+//!   any       ── 401 | the daemon serves other models ───────────────────▶ Disabled
+//! ```
+//!
+//! Failure semantics are "degrade, never block". During a cooldown
+//! `available()` is false, so the engine works locally at zero probe cost,
+//! and delegation resumes by itself when the window passes — there is no
+//! separate re-probe. `Disabled` does not self-heal (retrying would repeat
+//! a misconfiguration warning forever), but it belongs to the client, not
+//! to the process: a background engine opened later builds a new client
+//! and asks the daemon again.
+//!
+//! Where the daemon lives is [`DaemonAddr`], for every party that needs it.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use mimir_core::config::DaemonInference;
 use mimir_core::error::{Error, Result};
 use mimir_core::{Mimir, RemoteInference};
 use serde::Deserialize;
@@ -25,8 +38,102 @@ const DEAD_LONG: Duration = Duration::from_secs(300);
 /// Connect budget: the daemon is loopback; anything slower is "down".
 const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// Environment override for `[hooks] inject_url`, read wherever the
+/// daemon's address is needed (an empty value counts as unset).
+pub(crate) const INJECT_URL_ENV: &str = "MIMIR_INJECT_URL";
+
+/// Where the `mimir daemon` lives: its `/inject` URL, and the two forms
+/// derived from it.
+///
+/// One setting decides it, `[hooks] inject_url`, with `MIMIR_INJECT_URL` as
+/// the per-environment override. Every party derives the address here —
+/// the daemon's own bind (`mimir daemon`), the delegation client
+/// ([`DaemonClient`]) and `doctor`'s probe — so they cannot point at
+/// different ports. The hook script is the one reader outside this
+/// process; it spells the same rule in shell,
+/// `INJECT_URL="${MIMIR_INJECT_URL:-<configured>}"`, with
+/// [`DaemonAddr::configured`] baked in as the default at install time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DaemonAddr {
+    inject_url: String,
+    from_env: bool,
+}
+
+impl DaemonAddr {
+    /// The address in effect for this process: `MIMIR_INJECT_URL` when set,
+    /// `[hooks] inject_url` otherwise.
+    pub(crate) fn resolve(config: &mimir_core::config::Config) -> Self {
+        Self::from_parts(
+            Self::configured(config),
+            crate::sync::env_nonempty(INJECT_URL_ENV),
+        )
+    }
+
+    /// The configured layer alone: what the hook script falls back to when
+    /// its environment does not override it.
+    pub(crate) fn configured(config: &mimir_core::config::Config) -> &str {
+        &config.hooks.inject_url
+    }
+
+    /// [`DaemonAddr::resolve`] with the environment passed in.
+    pub(crate) fn from_parts(configured: &str, env_override: Option<String>) -> Self {
+        match env_override {
+            Some(url) => DaemonAddr {
+                inject_url: url,
+                from_env: true,
+            },
+            None => DaemonAddr {
+                inject_url: configured.to_string(),
+                from_env: false,
+            },
+        }
+    }
+
+    /// The full `/inject` URL (e.g. `http://127.0.0.1:8077/inject`).
+    pub(crate) fn inject_url(&self) -> &str {
+        &self.inject_url
+    }
+
+    /// The URL minus its `/inject` path: the prefix `/inference`, `/embed`
+    /// and `/rerank` hang off.
+    pub(crate) fn base(&self) -> String {
+        let trimmed = self.inject_url.trim_end_matches('/');
+        trimmed
+            .strip_suffix("/inject")
+            .unwrap_or(trimmed)
+            .to_string()
+    }
+
+    /// The bare `host:port` the daemon binds: scheme and path stripped.
+    pub(crate) fn bind(&self) -> anyhow::Result<String> {
+        let without_scheme = self
+            .inject_url
+            .split_once("://")
+            .map(|(_, rest)| rest)
+            .unwrap_or(&self.inject_url);
+        let host_port = without_scheme.split('/').next().unwrap_or("");
+        if host_port.is_empty() {
+            anyhow::bail!(
+                "{} `{}` has no host:port to bind to",
+                self.origin(),
+                self.inject_url
+            );
+        }
+        Ok(host_port.to_string())
+    }
+
+    /// Which layer the address came from, for messages about it.
+    pub(crate) fn origin(&self) -> &'static str {
+        if self.from_env {
+            INJECT_URL_ENV
+        } else {
+            "config.hooks.inject_url"
+        }
+    }
+}
+
 pub struct DaemonClient {
-    /// `hooks.inject_url` minus its `/inject` path.
+    /// [`DaemonAddr::base`].
     base: String,
     token: Option<String>,
     embed_model: String,
@@ -40,13 +147,8 @@ pub struct DaemonClient {
 
 impl DaemonClient {
     pub fn from_config(config: &mimir_core::config::Config) -> Self {
-        let trimmed = config.hooks.inject_url.trim_end_matches('/');
-        let base = trimmed
-            .strip_suffix("/inject")
-            .unwrap_or(trimmed)
-            .to_string();
         Self::new(
-            base,
+            DaemonAddr::resolve(config).base(),
             crate::mcp::http_token_from_env(),
             config.embedding.model.clone(),
             config.rerank.model.clone(),
@@ -70,7 +172,7 @@ impl DaemonClient {
     }
 
     /// `GET /inference`: is a daemon up, and does it serve OUR models?
-    /// A name mismatch disables delegation permanently — vectors from a
+    /// A name mismatch disables this client for good — vectors from a
     /// different embedder would silently poison the store.
     pub fn probe(&self) -> bool {
         #[derive(Deserialize)]
@@ -92,7 +194,8 @@ impl DaemonClient {
                             daemon_rerank = %info.rerank_model,
                             local_embed = %self.embed_model,
                             local_rerank = %self.rerank_model,
-                            "daemon serves different models; inference delegation disabled"
+                            "daemon serves different models; inference delegation disabled \
+                             for this client"
                         );
                         self.disabled.store(true, Ordering::Relaxed);
                         return false;
@@ -129,7 +232,8 @@ impl DaemonClient {
             ureq::Error::Status(401, _) => {
                 tracing::warn!(
                     "daemon rejected the bearer token (401); inference delegation \
-                     disabled for this session — check MIMIR_HTTP_TOKEN"
+                     disabled for this client — check MIMIR_HTTP_TOKEN (the disable is \
+                     per engine: a background engine opened later asks the daemon again)"
                 );
                 self.disabled.store(true, Ordering::Relaxed);
                 format!("daemon {what}: 401")
@@ -175,13 +279,14 @@ impl RemoteInference for DaemonClient {
             let resp = req
                 .send_json(serde_json::json!({ "texts": chunk }))
                 .map_err(|e| Error::Embed(self.on_error(&e, "embed")))?;
-            let resp: EmbedResponse = resp
-                .into_json()
-                .map_err(|e| Error::Embed(format!("daemon embed: bad response: {e}")))?;
+            let resp: EmbedResponse = resp.into_json().map_err(|e| {
+                self.mark_dead(self.dead_short);
+                Error::Embed(format!("daemon embed: bad response: {e}"))
+            })?;
             if resp.model != self.embed_model {
                 tracing::warn!(
                     daemon = %resp.model, local = %self.embed_model,
-                    "daemon embeds with a different model; delegation disabled"
+                    "daemon embeds with a different model; delegation disabled for this client"
                 );
                 self.disabled.store(true, Ordering::Relaxed);
                 return Err(Error::Embed("daemon embed: model mismatch".into()));
@@ -211,13 +316,14 @@ impl RemoteInference for DaemonClient {
         let resp = req
             .send_json(serde_json::json!({ "query": query, "docs": docs }))
             .map_err(|e| Error::Embed(self.on_error(&e, "rerank")))?;
-        let resp: RerankResponse = resp
-            .into_json()
-            .map_err(|e| Error::Embed(format!("daemon rerank: bad response: {e}")))?;
+        let resp: RerankResponse = resp.into_json().map_err(|e| {
+            self.mark_dead(self.dead_short);
+            Error::Embed(format!("daemon rerank: bad response: {e}"))
+        })?;
         if resp.model != self.rerank_model {
             tracing::warn!(
                 daemon = %resp.model, local = %self.rerank_model,
-                "daemon reranks with a different model; delegation disabled"
+                "daemon reranks with a different model; delegation disabled for this client"
             );
             self.disabled.store(true, Ordering::Relaxed);
             return Err(Error::Embed("daemon rerank: model mismatch".into()));
@@ -237,18 +343,16 @@ impl RemoteInference for DaemonClient {
 /// Attach delegation to an engine per `[daemon] inference`. Returns whether
 /// a live, model-compatible daemon answered the startup probe — callers use
 /// that to decide whether to eager-load a local reranker as the fallback.
-/// `"off"` (or an unknown value, warned) attaches nothing: pure-local.
+/// [`DaemonInference::Off`] (which an unrecognized value also is; the
+/// server's start-up log reports it once) attaches nothing: pure-local.
+///
+/// A failed probe still leaves the client attached, in its cooldown: the
+/// engine asks `available()` before every bulk embed and every rerank it
+/// has no resident model for, so delegation starts as soon as the daemon
+/// is back.
 pub fn attach(m: &mut Mimir) -> bool {
-    match m.config.daemon.inference.as_str() {
-        "auto" => {}
-        "off" => return false,
-        other => {
-            tracing::warn!(
-                inference = other,
-                "unknown [daemon] inference value; treating as off"
-            );
-            return false;
-        }
+    if m.config.daemon.inference() == DaemonInference::Off {
+        return false;
     }
     let client = DaemonClient::from_config(&m.config);
     let alive = client.probe();
@@ -260,8 +364,7 @@ pub fn attach(m: &mut Mimir) -> bool {
 /// (auto-sync ticks, startup maintenance) only touch the daemon when real
 /// work exists, so a per-engine probe would be pure overhead on the common
 /// nothing-pending tick. First-use failures take the client's normal
-/// cooldown path. Callers gate on `inference == "auto"` themselves (this
-/// runs on threads where a repeated unknown-value warn would just spam).
+/// cooldown path. Callers gate on [`DaemonInference::Auto`] themselves.
 pub fn attach_lazy(m: &mut Mimir) {
     let client = DaemonClient::from_config(&m.config);
     m.set_remote_inference(Box::new(client));
@@ -421,6 +524,70 @@ mod tests {
         let v = c.embed(&["hi".into()]).unwrap();
         assert_eq!(v, vec![vec![0.1, 0.2, 0.3, 0.4]]);
         assert!(c.available());
+    }
+
+    /// A 200 whose body is not the JSON we asked for is a daemon that
+    /// cannot help right now, in `embed` and `rerank` exactly as in
+    /// `probe`: cool down instead of paying a doomed round-trip per call.
+    #[test]
+    fn unparseable_success_body_starts_the_cooldown() {
+        let c = client_for(stub(200, "<html>proxy login</html>"));
+        assert!(c.embed(&["hi".into()]).is_err());
+        assert!(!c.available(), "embed: bad body must start the cooldown");
+        assert!(
+            !c.disabled.load(Ordering::Relaxed),
+            "a cooldown, not a disable"
+        );
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(c.available(), "and it must end");
+
+        let c = client_for(stub(200, "{\"model\": 7}"));
+        assert!(c.rerank("q", &["a".into()]).is_err());
+        assert!(!c.available(), "rerank: bad body must start the cooldown");
+
+        let c = client_for(stub(200, "[]"));
+        assert!(!c.probe());
+        assert!(!c.available(), "probe: bad body starts the cooldown");
+    }
+
+    #[test]
+    fn daemon_address_is_the_config_value_unless_the_environment_overrides_it() {
+        let configured = DaemonAddr::from_parts("http://127.0.0.1:8077/inject", None);
+        assert_eq!(configured.inject_url(), "http://127.0.0.1:8077/inject");
+        assert_eq!(configured.base(), "http://127.0.0.1:8077");
+        assert_eq!(configured.bind().unwrap(), "127.0.0.1:8077");
+        assert_eq!(configured.origin(), "config.hooks.inject_url");
+
+        let overridden = DaemonAddr::from_parts(
+            "http://127.0.0.1:8077/inject",
+            Some("http://127.0.0.1:9100/inject/".into()),
+        );
+        assert_eq!(overridden.base(), "http://127.0.0.1:9100");
+        assert_eq!(overridden.bind().unwrap(), "127.0.0.1:9100");
+        assert_eq!(overridden.origin(), INJECT_URL_ENV);
+
+        // The script template bakes in the configured layer only; the
+        // override is the shell's to apply when the hook runs.
+        let mut config = mimir_core::config::Config::default();
+        config.hooks.inject_url = "http://10.0.0.5:9999/inject".into();
+        assert_eq!(
+            DaemonAddr::configured(&config),
+            "http://10.0.0.5:9999/inject"
+        );
+    }
+
+    #[test]
+    fn daemon_address_without_a_host_cannot_be_bound() {
+        for url in ["", "http://", "/inject"] {
+            let addr = DaemonAddr::from_parts(url, None);
+            let err = addr.bind().unwrap_err().to_string();
+            assert!(err.contains("config.hooks.inject_url"), "{url:?}: {err}");
+        }
+        let err = DaemonAddr::from_parts("http://127.0.0.1:8077/inject", Some("http://".into()))
+            .bind()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(INJECT_URL_ENV), "{err}");
     }
 
     #[test]

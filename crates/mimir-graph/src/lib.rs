@@ -12,27 +12,59 @@
 // call sites are unaffected.
 pub use mimir_syntax::{extract, languages};
 
+mod imports;
+pub mod prune;
 pub mod queries;
+pub mod render;
+pub mod state;
 pub mod store_graph;
+pub mod tier;
 
 use mimir_core::error::{Error, Result};
 use mimir_core::model::Node;
 use mimir_core::store::{self, row_to_node, NODE_COLS};
 use rusqlite::Connection;
 
-pub use queries::CodeGraph;
-pub use store_graph::{check, update, Drift, GraphStats};
+pub use prune::{missing_projects, prune_graph, prune_graph_toward, MissingProject, Pruned};
+pub use queries::{CodeGraph, Impact, ImpactHit, ImpactTrace, Traced};
+pub use state::{
+    graph_built_at, graph_rules, graphed_projects, has_graph, rules_note, wants_full_rebuild,
+    AUTO_FULL_MAX_FILES, AUTO_FULL_MAX_SYMBOLS, GRAPH_RULES,
+};
+pub use store_graph::{
+    check, file_is_current, freshness, update, update_with, Drift, Freshness, GraphStats,
+    UpdateOptions, UpdateReport,
+};
+pub use tier::CallTier;
 
 /// Resolve a symbol by short id, exact qualified name, or bare name.
 /// Bare-name matches must be unique; ambiguity lists the candidates as
 /// `symbol_line`s (id, path, span) so the caller can pick one by id: a bare
 /// list of names ("tessellate, tessellate") gives nothing to retry with.
+///
+/// Either way the symbol is one of `project_id`'s. An id is global, so it
+/// can name a symbol of another project; that symbol is in a graph this
+/// query will not load, and returning it produced "no callers found" about
+/// a symbol that has callers. It is an error that says where the symbol
+/// lives instead.
 pub fn resolve_symbol(conn: &Connection, project_id: i64, reference: &str) -> Result<Node> {
     /// Candidates shown in an ambiguity error; the count reported is the true total.
     const SHOWN: usize = 6;
     if let Ok(node) = store::resolve_ref(conn, reference) {
         if matches!(node.kind, mimir_core::model::Kind::Symbol) {
-            return Ok(node);
+            if node.project_id == Some(project_id) {
+                return Ok(node);
+            }
+            let owner = node
+                .project_id
+                .and_then(|id| store::get_node(conn, id).ok())
+                .and_then(|p| p.title)
+                .map(|title| format!("project {title}"))
+                .unwrap_or_else(|| "another project".to_string());
+            return Err(Error::Invalid(format!(
+                "{} belongs to {owner} — run this from that checkout",
+                mimir_core::model::short_uid(node.kind, &node.uid)
+            )));
         }
     }
     let filter = "FROM node
@@ -77,6 +109,21 @@ pub fn symbol_line(node: &Node) -> String {
         node.path.as_deref().unwrap_or("?"),
         node.title.as_deref().unwrap_or("?")
     )
+}
+
+/// One line for an [`ImpactHit`]: [`symbol_line`] for a symbol, and for a
+/// file that depends on the change only through an import, its path and why
+/// it is listed.
+pub fn impact_line(hit: &ImpactHit) -> String {
+    match hit.node.kind {
+        mimir_core::model::Kind::Symbol => symbol_line(&hit.node),
+        _ => format!(
+            "{} [file {}] {} (reached by import only)",
+            mimir_core::model::short_uid(hit.node.kind, &hit.node.uid),
+            hit.node.lang.as_deref().unwrap_or("?"),
+            hit.node.path.as_deref().unwrap_or("?")
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -447,6 +494,212 @@ mod tests {
             graph.callers(target.id, 2).iter().any(|r| r.id == go.id),
             "the global-by-name tier still links it"
         );
+    }
+
+    /// `impact` has three answers and they need three different sentences.
+    /// "Nothing depends on these files" is an all-clear; "these files are
+    /// not in the graph" is the opposite of one. Each surface used to
+    /// re-derive the answer from whichever list came back empty, and the
+    /// path lookup ran across every project on the machine — so a path that
+    /// existed only in a *different* project produced seeds, the traversal
+    /// found nothing, and the caller was told there was no impact.
+    #[test]
+    fn impact_separates_not_in_graph_from_no_dependents() {
+        let (dir, mut mimir, proj) = setup();
+        update(&mut mimir.conn, &proj, dir.path()).unwrap();
+
+        let other_dir = tempfile::tempdir().unwrap();
+        write(
+            other_dir.path(),
+            "src/only_there.rs",
+            "pub fn elsewhere() {}\n",
+        );
+        let other = store::ensure_project(
+            &mimir.conn,
+            &other_dir.path().to_string_lossy(),
+            "other-proj",
+        )
+        .unwrap();
+        update(&mut mimir.conn, &other, other_dir.path()).unwrap();
+
+        let graph = CodeGraph::load(&mimir.conn, proj.id).unwrap();
+        let ask = |path: &str| graph.impact_of_paths(&mimir.conn, &[path.to_string()], 3);
+
+        // run() calls slugify(), and main() calls run().
+        match ask("src/util.rs").unwrap() {
+            Impact::Reached(hits) => {
+                let names: Vec<_> = hits
+                    .iter()
+                    .map(|h| (h.node.title.clone().unwrap_or_default(), h.distance))
+                    .collect();
+                assert_eq!(names, [("run".to_string(), 1), ("main".to_string(), 2)]);
+            }
+            other => panic!("util.rs has callers, got {other:?}"),
+        }
+        // A leading `./` is how some tools print a path.
+        assert!(matches!(ask("./src/util.rs").unwrap(), Impact::Reached(_)));
+        // Nothing calls into main.rs: in the graph, no dependents.
+        assert!(matches!(ask("src/main.rs").unwrap(), Impact::Contained));
+        // Not a file anywhere.
+        assert!(matches!(ask("src/nope.rs").unwrap(), Impact::NotInGraph));
+        // A file of another project is not in THIS graph, and must not read
+        // as "no impact".
+        assert!(matches!(
+            ask("src/only_there.rs").unwrap(),
+            Impact::NotInGraph
+        ));
+    }
+
+    /// A file of constants has no symbol anyone calls, so the only trace of
+    /// a dependent is the `imports` edge. Reporting "no impact" for it is the
+    /// false all-clear this type exists to prevent.
+    #[test]
+    fn impact_lists_a_file_reached_by_import_only() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing calls the fn: the file is reached by the import alone.
+        write(
+            dir.path(),
+            "src/limits.rs",
+            "pub const MAX: u8 = 9;\n\npub fn unused() {}\n",
+        );
+        write(
+            dir.path(),
+            "src/main.rs",
+            "use crate::limits::MAX;\n\nfn main() { let _ = MAX; }\n",
+        );
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        let proj = project(&mimir.conn, dir.path());
+        let stats = update(&mut mimir.conn, &proj, dir.path()).unwrap();
+        assert!(stats.imports >= 1, "{stats:?}");
+
+        let graph = CodeGraph::load(&mimir.conn, proj.id).unwrap();
+        match graph
+            .impact_of_paths(&mimir.conn, &["src/limits.rs".to_string()], 3)
+            .unwrap()
+        {
+            Impact::Reached(hits) => {
+                assert_eq!(hits.len(), 1, "{hits:?}");
+                assert_eq!(hits[0].node.kind, mimir_core::model::Kind::File);
+                let line = impact_line(&hits[0]);
+                assert!(line.contains("src/main.rs"), "{line}");
+                assert!(line.contains("reached by import only"), "{line}");
+            }
+            other => panic!("main.rs imports limits.rs, got {other:?}"),
+        }
+        // When a symbol of the importing file IS reached, it speaks for the
+        // file: `setup()` has main.rs calling into util.rs.
+        let (dir, mut mimir, proj) = setup();
+        update(&mut mimir.conn, &proj, dir.path()).unwrap();
+        let graph = CodeGraph::load(&mimir.conn, proj.id).unwrap();
+        match graph
+            .impact_of_paths(&mimir.conn, &["src/util.rs".to_string()], 3)
+            .unwrap()
+        {
+            Impact::Reached(hits) => assert!(
+                hits.iter()
+                    .all(|h| h.node.kind == mimir_core::model::Kind::Symbol),
+                "{hits:?}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A docs file the project has indexed is known, and has no dependents:
+    /// a docs-only diff is an all-clear, not "run `graph build`". The same
+    /// file name indexed by a different project is still not ours.
+    #[test]
+    fn impact_on_an_indexed_docs_file_is_contained_not_missing() {
+        let (dir, mut mimir, proj) = setup();
+        write(dir.path(), "README.md", "# Probe\n\nSome words.\n");
+        update(&mut mimir.conn, &proj, dir.path()).unwrap();
+        let docs = mimir_core::index::add_collection(
+            &mimir.conn,
+            dir.path(),
+            "probe",
+            Some(proj.id),
+            "docs",
+        )
+        .unwrap();
+        mimir_core::index::index_collection(&mut mimir.conn, &docs).unwrap();
+
+        let other_dir = tempfile::tempdir().unwrap();
+        write(other_dir.path(), "NOTES.md", "# Theirs\n\nOther words.\n");
+        write(other_dir.path(), "src/x.rs", "pub fn x() {}\n");
+        let other = store::ensure_project(
+            &mimir.conn,
+            &other_dir.path().to_string_lossy(),
+            "other-proj",
+        )
+        .unwrap();
+        update(&mut mimir.conn, &other, other_dir.path()).unwrap();
+        let theirs = mimir_core::index::add_collection(
+            &mimir.conn,
+            other_dir.path(),
+            "theirs",
+            Some(other.id),
+            "docs",
+        )
+        .unwrap();
+        mimir_core::index::index_collection(&mut mimir.conn, &theirs).unwrap();
+
+        let graph = CodeGraph::load(&mimir.conn, proj.id).unwrap();
+        let ask = |path: &str| graph.impact_of_paths(&mimir.conn, &[path.to_string()], 3);
+        assert!(matches!(ask("README.md").unwrap(), Impact::Contained));
+        assert!(matches!(ask("NOTES.md").unwrap(), Impact::NotInGraph));
+        // A docs file beside a code file does not hide the code's impact.
+        assert!(matches!(
+            graph
+                .impact_of_paths(
+                    &mimir.conn,
+                    &["README.md".to_string(), "src/util.rs".to_string()],
+                    3
+                )
+                .unwrap(),
+            Impact::Reached(_)
+        ));
+    }
+
+    /// The path lookup is capped, and the cap used to apply across every
+    /// project before any project filter — so on a machine with a few repos
+    /// that all have a `src/util.rs`, this project's own file could be cut
+    /// off and reported as missing from its own graph.
+    #[test]
+    fn impact_finds_this_projects_file_however_many_projects_share_the_path() {
+        let mimir_dirs: Vec<_> = (0..4).map(|_| tempfile::tempdir().unwrap()).collect();
+        let mut mimir = Mimir::open_in_memory().unwrap();
+        // The other projects go in first, so their rows precede ours.
+        for (i, d) in mimir_dirs.iter().enumerate() {
+            write(d.path(), "src/util.rs", "pub fn unrelated() {}\n");
+            let p = store::ensure_project(
+                &mimir.conn,
+                &d.path().to_string_lossy(),
+                &format!("other-{i}"),
+            )
+            .unwrap();
+            update(&mut mimir.conn, &p, d.path()).unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/util.rs", "pub fn slugify() {}\n");
+        write(
+            dir.path(),
+            "src/main.rs",
+            "use crate::util::slugify;\n\nfn main() { slugify(); }\n",
+        );
+        let proj = project(&mimir.conn, dir.path());
+        update(&mut mimir.conn, &proj, dir.path()).unwrap();
+
+        let graph = CodeGraph::load(&mimir.conn, proj.id).unwrap();
+        match graph
+            .impact_of_paths(&mimir.conn, &["src/util.rs".to_string()], 3)
+            .unwrap()
+        {
+            Impact::Reached(hits) => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].node.title.as_deref(), Some("main"));
+                assert_eq!(hits[0].node.project_id, Some(proj.id));
+            }
+            other => panic!("main() calls slugify(), got {other:?}"),
+        }
     }
 
     #[test]

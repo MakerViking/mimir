@@ -57,9 +57,28 @@ fn normalise(query: &str) -> String {
         .to_lowercase()
 }
 
+/// Whether one explicit recall may feed the ledger at all. The one gate both
+/// recall surfaces ask before calling [`observe`].
+///
+/// The ledger is about the store as it stands, asked plainly. So, besides
+/// the `[learn] log_misses` switch, a recall is left out when it looked at
+/// something else:
+///
+/// - `since` or `as_of`: a time-sliced view. Finding nothing in the last
+///   week, or nothing as of March, is not the store lacking an answer.
+/// - `include_superseded`: a view into history. A strong hit on a retired
+///   memory is not an answer recall would give, so it must not resolve the
+///   question — and for symmetry such a page does not open one either.
+///
+/// A kind filter and `--min-score` do not disqualify a recall: the page is
+/// judged as retrieved, and "no doc answers this" is still a gap.
+pub fn should_observe(log_misses: bool, query: &crate::search::SearchQuery) -> bool {
+    log_misses && query.since.is_none() && query.as_of.is_none() && !query.include_superseded
+}
+
 /// Record what one explicit recall page says about the store: a miss bumps
 /// (or reopens) the query's row, an answer resolves it. The single entry
-/// point both recall surfaces call.
+/// point both recall surfaces call, once [`should_observe`] allows it.
 ///
 /// Never writes a query the secrets scanner flags — the ledger keeps text,
 /// and a secret pasted into a search box must not become the one copy of it
@@ -223,6 +242,44 @@ mod tests {
     use MatchStrength::{Strong, Weak};
 
     const T: i64 = 1_700_000_000;
+
+    /// The gate, one flag at a time: each view that is not "the store as it
+    /// stands, asked plainly" is refused on its own.
+    #[test]
+    fn only_a_plain_recall_of_the_present_store_feeds_the_ledger() {
+        let plain = crate::search::SearchQuery {
+            text: "hub token rotation".into(),
+            scope: Scope::All,
+            kinds: vec![],
+            since: None,
+            limit: 8,
+            strength_alpha: 0.0,
+            recency_alpha: 0.0,
+            type_prior_alpha: 0.0,
+            code_damp: 1.0,
+            include_superseded: false,
+            as_of: None,
+        };
+        assert!(should_observe(true, &plain));
+        assert!(!should_observe(false, &plain), "`log_misses = false`");
+
+        let mut since = plain.clone();
+        since.since = Some(T);
+        assert!(!should_observe(true, &since), "--since");
+
+        let mut as_of = plain.clone();
+        as_of.as_of = Some(T);
+        assert!(!should_observe(true, &as_of), "--as-of");
+
+        let mut history = plain.clone();
+        history.include_superseded = true;
+        assert!(!should_observe(true, &history), "--include-superseded");
+
+        // A narrower kind is still a question to the present store.
+        let mut docs = plain.clone();
+        docs.kinds = vec![crate::model::Kind::Chunk];
+        assert!(should_observe(true, &docs));
+    }
 
     #[test]
     fn a_repeated_miss_is_one_row_counted_twice_regardless_of_case_and_spacing() {

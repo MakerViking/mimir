@@ -32,6 +32,10 @@ pub struct Peeked {
     /// Node id of the resolved symbol, so callers can record the access
     /// without resolving it a second time.
     pub symbol_id: i64,
+    /// One line to show after the body when the file was edited since the
+    /// graph stored this symbol's line numbers, so the lines above may not
+    /// be the symbol. `None` when the file is as indexed.
+    pub stale_note: Option<String>,
 }
 
 /// Build a signature map for `target` (a file or directory, relative to
@@ -302,6 +306,17 @@ pub fn peek_symbol(
         std::fs::read_to_string(&file).with_context(|| format!("reading {}", file.display()))?;
 
     let before = tokens::count(&src);
+    // The slice below trusts line numbers stored at the last build. If the
+    // file has been edited since, they may point at other lines; the body is
+    // still returned (it is usually close), with a line saying so. Read-only,
+    // and a failed comparison is no reason to fail the peek.
+    let stale_note = match mimir_graph::file_is_current(conn, project_id, root, &rel) {
+        Ok(Some(false)) => Some(format!(
+            "note: {rel} changed since the code graph was built — these lines may be off; \
+             run `mimir graph build`"
+        )),
+        _ => None,
+    };
     // 1-based inclusive lines → slice. Clamp defensively if the file shifted.
     let lines: Vec<&str> = src.lines().collect();
     let lo = start.saturating_sub(1).min(lines.len());
@@ -316,6 +331,7 @@ pub fn peek_symbol(
         tokens_after: after,
         path: rel,
         symbol_id: sym.id,
+        stale_note,
     })
 }
 
@@ -383,6 +399,10 @@ pub fn peek(reference: &str, json: bool) -> Result<()> {
     // Reading one symbol is a genuine access — feed the learning signal
     // (peek_symbol already resolved it; no second lookup).
     let _ = mimir_core::learn::record_opened(&mimir.conn, p.symbol_id);
+    // On stderr in both output modes, so stdout stays the body (or the JSON).
+    if let Some(note) = &p.stale_note {
+        eprintln!("{note}");
+    }
 
     if json {
         println!(

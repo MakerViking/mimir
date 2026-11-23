@@ -9,9 +9,15 @@ use crate::languages::Lang;
 pub struct SymbolDef {
     /// Bare name (resolution bucket), e.g. "resolve_ref".
     pub name: String,
-    /// Nesting-qualified, e.g. "MatrixCache::ensure" / "ClassName.method".
+    /// Nesting-qualified with [`SCOPE_SEP`] in every language, e.g.
+    /// "MatrixCache::ensure".
     pub qualified: String,
-    /// function | method | struct | class | trait | enum | interface | type
+    /// What `Lang::definition` called it: function | method | constructor |
+    /// struct | class | object | trait | interface | enum | type | property |
+    /// module | namespace | table | view | procedure. Not every language
+    /// emits every kind, and a `function` found inside any enclosing scope is
+    /// stored as `method`. The string is part of the symbol's stored
+    /// identity, so renaming one re-keys every symbol that carries it.
     pub kind: &'static str,
     /// Signature line(s) — what gets embedded alongside the doc comment.
     pub signature: String,
@@ -63,17 +69,58 @@ pub struct FileExtract {
     pub bindings: Vec<Binding>,
 }
 
-pub fn extract(lang: Lang, source: &str) -> FileExtract {
+/// Separator between the segments of a qualified name, the same in every
+/// language: `Type::method`, `module::function`. The extractor joins scopes
+/// with it and the graph's resolver splits on it, so it has one spelling.
+pub const SCOPE_SEP: &str = "::";
+
+/// Why a file produced no extraction at all. Distinct from a file that parsed
+/// and simply defines nothing: that is an empty [`FileExtract`], and it means
+/// "this file has no symbols", which a caller may act on. A failure means
+/// "nothing is known about this file", and acting on it as if it were empty
+/// would erase whatever was known before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExtractError {
+    /// The tree-sitter runtime refused the language's grammar (an ABI
+    /// mismatch between the runtime and the grammar crate).
+    Grammar,
+    /// The parser returned no tree.
+    Parse,
+}
+
+impl std::fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ExtractError::Grammar => "the parser rejected the language grammar",
+            ExtractError::Parse => "the parser returned no syntax tree",
+        })
+    }
+}
+
+impl std::error::Error for ExtractError {}
+
+/// Extract a file's symbols, calls, imports and bindings, or say that the
+/// parser could not run. Source with syntax errors still extracts (tree-sitter
+/// recovers and the walk takes what it finds); `Err` is the parser itself
+/// failing.
+pub fn try_extract(lang: Lang, source: &str) -> Result<FileExtract, ExtractError> {
     let mut parser = Parser::new();
     if parser.set_language(&lang.language()).is_err() {
-        return FileExtract::default();
+        return Err(ExtractError::Grammar);
     }
     let Some(tree) = parser.parse(source, None) else {
-        return FileExtract::default();
+        return Err(ExtractError::Parse);
     };
     let mut out = FileExtract::default();
     walk(lang, tree.root_node(), source, &mut Vec::new(), &mut out);
-    out
+    Ok(out)
+}
+
+/// [`try_extract`] for callers that only render what they get (an outline,
+/// a chunker): a parser failure reads as a file with nothing in it. Anything
+/// that *stores* the result must use [`try_extract`] instead.
+pub fn extract(lang: Lang, source: &str) -> FileExtract {
+    try_extract(lang, source).unwrap_or_default()
 }
 
 /// Recursive walk keeping a stack of enclosing definition names.
@@ -98,7 +145,7 @@ fn walk(lang: Lang, node: Node, src: &str, scope: &mut Vec<String>, out: &mut Fi
             kind,
         });
         // Push the name as returned (it may carry a `::` receiver prefix,
-        // e.g. Go methods) so scope.join("::") == qualified for children.
+        // e.g. Go methods) so scope.join(SCOPE_SEP) == qualified for children.
         scope.push(name);
         pushed = true;
     } else if let Some(scope_name) = lang.scope_only(node, src) {
@@ -144,13 +191,13 @@ fn qualify(scope: &[String], name: &str) -> String {
     if scope.is_empty() {
         name.to_string()
     } else {
-        format!("{}::{name}", scope.join("::"))
+        format!("{}{SCOPE_SEP}{name}", scope.join(SCOPE_SEP))
     }
 }
 
 fn qualified_tail(qualified: &str) -> String {
     qualified
-        .rsplit("::")
+        .rsplit(SCOPE_SEP)
         .next()
         .unwrap_or(qualified)
         .to_string()
@@ -198,6 +245,23 @@ mod tests {
                     .map(|r| (c.caller.as_str(), r, c.callee.as_str()))
             })
             .collect()
+    }
+
+    /// Source that does not compile still parses: tree-sitter recovers and
+    /// the walk takes what it finds. `Err` is the parser not running at all,
+    /// which no input causes — so broken, and even empty, source is `Ok`.
+    #[test]
+    fn try_extract_is_ok_for_broken_source_and_agrees_with_extract() {
+        let src = "fn fine() {}\nfn broken( {{{\n";
+        let fx = try_extract(Lang::Rust, src).expect("a syntax error is not a parser failure");
+        assert!(
+            names(&fx).contains(&("fine", "function")),
+            "{:?}",
+            names(&fx)
+        );
+        assert_eq!(names(&extract(Lang::Rust, src)), names(&fx));
+        assert!(try_extract(Lang::Rust, "").unwrap().symbols.is_empty());
+        assert_eq!(SCOPE_SEP, Lang::Rust.separator());
     }
 
     #[test]
@@ -629,7 +693,8 @@ namespace app {
             .map(|i| (i.local.as_str(), i.source.as_str()))
             .collect();
         assert!(imports.contains(&("util", "util.h")), "{imports:?}");
-        assert!(imports.contains(&("vector", "vector")), "{imports:?}");
+        // `<vector>` is a system header: not something a project file can be.
+        assert_eq!(imports.len(), 1, "{imports:?}");
     }
 
     #[test]

@@ -12,6 +12,13 @@
 //! existing, so "this memory is about `retry_with_backoff`" becomes checkable
 //! by looking, and stops being true the moment the symbol is deleted.
 //!
+//! For a code symbol that soft-delete is a decision `graph build` makes
+//! because of the link: a removed symbol nothing points at is derived data
+//! and is deleted outright, while one with a memory linked to it is kept as
+//! a tombstone (`mimir_graph::store_graph`), precisely so the link survives
+//! to be read here. If the symbol comes back under the same name and kind,
+//! the same row is revived and the memory is grounded again.
+//!
 //! [`Grounding::Stale`] is that check failing — the memory still claims to be
 //! about something the codebase no longer has. It does **not** mean the
 //! memory is wrong; a note about a function that was renamed is usually still
@@ -39,8 +46,9 @@ pub enum Grounding {
     /// Linked to an artifact that is still indexed.
     Grounded { kind: Kind, label: String },
     /// Linked to an artifact that has since been soft-deleted — the file
-    /// left the collection, or the symbol went away on the last
-    /// `graph build`. The claim was checked and it failed.
+    /// left the collection, or the symbol went away on a `graph build`
+    /// (removed from its file, or along with it). The claim was checked and
+    /// it failed.
     Stale { kind: Kind, label: String },
     /// No link to anything checkable: a free-standing assertion, trusted
     /// entirely because someone wrote it down.

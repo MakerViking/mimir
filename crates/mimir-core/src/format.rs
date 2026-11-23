@@ -8,7 +8,7 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::memory::tokens;
-use crate::model::{short_uid, Node};
+use crate::model::{short_uid, Kind, Node, Validity};
 use crate::search::fts::is_stopword;
 use crate::store;
 
@@ -294,7 +294,7 @@ pub fn agent_line_for_query(
     marks: HitMarks,
 ) -> String {
     let id = short_uid(node.kind, &node.uid);
-    let tag = node.subkind.as_deref().unwrap_or(node.kind.as_str());
+    let tag = node.type_label();
     let scope = project.map(|p| format!(" pr:{p}")).unwrap_or_default();
     let date = month_day(node.created_at);
     let uses = if node.access_count > 0 {
@@ -312,10 +312,11 @@ pub fn agent_line_for_query(
         Some(crate::model::MemoryConfidence::Unsure) => " unsure",
         _ => "",
     };
-    // Only a *closed* validity interval reaches this line, on the same
-    // reasoning as `doubt`: "no longer current" changes what an agent should
-    // do with the fact, while an open interval says only what every
-    // undeclared memory already implies.
+    // Only an interval `now` falls outside of reaches this line — closed,
+    // or not yet begun — on the same reasoning as `doubt`: "no longer
+    // current" and "not current yet" change what an agent should do with
+    // the fact, while an open interval says only what every undeclared
+    // memory already implies.
     //
     // The **year**, not the full date, and that is a measured call rather
     // than a guess. Against the bundled tokenizer, " until 2024-06-30" costs
@@ -331,12 +332,38 @@ pub fn agent_line_for_query(
     // self-consistent. Same reason `month_day` drops the year for
     // `created_at` and this keeps it: they are opposite axes, and the one
     // being flagged is the one the rest of the line does not already imply.
-    let validity = if node.validity_closed(crate::model::now_unix()) {
-        node.valid_to()
+    //
+    // A fact recorded ahead of its start gets the mirror image, " from
+    // 2027", for the same price and the same reason: without it the line
+    // states as current something its author said is not true yet.
+    let now = crate::model::now_unix();
+    let validity = match node.validity(now) {
+        Validity::Closed => node
+            .valid_to()
             .map(|to| format!(" until {}", year_of(to)))
-            .unwrap_or_default()
-    } else {
-        String::new()
+            .unwrap_or_default(),
+        Validity::NotYet => node
+            .valid_from()
+            .map(|from| format!(" from {}", year_of(from)))
+            .unwrap_or_default(),
+        Validity::Open | Validity::Undeclared => String::new(),
+    };
+    // The memory's lifecycle state, when it is anything but live — same
+    // asymmetry as `doubt`: the ordinary case goes unsaid and costs nothing.
+    // A retired or tombstoned memory only reaches a line when history was
+    // asked for (`--include-superseded`, `--as-of`, `list`, a refusal that
+    // quotes the tombstone), and there it used to print exactly like a live
+    // one, leaving the reader to act on a fact its author had withdrawn.
+    //
+    // Memories only: a doc chunk or symbol is removed by a reindex, nobody
+    // "forgot" it, and those lines are left as they were.
+    let state = match node.kind {
+        Kind::Memory => node
+            .lifecycle(now)
+            .label()
+            .map(|l| format!(" {l}"))
+            .unwrap_or_default(),
+        _ => String::new(),
     };
     // Same reasoning as `doubt`, and the reason this is worth a parameter
     // rather than a lookup: recall is where an agent decides what to act
@@ -356,7 +383,7 @@ pub fn agent_line_for_query(
     // one ~55%.
     let weak = if marks.weak_match { " weak" } else { "" };
     let mut line =
-        format!("{id} [{tag}{scope} {date}{uses}{doubt}{validity}{stale}{weak}] {title}");
+        format!("{id} [{tag}{scope} {date}{uses}{state}{doubt}{validity}{stale}{weak}] {title}");
     if let Some(body) = node.body.as_deref() {
         let flat = collapse_ws(body);
         let stems = query.map(query_stems).unwrap_or_default();
@@ -384,6 +411,75 @@ pub fn agent_line_for_query(
     line
 }
 
+/// How the node at the far end of an edge is named in a list of links: its
+/// id and title, plus a retired memory's state in brackets.
+///
+/// `None` for a memory that was forgotten or archived. A link is one more
+/// way to reach a node, and a tombstone must not surface through it: the
+/// arrow lists used to print the title of a deliberately deleted memory to
+/// anyone who opened something it had been linked to. Everything that is not
+/// a memory is named exactly as before.
+pub fn link_target_label(other: &Node) -> Option<String> {
+    let name = format!(
+        "{} {}",
+        short_uid(other.kind, &other.uid),
+        other.title.as_deref().unwrap_or("")
+    );
+    if other.kind != Kind::Memory {
+        return Some(name);
+    }
+    let state = other.lifecycle(crate::model::now_unix());
+    if state.is_tombstoned() {
+        return None;
+    }
+    Some(match state.label() {
+        Some(label) => format!("{name} [{label}]"),
+        None => name,
+    })
+}
+
+/// One sentence saying why a memory is not current truth, or `None` when it
+/// is ([`crate::lifecycle::Lifecycle::Live`]) or when `node` is not a memory.
+///
+/// Each arm says what the state means for the reader, not just its name:
+/// whether the text is history or a deletion, and how it got there.
+pub fn lifecycle_status(conn: &Connection, node: &Node) -> Option<String> {
+    use crate::lifecycle::Lifecycle;
+    if node.kind != Kind::Memory {
+        return None;
+    }
+    const HISTORY: &str = "kept as history; recall hides it unless asked";
+    let deleted = || node.deleted_at.map(full_date).unwrap_or_default();
+    match node.lifecycle(crate::model::now_unix()) {
+        Lifecycle::Live => None,
+        Lifecycle::Superseded => {
+            // Named the way any link target is: a replacement that was
+            // itself retired says so, and one that was since forgotten is
+            // not named at all.
+            let by = node
+                .superseded_by
+                .and_then(|id| store::get_node(conn, id).ok())
+                .and_then(|n| link_target_label(&n))
+                .map(|label| format!(" by {}", label.trim_end()))
+                .unwrap_or_default();
+            Some(format!("superseded{by} — {HISTORY}"))
+        }
+        Lifecycle::Expired => Some(format!(
+            "expired {} — {HISTORY}",
+            node.expires_at().map(full_date).unwrap_or_default()
+        )),
+        Lifecycle::Archived => Some(format!(
+            "archived {} — decayed while idle; nobody deleted it, and \
+             `remember` will take it back",
+            deleted()
+        )),
+        Lifecycle::Forgotten => Some(format!(
+            "forgotten {} — deleted on purpose; `remember` refuses it without --force",
+            deleted()
+        )),
+    }
+}
+
 /// Multi-line full record: header, title, body, tags, edges.
 pub fn full_record(
     conn: &Connection,
@@ -394,20 +490,26 @@ pub fn full_record(
         .project_id
         .and_then(|id| projects.get(&id))
         .map(String::as_str);
-    let mut out = format!(
-        "{} {}",
-        short_uid(node.kind, &node.uid),
-        node.subkind.as_deref().unwrap_or(node.kind.as_str())
-    );
+    let mut out = format!("{} {}", short_uid(node.kind, &node.uid), node.type_label());
     if let Some(p) = project {
         out.push_str(&format!(" pr:{p}"));
     }
     out.push_str(&format!(" created {}", full_date(node.created_at)));
-    if node.updated_at != node.created_at {
+    // Compared as the dates that are printed, not to the second: capture
+    // attaches an expiry or an anchor in a statement of its own, and one
+    // that lands on the next clock second would otherwise print a brand-new
+    // memory as "created D updated D".
+    if full_date(node.updated_at) != full_date(node.created_at) {
         out.push_str(&format!(" updated {}", full_date(node.updated_at)));
     }
     if node.access_count > 0 {
         out.push_str(&format!(" ↑{}", node.access_count));
+    }
+    // First thing after the header, ahead of the text: if this memory is no
+    // longer current truth, the reader should know before reading it, not
+    // after. Prints nothing for a live memory, which is nearly all of them.
+    if let Some(status) = lifecycle_status(conn, node) {
+        out.push_str(&format!("\n! {status}"));
     }
     if let Some(t) = &node.title {
         out.push('\n');
@@ -435,13 +537,11 @@ pub fn full_record(
         } else {
             ("←", edge.src)
         };
-        if let Ok(other) = store::get_node(conn, other_id) {
-            out.push_str(&format!(
-                "\n{arrow} {} {} {}",
-                edge.rel,
-                short_uid(other.kind, &other.uid),
-                other.title.as_deref().unwrap_or("")
-            ));
+        if let Some(label) = store::get_node(conn, other_id)
+            .ok()
+            .and_then(|other| link_target_label(&other))
+        {
+            out.push_str(&format!("\n{arrow} {} {label}", edge.rel));
         }
     }
     // What the store noticed on its own: memories repeatedly opened in the
@@ -477,6 +577,35 @@ pub fn full_record(
                 "\nconfidence: {c} (author-declared; not a ranking signal)"
             ));
         }
+        // The one transition that happens with nobody doing anything: the
+        // clock passing a declared expiry. Until now the deadline was echoed
+        // once at capture and never shown again, so nothing warned a reader
+        // that a memory was about to stop being recalled. Once it has
+        // passed, the status line under the header says so instead.
+        let now = crate::model::now_unix();
+        if let Some(at) = node.expires_at().filter(|at| *at > now) {
+            out.push_str(&format!(
+                "\nexpires: {} (author-declared; recall hides it after that)",
+                full_date(at)
+            ));
+        }
+        // `resolves_when` exists to travel with the memory so the reader
+        // knows what would falsify it — which it can only do if it is shown.
+        if let Some(cond) = node.resolves_when() {
+            out.push_str(&format!(
+                "\nresolves when: {cond} (author-declared; nothing checks it)"
+            ));
+        }
+        // A session handoff is restored once; the mark that says so lives on
+        // the memory, so the record shows why a later clear did not bring
+        // it back.
+        if let Some(at) = crate::context_guard::restored_at(node) {
+            out.push_str(&format!(
+                "\nrestored: {} (this handoff was restored into a session; a later clear \
+                 will not restore it again)",
+                full_date(at)
+            ));
+        }
         if node.valid_from().is_some() || node.valid_to().is_some() {
             let from = node
                 .valid_from()
@@ -487,10 +616,10 @@ pub fn full_record(
                 "\nvalid: {from} .. {} (author-declared; when the fact was true, \
                  not when it was recorded{})",
                 to.clone().unwrap_or_else(|| "open".into()),
-                if node.validity_closed(crate::model::now_unix()) {
-                    " — no longer current"
-                } else {
-                    ""
+                match node.validity(crate::model::now_unix()) {
+                    Validity::Closed => " — no longer current",
+                    Validity::NotYet => " — not yet current",
+                    Validity::Open | Validity::Undeclared => "",
                 }
             ));
         }
@@ -506,7 +635,14 @@ pub fn full_record(
         // What was done to it. Only the changes, never the creation — the
         // row already says when it was written and what it says. A memory
         // nobody has touched prints nothing, which is the common case.
-        let changes = crate::audit::history(conn, node.id).unwrap_or_default();
+        // A memory that arrived over sync has a `create` row (that row is
+        // how a hub knows when it arrived); it is the creation, so it is
+        // left to `mimir audit` like every other one.
+        let changes: Vec<_> = crate::audit::history(conn, node.id)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.op != crate::model::MutationOp::Create)
+            .collect();
         if !changes.is_empty() {
             out.push_str("\nhistory:");
             for m in &changes {
@@ -529,7 +665,7 @@ pub fn full_record(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Kind, NewNode};
+    use crate::model::NewNode;
 
     #[test]
     fn dates() {
@@ -560,6 +696,38 @@ mod tests {
                 "'{s}' must be refused, not guessed"
             );
         }
+    }
+
+    /// A memory stored without a subkind (a sync apply that coerced an
+    /// unknown type, an older import) decays and ranks as a note, so that is
+    /// what its line and its record call it. It used to print `memory` —
+    /// the node's kind — which is not a type `list -t` or `remember -t`
+    /// accepts.
+    #[test]
+    fn a_memory_without_a_subkind_is_labelled_note() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.title = Some("untyped".into());
+        new.body = Some("untyped".into());
+        let node = store::insert_node(&conn, new).unwrap();
+        assert!(node.subkind.is_none());
+        let tail = &node.uid[node.uid.len() - 6..];
+
+        assert_eq!(
+            agent_line(&node, None, 120),
+            format!("m:{tail} [note {}] untyped", month_day(node.created_at))
+        );
+        let record = full_record(&conn, &node, &HashMap::new()).unwrap();
+        assert!(
+            record.starts_with(&format!("m:{tail} note created ")),
+            "{record}"
+        );
+
+        // A node that is not a memory still shows its kind.
+        let mut chunk = NewNode::new(Kind::Chunk);
+        chunk.title = Some("a chunk".into());
+        let chunk = store::insert_node(&conn, chunk).unwrap();
+        assert!(agent_line(&chunk, None, 120).contains(" [chunk "));
     }
 
     #[test]
@@ -644,6 +812,235 @@ mod tests {
         // Undeclared: nothing at all.
         let bare = make(None, None);
         assert!(!bare.contains("until"), "{bare}");
+    }
+
+    /// The mirror of the closed case: a fact recorded before it starts being
+    /// true. `valid_at` could always answer that and nothing ever asked, so
+    /// the line presented it as current.
+    #[test]
+    fn a_fact_that_has_not_started_yet_says_from_when() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let mut new = NewNode::new(Kind::Memory);
+        new.subkind = Some("decision".into());
+        new.title = Some("the api moves to v3".into());
+        new.body = Some("the api moves to v3".into());
+        let node = store::insert_node(&conn, new).unwrap();
+        // 2100-01-01: not yet, for any clock this test will run under.
+        store::set_valid_interval(&conn, node.id, Some(4_102_444_800), None).unwrap();
+        let node = store::get_node(&conn, node.id).unwrap();
+
+        let line = agent_line(&node, None, 120);
+        assert!(line.contains(" from 2100] "), "{line}");
+        assert!(!line.contains("until"), "{line}");
+        assert!(
+            !line.contains("2100-01"),
+            "the year only, as for a closed interval: {line}"
+        );
+
+        let record = full_record(&conn, &node, &HashMap::new()).unwrap();
+        assert!(
+            record.contains("valid: 2100-01-01 .. open") && record.contains("— not yet current"),
+            "{record}"
+        );
+        assert!(!record.contains("no longer current"), "{record}");
+    }
+
+    fn memory_node(conn: &Connection, text: &str) -> Node {
+        let mut new = NewNode::new(Kind::Memory);
+        new.subkind = Some("gotcha".into());
+        new.title = Some(text.into());
+        new.body = Some(text.into());
+        store::insert_node(conn, new).unwrap()
+    }
+
+    /// A live memory's line is byte-for-byte what it was; every other state
+    /// costs one word, placed where `weak]` still closes the bracket.
+    #[test]
+    fn the_compact_line_names_every_state_but_live() {
+        use crate::model::Actor;
+        let conn = crate::db::open_in_memory().unwrap();
+        let line = |id: i64| agent_line(&store::get_node(&conn, id).unwrap(), None, 120);
+        let now = crate::model::now_unix();
+
+        let live = memory_node(&conn, "retry the lock");
+        let tail = &live.uid[live.uid.len() - 6..];
+        assert_eq!(
+            line(live.id),
+            format!(
+                "m:{tail} [gotcha {}] retry the lock",
+                month_day(live.created_at)
+            ),
+            "a live line carries no state word at all"
+        );
+
+        let expired = memory_node(&conn, "the freeze ends friday");
+        store::set_expiry(&conn, expired.id, Some(now - 60), None).unwrap();
+        assert!(
+            line(expired.id).contains(" expired] "),
+            "{}",
+            line(expired.id)
+        );
+
+        let old = memory_node(&conn, "use port 5432");
+        store::set_superseded(&conn, old.id, live.id, Actor::System, None).unwrap();
+        assert!(line(old.id).contains(" superseded] "), "{}", line(old.id));
+
+        let gone = memory_node(&conn, "the old vpn host");
+        store::soft_delete(&conn, gone.id, Actor::Human, None).unwrap();
+        assert!(line(gone.id).contains(" forgotten] "), "{}", line(gone.id));
+
+        // The statement `consolidate`'s decay pass runs.
+        let idle = memory_node(&conn, "a note nobody opened");
+        conn.execute(
+            "UPDATE node SET deleted_at = ?2, meta = json_set(meta, '$.archived', 1)
+             WHERE id = ?1",
+            [idle.id, now],
+        )
+        .unwrap();
+        assert!(line(idle.id).contains(" archived] "), "{}", line(idle.id));
+
+        // The other marks still follow it, and `weak` still comes last.
+        let marked = agent_line_for_query(
+            &store::get_node(&conn, old.id).unwrap(),
+            None,
+            120,
+            None,
+            HitMarks {
+                stale_grounding: false,
+                weak_match: true,
+            },
+        );
+        assert!(marked.contains(" superseded weak] "), "{marked}");
+
+        // A doc chunk is removed by a reindex, not forgotten: no label.
+        let mut chunk = NewNode::new(Kind::Chunk);
+        chunk.title = Some("Guide › Setup".into());
+        chunk.body = Some("install it".into());
+        let chunk = store::insert_node(&conn, chunk).unwrap();
+        conn.execute(
+            "UPDATE node SET deleted_at = ?1 WHERE id = ?2",
+            [now, chunk.id],
+        )
+        .unwrap();
+        assert!(!line(chunk.id).contains("forgotten"), "{}", line(chunk.id));
+    }
+
+    /// `get` says why a memory is not current before it shows the text, and
+    /// names the replacement so the reader can go straight to it.
+    #[test]
+    fn full_record_leads_with_why_a_memory_is_not_current() {
+        use crate::model::Actor;
+        let conn = crate::db::open_in_memory().unwrap();
+        let record =
+            |id: i64| full_record(&conn, &store::get_node(&conn, id).unwrap(), &HashMap::new());
+
+        let new = memory_node(&conn, "use port 6432 via the pooler");
+        assert!(
+            !record(new.id).unwrap().contains("\n! "),
+            "a live memory prints no status line"
+        );
+
+        let old = memory_node(&conn, "use port 5432");
+        store::set_superseded(&conn, old.id, new.id, Actor::System, None).unwrap();
+        let out = record(old.id).unwrap();
+        let new_uid = store::get_node(&conn, new.id).unwrap().uid;
+        let status = out.lines().nth(1).unwrap_or_default();
+        assert!(status.starts_with("! superseded by m:"), "{out}");
+        assert!(status.contains(&new_uid[new_uid.len() - 6..]), "{out}");
+        assert!(status.contains("use port 6432 via the pooler"), "{out}");
+        assert!(status.contains("kept as history"), "{out}");
+
+        // Forget the replacement: the old memory is still superseded, but
+        // the deleted one must not be named through it.
+        store::soft_delete(&conn, new.id, Actor::Human, None).unwrap();
+        let out = record(old.id).unwrap();
+        assert!(
+            out.lines()
+                .nth(1)
+                .unwrap_or_default()
+                .starts_with("! superseded — kept as history"),
+            "{out}"
+        );
+        assert!(!out.contains("6432"), "forgotten text surfaced: {out}");
+
+        let expired = memory_node(&conn, "the freeze ends friday");
+        store::set_expiry(&conn, expired.id, Some(86_400), None).unwrap();
+        let out = record(expired.id).unwrap();
+        assert!(
+            out.lines()
+                .nth(1)
+                .unwrap_or_default()
+                .starts_with("! expired 1970-01-02"),
+            "{out}"
+        );
+        assert!(!out.contains("\nexpires: "), "passed, not pending: {out}");
+    }
+
+    /// A link is one more way to reach a memory. Followed from a neighbour,
+    /// a retired one says so and a forgotten one does not appear.
+    #[test]
+    fn links_name_a_retired_memory_and_never_show_a_forgotten_one() {
+        use crate::model::{Actor, Rel};
+        let conn = crate::db::open_in_memory().unwrap();
+        let hub = memory_node(&conn, "connection pooling notes");
+        let live = memory_node(&conn, "pgbouncer runs in transaction mode");
+        let old = memory_node(&conn, "use port 5432");
+        let gone = memory_node(&conn, "the retired bastion hostname");
+        for other in [&live, &old, &gone] {
+            store::link(&conn, hub.id, other.id, Rel::Relates, 1.0).unwrap();
+        }
+        store::set_superseded(&conn, old.id, live.id, Actor::System, None).unwrap();
+        store::soft_delete(&conn, gone.id, Actor::Human, None).unwrap();
+
+        let hub = store::get_node(&conn, hub.id).unwrap();
+        let out = full_record(&conn, &hub, &HashMap::new()).unwrap();
+        assert!(
+            out.lines().any(|l| l.starts_with("→ relates m:")
+                && l.ends_with(" pgbouncer runs in transaction mode")),
+            "a live link reads as it always did: {out}"
+        );
+        assert!(out.contains(" use port 5432 [superseded]"), "{out}");
+        assert!(
+            !out.contains("bastion"),
+            "a forgotten memory surfaced: {out}"
+        );
+
+        // A symbol removed by a rebuild is not a memory and is named as before.
+        let mut sym = NewNode::new(Kind::Symbol);
+        sym.title = Some("open_pool".into());
+        let sym = store::insert_node(&conn, sym).unwrap();
+        conn.execute("UPDATE node SET deleted_at = 1 WHERE id = ?1", [sym.id])
+            .unwrap();
+        let sym = store::get_node(&conn, sym.id).unwrap();
+        assert!(link_target_label(&sym).unwrap().ends_with(" open_pool"));
+    }
+
+    /// A deadline that has not passed yet, and the condition that would
+    /// falsify a memory, are both shown — the second was documented as
+    /// "travels with the memory" and was printed nowhere after capture.
+    #[test]
+    fn full_record_shows_a_pending_expiry_and_what_would_falsify_it() {
+        let conn = crate::db::open_in_memory().unwrap();
+        let node = memory_node(&conn, "deluge pins libtorrent 1.2");
+        let later = crate::model::now_unix() + 30 * 86_400;
+        store::set_expiry(
+            &conn,
+            node.id,
+            Some(later),
+            Some("when Deluge ships libtorrent 2.1 support"),
+        )
+        .unwrap();
+        let node = store::get_node(&conn, node.id).unwrap();
+        let out = full_record(&conn, &node, &HashMap::new()).unwrap();
+        assert!(
+            out.contains(&format!("\nexpires: {} ", full_date(later))),
+            "{out}"
+        );
+        assert!(
+            out.contains("\nresolves when: when Deluge ships libtorrent 2.1 support "),
+            "{out}"
+        );
+        assert!(!out.contains("\n! "), "still live: {out}");
     }
 
     /// Confidence must be readable in full, and must be legibly the
